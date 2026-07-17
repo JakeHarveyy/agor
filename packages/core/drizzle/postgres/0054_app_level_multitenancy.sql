@@ -216,4 +216,4 @@ CREATE UNIQUE INDEX IF NOT EXISTS "kb_embedding_spaces_tenant_provider_model_uni
 --> statement-breakpoint
 CREATE UNIQUE INDEX IF NOT EXISTS "kb_graph_nodes_tenant_uri_unique" ON "kb_graph_nodes" ("tenant_id", "uri");
 --> statement-breakpoint
-CREATE UNIQUE INDEX IF NOT EXISTS "kb_graph_edges_tenant_source_target_type_unique" ON "kb_graph_edges" ("tenant_id", "source_node_id", "target_node_id", "edge_type");
+CREATE UNIQUE INDEX IF NOT EXISTS "kb_graph_edges_tenant_source_target_type_unique" ON "kb_graph_edges" ("tenant_id", "source_node_id", "target_node_id", "edge_type") WHERE archived = false;
