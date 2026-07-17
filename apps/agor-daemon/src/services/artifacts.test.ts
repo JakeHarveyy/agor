@@ -5,7 +5,15 @@
  * land (filesystem materialization, path-traversal defenses).
  */
 
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import {
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  realpathSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { generateId } from '@agor/core';
@@ -15,13 +23,14 @@ import {
   BranchRepository,
   type Database,
   RepoRepository,
+  SessionRepository,
   shortId,
   UsersRepository,
 } from '@agor/core/db';
 import type { Application } from '@agor/core/feathers';
-import type { Artifact, BoardID, BranchID, UUID } from '@agor/core/types';
+import type { Artifact, BoardID, BranchID, SessionID, UUID } from '@agor/core/types';
 import jwt from 'jsonwebtoken';
-import { afterEach, beforeEach, describe, expect } from 'vitest';
+import { afterEach, beforeEach, describe, expect, vi } from 'vitest';
 import { dbTest } from '../../../../packages/core/src/db/test-helpers';
 import { ArtifactsService } from './artifacts';
 
@@ -72,6 +81,16 @@ async function seedRepoAndBranch(db: Database, branchPath: string) {
   });
 }
 
+async function seedSession(db: Database, branchId: BranchID, userId = 'user-owner') {
+  return new SessionRepository(db).create({
+    session_id: generateId() as SessionID,
+    branch_id: branchId,
+    created_by: userId as UUID,
+    tasks: [],
+    genealogy: { children: [] },
+  });
+}
+
 /**
  * Insert a row into `users` so FK-bearing tables (like
  * `artifact_trust_grants.user_id`) accept a grant for this user. The CI
@@ -105,7 +124,7 @@ function defaultLandDestForArtifact(
     .slice(0, 40);
   const idShort = shortId(artifact.artifact_id);
   const folder = slug.length > 0 ? `${slug}-${idShort}` : artifact.artifact_id;
-  return path.join(tmpRoot, '.agor', 'artifacts', folder);
+  return path.join(realpathSync(tmpRoot), '.agor', 'artifacts', folder);
 }
 
 /** Seed an artifact with a known file map and a board placement. */
@@ -176,6 +195,76 @@ describe('ArtifactRepository URL fields', () => {
       } else {
         process.env.AGOR_BASE_URL = previousBaseUrl;
       }
+    }
+  });
+});
+
+describe('ArtifactRepository source session provenance', () => {
+  dbTest('persists and returns source_session_id', async ({ db }) => {
+    const tmpRoot = mkdtempSync(path.join(tmpdir(), 'artifact-source-session-'));
+    try {
+      const board = await seedBoard(db);
+      const branch = await seedRepoAndBranch(db, tmpRoot);
+      const session = await seedSession(db, branch.branch_id);
+      const artifactRepo = new ArtifactRepository(db);
+
+      const created = await artifactRepo.create({
+        board_id: board.board_id,
+        name: 'Session-linked artifact',
+        template: 'react',
+        files: { '/index.js': 'console.log("hi")' },
+        source_session_id: session.session_id,
+        created_by: 'user-owner',
+      });
+
+      expect(created.source_session_id).toBe(session.session_id);
+      const fetched = await artifactRepo.findById(created.artifact_id);
+      expect(fetched?.source_session_id).toBe(session.session_id);
+    } finally {
+      rmSync(tmpRoot, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('ArtifactsService source session provenance', () => {
+  dbTest('ignores source_session_id in generic metadata patch', async ({ db }) => {
+    const tmpRoot = mkdtempSync(path.join(tmpdir(), 'artifact-source-session-patch-'));
+    try {
+      const service = new ArtifactsService(db, makeFakeApp());
+      const board = await seedBoard(db);
+      const branch = await seedRepoAndBranch(db, tmpRoot);
+      const originalSession = await seedSession(db, branch.branch_id);
+      const spoofedSession = await seedSession(db, branch.branch_id);
+      const artifactRepo = new ArtifactRepository(db);
+
+      const artifact = await artifactRepo.create({
+        board_id: board.board_id,
+        name: 'Original',
+        template: 'react',
+        files: { '/index.js': 'console.log("hi")' },
+        source_session_id: originalSession.session_id,
+        created_by: 'user-owner',
+      });
+
+      const patched = await service.patch(artifact.artifact_id, {
+        name: 'Renamed',
+        source_session_id: spoofedSession.session_id,
+      });
+
+      expect(patched.name).toBe('Renamed');
+      expect(patched.source_session_id).toBe(originalSession.session_id);
+
+      const updated = await service.update(artifact.artifact_id, {
+        description: 'Updated metadata',
+        source_session_id: spoofedSession.session_id,
+      });
+
+      expect(updated.description).toBe('Updated metadata');
+      expect(updated.source_session_id).toBe(originalSession.session_id);
+      const fetched = await artifactRepo.findById(artifact.artifact_id);
+      expect(fetched?.source_session_id).toBe(originalSession.session_id);
+    } finally {
+      rmSync(tmpRoot, { recursive: true, force: true });
     }
   });
 });
@@ -435,7 +524,9 @@ describe('ArtifactsService.land', () => {
       subpath: 'apps/frontend/demo',
     });
 
-    expect(result.destinationPath).toBe(path.join(tmpRoot, 'apps', 'frontend', 'demo'));
+    expect(result.destinationPath).toBe(
+      path.join(realpathSync(tmpRoot), 'apps', 'frontend', 'demo')
+    );
   });
 
   dbTest('rejects subpath that escapes the branch via ".."', async ({ db }) => {
@@ -569,7 +660,7 @@ describe('ArtifactsService.land', () => {
     const result = await service.land(artifact.artifact_id, symlinkedBranch);
 
     // Destination path is reported under the real root (post-canonicalize).
-    expect(result.destinationPath.startsWith(realBranch)).toBe(true);
+    expect(result.destinationPath.startsWith(realpathSync(realBranch))).toBe(true);
     expect(readFileSync(path.join(result.destinationPath, 'index.js'), 'utf-8')).toBe(
       'console.log("hello")'
     );
@@ -928,6 +1019,44 @@ describe('ArtifactsService.grantTrust', () => {
   });
 });
 
+describe('ArtifactsService.checkBuildFromFolder validation diagnostics', () => {
+  dbTest('reports missing local imports and malformed package.json', async ({ db }) => {
+    const root = mkdtempSync(path.join(tmpdir(), 'agor-artifact-validate-'));
+    try {
+      writeFileSync(path.join(root, 'index.js'), "import './missing';\nconsole.log('hello');\n");
+      writeFileSync(path.join(root, 'package.json'), '{ invalid json');
+
+      const service = new ArtifactsService(db, makeFakeApp());
+      const result = await service.checkBuildFromFolder({ folderPath: root });
+
+      expect(result.status).toBe('error');
+      expect(result.diagnostics.map((d) => d.code)).toContain('missing_local_import');
+      expect(result.diagnostics.map((d) => d.code)).toContain('malformed_package_json');
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  dbTest('warns about declared env vars on templates without dotenv injection', async ({ db }) => {
+    const root = mkdtempSync(path.join(tmpdir(), 'agor-artifact-validate-'));
+    try {
+      writeFileSync(path.join(root, 'index.js'), "console.log('hello');\n");
+      writeFileSync(
+        path.join(root, 'agor.artifact.json'),
+        JSON.stringify({ template: 'vanilla', required_env_vars: ['API_KEY'] })
+      );
+
+      const service = new ArtifactsService(db, makeFakeApp());
+      const result = await service.checkBuildFromFolder({ folderPath: root });
+
+      expect(result.status).toBe('success');
+      expect(result.diagnostics.map((d) => d.code)).toContain('env_vars_not_injected_for_template');
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+});
+
 describe('ArtifactsService.getStatus + console isolation', () => {
   dbTest('console logs and sandpack errors are scoped per viewer', async ({ db }) => {
     const service = new ArtifactsService(db, makeFakeApp());
@@ -946,13 +1075,18 @@ describe('ArtifactsService.getStatus + console isolation', () => {
     // Two different viewers post console output. Viewer A's output may
     // contain values derived from their own injected secrets — those must
     // never leak into viewer B's status read.
-    service.appendConsoleLogs(created.artifact_id, 'viewer-A', [
+    await service.appendConsoleLogs(created.artifact_id, 'viewer-A', [
       { timestamp: 1, level: 'log', message: 'A_SECRET=alpha' },
     ]);
-    service.appendConsoleLogs(created.artifact_id, 'viewer-B', [
+    await service.appendConsoleLogs(created.artifact_id, 'viewer-B', [
       { timestamp: 2, level: 'log', message: 'B_SECRET=bravo' },
     ]);
-    service.setSandpackError(created.artifact_id, 'viewer-A', { message: 'A-only error' }, 'idle');
+    await service.setSandpackError(
+      created.artifact_id,
+      'viewer-A',
+      { message: 'A-only error' },
+      'idle'
+    );
 
     const statusA = await service.getStatus(created.artifact_id, 'viewer-A' as never);
     expect(statusA.console_logs.map((l) => l.message)).toEqual(['A_SECRET=alpha']);
@@ -962,6 +1096,127 @@ describe('ArtifactsService.getStatus + console isolation', () => {
     expect(statusB.console_logs.map((l) => l.message)).toEqual(['B_SECRET=bravo']);
     expect(statusB.sandpack_error).toBeNull();
   });
+
+  dbTest('waitForRuntimeStatus resolves with browser-reported Sandpack failure', async ({ db }) => {
+    const service = new ArtifactsService(db, makeFakeApp());
+    const board = await seedBoard(db);
+    const artifactRepo = new ArtifactRepository(db);
+    const created = await artifactRepo.create({
+      artifact_id: generateId(),
+      board_id: board.board_id,
+      name: 'wait-failure',
+      template: 'react',
+      files: { '/index.js': 'console.log("x")' },
+      public: true,
+      created_by: 'user-owner',
+    });
+
+    const waitPromise = service.waitForRuntimeStatus(created.artifact_id, 'viewer-A' as never, {
+      timeoutMs: 5000,
+      settleMs: 0,
+    });
+    await service.setSandpackError(
+      created.artifact_id,
+      'viewer-A',
+      { message: 'Cannot find module ./missing' },
+      'idle'
+    );
+
+    const result = await waitPromise;
+    expect(result.ok).toBe(false);
+    expect(result.observed).toBe(true);
+    expect(result.build_status).toBe('error');
+    expect(result.build_errors?.join('\n')).toMatch(/Cannot find module/);
+  });
+
+  dbTest(
+    'waitForRuntimeStatus ignores stale content-hash reports and times out',
+    async ({ db }) => {
+      vi.useFakeTimers();
+      try {
+        const service = new ArtifactsService(db, makeFakeApp());
+        const board = await seedBoard(db);
+        const artifactRepo = new ArtifactRepository(db);
+        const created = await artifactRepo.create({
+          artifact_id: generateId(),
+          board_id: board.board_id,
+          name: 'wait-stale',
+          template: 'react',
+          files: { '/index.js': 'console.log("x")' },
+          content_hash: 'current',
+          public: true,
+          created_by: 'user-owner',
+        });
+
+        const waitPromise = service.waitForRuntimeStatus(created.artifact_id, 'viewer-A' as never, {
+          timeoutMs: 500,
+          settleMs: 0,
+        });
+        await service.setSandpackError(created.artifact_id, 'viewer-A', null, 'idle', 'old');
+        await vi.advanceTimersByTimeAsync(600);
+
+        const result = await waitPromise;
+        expect(result.ok).toBe(false);
+        expect(result.observed).toBe(false);
+        expect(result.timed_out).toBe(true);
+        expect(result.sandpack_status).toBeUndefined();
+      } finally {
+        vi.useRealTimers();
+      }
+    }
+  );
+
+  dbTest(
+    'waitForRuntimeStatus ignores stale reports after metadata-only render changes',
+    async ({ db }) => {
+      vi.useFakeTimers();
+      try {
+        const service = new ArtifactsService(db, makeFakeApp());
+        const board = await seedBoard(db);
+        const artifactRepo = new ArtifactRepository(db);
+        const created = await artifactRepo.create({
+          artifact_id: generateId(),
+          board_id: board.board_id,
+          name: 'wait-stale-metadata',
+          template: 'react',
+          files: { '/index.js': 'console.log("x")' },
+          content_hash: 'same-file-hash',
+          public: true,
+          created_by: 'user-owner',
+        });
+        const beforePayload = await service.getPayload(created.artifact_id, 'viewer-A' as never);
+
+        const updated = await service.updateMetadata(
+          created.artifact_id,
+          { sandpack_config: { options: { showNavigator: true } } },
+          'user-owner',
+          'admin'
+        );
+        expect(updated.content_hash).toBe('same-file-hash');
+
+        const waitPromise = service.waitForRuntimeStatus(created.artifact_id, 'viewer-A' as never, {
+          timeoutMs: 500,
+          settleMs: 0,
+        });
+        await service.setSandpackError(
+          created.artifact_id,
+          'viewer-A',
+          null,
+          'idle',
+          beforePayload.runtime_report_hash
+        );
+        await vi.advanceTimersByTimeAsync(600);
+
+        const result = await waitPromise;
+        expect(result.ok).toBe(false);
+        expect(result.observed).toBe(false);
+        expect(result.timed_out).toBe(true);
+        expect(result.sandpack_status).toBeUndefined();
+      } finally {
+        vi.useRealTimers();
+      }
+    }
+  );
 
   dbTest('getStatus rejects when artifact is not visible to caller', async ({ db }) => {
     const service = new ArtifactsService(db, makeFakeApp());
@@ -1477,5 +1732,183 @@ describe('ArtifactsService.queryArtifactRuntime', () => {
     await expect(queryPromise).rejects.toThrow(/timed out/i);
 
     realApp.app = originalApp;
+  });
+});
+
+describe('ArtifactsService.find SQL pushdown', () => {
+  async function seedPushdownFixture(db: Database) {
+    const boardA = (await seedBoard(db)).board_id as BoardID;
+    const boardB = (await seedBoard(db)).board_id as BoardID;
+    const branch1 = (await seedRepoAndBranch(db, '/tmp/artifact-branch-1')).branch_id as BranchID;
+    const branch2 = (await seedRepoAndBranch(db, '/tmp/artifact-branch-2')).branch_id as BranchID;
+    const artifactRepo = new ArtifactRepository(db);
+    const files = { '/index.js': 'console.log("hi")' };
+
+    // boardA: branch1, branch2, and an orphan (null branch_id).
+    const onBranch1 = await artifactRepo.create({
+      artifact_id: generateId(),
+      board_id: boardA,
+      branch_id: branch1,
+      name: 'a-branch1',
+      files,
+    });
+    await artifactRepo.create({
+      artifact_id: generateId(),
+      board_id: boardA,
+      branch_id: branch2,
+      name: 'a-branch2',
+      files,
+    });
+    await artifactRepo.create({
+      artifact_id: generateId(),
+      board_id: boardA,
+      branch_id: null,
+      name: 'a-orphan',
+      files,
+    });
+    // boardB: branch1 — must be excluded by a boardA-scoped query.
+    await artifactRepo.create({
+      artifact_id: generateId(),
+      board_id: boardB,
+      branch_id: branch1,
+      name: 'b-branch1',
+      files,
+    });
+
+    const service = new ArtifactsService(db, makeFakeApp());
+    return { service, boardA, boardB, branch1, branch2, onBranch1 };
+  }
+
+  dbTest('pushes board_id into the repository read (rbac off)', async ({ db }) => {
+    const { service, boardA } = await seedPushdownFixture(db);
+    const repoFindAll = vi.spyOn(
+      (service as unknown as { artifactRepo: ArtifactRepository }).artifactRepo,
+      'findAll'
+    );
+
+    const result = (await service.find({ query: { board_id: boardA } })) as {
+      data: Artifact[];
+      total: number;
+    };
+
+    // SQL-bounded: the board predicate reaches the repository, not a whole-table read.
+    expect(repoFindAll).toHaveBeenCalledWith({ board_id: boardA });
+    // boardA has 3 artifacts (branch1, branch2, orphan).
+    expect(result.total).toBe(3);
+    expect(result.data.every((a) => a.board_id === boardA)).toBe(true);
+    // Per-row enrichment ran on the reduced set (rowToArtifact populates files).
+    expect(result.data.every((a) => a.files !== undefined)).toBe(true);
+  });
+
+  dbTest(
+    'pushes board_id + accessible branch_id $in and excludes orphans (rbac on)',
+    async ({ db }) => {
+      const { service, boardA, branch1, onBranch1 } = await seedPushdownFixture(db);
+      const repoFindAll = vi.spyOn(
+        (service as unknown as { artifactRepo: ArtifactRepository }).artifactRepo,
+        'findAll'
+      );
+
+      const result = (await service.find({
+        query: { board_id: boardA, branch_id: { $in: [branch1] } },
+      })) as { data: Artifact[]; total: number };
+
+      expect(repoFindAll).toHaveBeenCalledWith({ board_id: boardA, branchIds: [branch1] });
+      // Only the boardA + branch1 artifact survives; branch2 and the orphan are excluded.
+      expect(result.total).toBe(1);
+      expect(result.data.map((a) => a.artifact_id)).toEqual([onBranch1.artifact_id]);
+    }
+  );
+
+  dbTest('pushes a scalar branch_id as a single-id set', async ({ db }) => {
+    const { service, branch1 } = await seedPushdownFixture(db);
+    const repoFindAll = vi.spyOn(
+      (service as unknown as { artifactRepo: ArtifactRepository }).artifactRepo,
+      'findAll'
+    );
+
+    const result = (await service.find({ query: { branch_id: branch1 } })) as {
+      data: Artifact[];
+      total: number;
+    };
+
+    expect(repoFindAll).toHaveBeenCalledWith({ branchIds: [branch1] });
+    // branch1 has artifacts on both boardA and boardB.
+    expect(result.total).toBe(2);
+  });
+
+  dbTest(
+    'returns no rows for an empty accessible set without reading the table',
+    async ({ db }) => {
+      const { service } = await seedPushdownFixture(db);
+      const repoFindAll = vi.spyOn(
+        (service as unknown as { artifactRepo: ArtifactRepository }).artifactRepo,
+        'findAll'
+      );
+
+      const result = (await service.find({ query: { branch_id: { $in: [] } } })) as {
+        data: Artifact[];
+        total: number;
+      };
+
+      expect(repoFindAll).toHaveBeenCalledWith({ branchIds: [] });
+      expect(result.total).toBe(0);
+      expect(result.data).toHaveLength(0);
+    }
+  );
+
+  dbTest('pushes the RBAC SQL visibility marker into the repository read', async ({ db }) => {
+    const { service, boardA } = await seedPushdownFixture(db);
+    const repoFindAll = vi.spyOn(
+      (service as unknown as { artifactRepo: ArtifactRepository }).artifactRepo,
+      'findAll'
+    );
+
+    await service.find({
+      _agorSqlBranchAccessUserId: 'viewer-1' as UUID,
+      query: { board_id: boardA },
+    });
+
+    expect(repoFindAll).toHaveBeenCalledWith({
+      board_id: boardA,
+      visibleToUserId: 'viewer-1',
+    });
+  });
+
+  // branch_id is nullable: a `{ $in }` containing a non-string element must NOT
+  // be pushed, because SQL `IN (NULL)` never matches an orphan's null branch_id
+  // while the JS `includes` path does. Pushing it would return a SUBSET.
+  dbTest('does NOT push a $in containing null — orphans stay visible', async ({ db }) => {
+    const { service } = await seedPushdownFixture(db);
+    const repoFindAll = vi.spyOn(
+      (service as unknown as { artifactRepo: ArtifactRepository }).artifactRepo,
+      'findAll'
+    );
+
+    const result = (await service.find({
+      query: { branch_id: { $in: [null as unknown as BranchID] } },
+    })) as { data: Artifact[]; total: number };
+
+    // Fell through to the whole-table read (no branchIds pushed); filterData
+    // applied the $in in JS, which matches the orphan's null branch_id.
+    expect(repoFindAll).toHaveBeenCalledWith({});
+    expect(result.data.map((a) => a.name)).toEqual(['a-orphan']);
+    expect(result.data.every((a) => a.branch_id === null)).toBe(true);
+  });
+
+  dbTest('does NOT push a mixed null + string $in — orphans stay visible', async ({ db }) => {
+    const { service, branch1 } = await seedPushdownFixture(db);
+    const repoFindAll = vi.spyOn(
+      (service as unknown as { artifactRepo: ArtifactRepository }).artifactRepo,
+      'findAll'
+    );
+
+    const result = (await service.find({
+      query: { branch_id: { $in: [null as unknown as BranchID, branch1] } },
+    })) as { data: Artifact[]; total: number };
+
+    // Whole-table fall-through; JS $in matches the orphan AND both branch1 rows.
+    expect(repoFindAll).toHaveBeenCalledWith({});
+    expect(result.data.map((a) => a.name).sort()).toEqual(['a-branch1', 'a-orphan', 'b-branch1']);
   });
 });

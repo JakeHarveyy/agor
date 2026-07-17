@@ -1,12 +1,12 @@
 import type {
   AgorClient,
-  AssistantKnowledgeConfig,
-  AssistantKnowledgeGrant,
-  AssistantKnowledgeGrantAccess,
   Branch,
   KnowledgeNamespace,
+  TeammateKnowledgeConfig,
+  TeammateKnowledgeGrant,
+  TeammateKnowledgeGrantAccess,
 } from '@agor-live/client';
-import { getAssistantConfig } from '@agor-live/client';
+import { getTeammateConfig } from '@agor-live/client';
 import {
   Alert,
   Button,
@@ -27,18 +27,19 @@ interface KnowledgeTabProps {
   branch: Branch;
   client: AgorClient | null;
   canEdit: boolean;
-  onBranchUpdated?: (branch: Branch) => void;
 }
 
-type EditableGrant = AssistantKnowledgeGrant & { key: string };
+type EditableGrant = TeammateKnowledgeGrant & { key: string };
 
-const ACCESS_OPTIONS: Array<{ label: string; value: AssistantKnowledgeGrantAccess }> = [
+const ACCESS_OPTIONS: Array<{ label: string; value: TeammateKnowledgeGrantAccess }> = [
   { label: 'No access', value: 'none' },
   { label: 'Read', value: 'read' },
   { label: 'Write', value: 'write' },
 ];
 
-function emptyKbConfig(): Partial<AssistantKnowledgeConfig> {
+const HOME_NAMESPACE_PERMISSIONS = new Set(['write', 'own']);
+
+function emptyKbConfig(): Partial<TeammateKnowledgeConfig> {
   return {
     memory_path_template: 'memory/{{YYYY-MM-DD}}.md',
     default_visibility: 'public',
@@ -47,20 +48,40 @@ function emptyKbConfig(): Partial<AssistantKnowledgeConfig> {
   };
 }
 
-function grantKey(grant: Pick<AssistantKnowledgeGrant, 'namespace_id' | 'namespace_slug'>) {
+function grantKey(grant: Pick<TeammateKnowledgeGrant, 'namespace_id' | 'namespace_slug'>) {
   return grant.namespace_id || grant.namespace_slug;
 }
 
-export const KnowledgeTab: React.FC<KnowledgeTabProps> = ({
-  branch,
-  client,
-  canEdit,
-  onBranchUpdated,
-}) => {
+function namespaceSelectLabel(namespace: KnowledgeNamespace) {
+  const permission = namespace.effective_permission ?? 'unknown';
+  return `${namespace.display_name} (${namespace.slug}) · ${permission}`;
+}
+
+export function buildTeammateKnowledgePatch(
+  branch: Pick<Branch, 'custom_context'>,
+  nextKb: Partial<TeammateKnowledgeConfig>
+): Partial<Branch> {
+  const existingConfig =
+    branch.custom_context?.teammate ??
+    branch.custom_context?.assistant ??
+    branch.custom_context?.agent ??
+    {};
+  return {
+    custom_context: {
+      teammate: {
+        ...existingConfig,
+        kind: 'teammate',
+        kb: nextKb,
+      },
+    },
+  };
+}
+
+export const KnowledgeTab: React.FC<KnowledgeTabProps> = ({ branch, client, canEdit }) => {
   const { showSuccess, showError } = useThemedMessage();
-  const assistant = useMemo(() => getAssistantConfig(branch), [branch]);
-  const initialKb = assistant?.kb;
-  const [kb, setKb] = useState<Partial<AssistantKnowledgeConfig>>(initialKb ?? emptyKbConfig());
+  const teammate = useMemo(() => getTeammateConfig(branch), [branch]);
+  const initialKb = teammate?.kb;
+  const [kb, setKb] = useState<Partial<TeammateKnowledgeConfig>>(initialKb ?? emptyKbConfig());
   const [namespace, setNamespace] = useState<KnowledgeNamespace | null>(null);
   const [namespaces, setNamespaces] = useState<KnowledgeNamespace[]>([]);
   const [loading, setLoading] = useState(false);
@@ -124,12 +145,11 @@ export const KnowledgeTab: React.FC<KnowledgeTabProps> = ({
     try {
       const result = await client
         .service('branches')
-        .ensureAssistantKnowledgeNamespace({ branchId: branch.branch_id });
+        .ensureTeammateKnowledgeNamespace({ branchId: branch.branch_id });
       setNamespace(result.namespace);
-      const nextKb = getAssistantConfig(result.branch)?.kb ?? kb;
+      const nextKb = getTeammateConfig(result.branch)?.kb ?? kb;
       setKb(nextKb);
-      onBranchUpdated?.(result.branch);
-      showSuccess('Assistant Knowledge namespace is ready');
+      showSuccess('Teammate Knowledge namespace is ready');
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       setError(message);
@@ -139,22 +159,16 @@ export const KnowledgeTab: React.FC<KnowledgeTabProps> = ({
     }
   };
 
-  const patchKb = async (nextKb: Partial<AssistantKnowledgeConfig>) => {
+  const patchKb = async (nextKb: Partial<TeammateKnowledgeConfig>) => {
     if (!client) return;
     setSavingPolicy(true);
     try {
-      const updated = (await client.service('branches').patch(branch.branch_id, {
-        custom_context: {
-          assistant: {
-            ...assistant,
-            kb: nextKb,
-          },
-        },
-      } as Partial<Branch>)) as Branch;
-      const savedKb = getAssistantConfig(updated)?.kb ?? nextKb;
+      const updated = (await client
+        .service('branches')
+        .patch(branch.branch_id, buildTeammateKnowledgePatch(branch, nextKb))) as Branch;
+      const savedKb = getTeammateConfig(updated)?.kb ?? nextKb;
       setKb(savedKb);
-      onBranchUpdated?.(updated);
-      showSuccess('Assistant Knowledge policy saved');
+      showSuccess('Teammate Knowledge policy saved');
     } catch (err) {
       showError(err instanceof Error ? err.message : String(err));
     } finally {
@@ -162,7 +176,20 @@ export const KnowledgeTab: React.FC<KnowledgeTabProps> = ({
     }
   };
 
-  const updateGrant = (key: string, patch: Partial<AssistantKnowledgeGrant>) => {
+  const selectHomeNamespace = (namespaceId: string) => {
+    const selected = namespaceById.get(namespaceId);
+    if (!selected) return;
+    setKb((current) => ({
+      ...current,
+      primary_namespace_id: selected.namespace_id,
+      primary_namespace_slug: selected.slug,
+      default_visibility: selected.visibility_default,
+      memory_path_template: current.memory_path_template ?? 'memory/{{YYYY-MM-DD}}.md',
+    }));
+    setNamespace(selected);
+  };
+
+  const updateGrant = (key: string, patch: Partial<TeammateKnowledgeGrant>) => {
     setKb((current) => ({
       ...current,
       grants: (current.grants ?? []).map((grant) =>
@@ -198,8 +225,8 @@ export const KnowledgeTab: React.FC<KnowledgeTabProps> = ({
     }));
   };
 
-  if (!assistant) {
-    return <Empty description="Knowledge memory is only available for assistant branches." />;
+  if (!teammate) {
+    return <Empty description="Knowledge memory is only available for teammate branches." />;
   }
 
   const missing = !namespace && (!kb.primary_namespace_id || error);
@@ -212,8 +239,8 @@ export const KnowledgeTab: React.FC<KnowledgeTabProps> = ({
         <Alert
           type="info"
           showIcon
-          message="Assistant Knowledge"
-          description="Assistant tools always use the home namespace for memory. Beyond that, this policy controls which Knowledge namespaces assistant-specific MCP tools may search. Effective access is still limited by the current user's namespace permissions."
+          message="Teammate Knowledge"
+          description="Teammate tools always use the home namespace for memory. Beyond that, this policy controls which Knowledge namespaces teammate-specific MCP tools may search. Effective access is still limited by the current user's namespace permissions."
         />
 
         <Card
@@ -233,43 +260,85 @@ export const KnowledgeTab: React.FC<KnowledgeTabProps> = ({
             </Space>
           }
         >
-          {loading ? (
-            <Spin />
-          ) : missing ? (
-            <Alert
-              type="warning"
-              showIcon
-              message="Home namespace is missing or unavailable"
-              description={error || 'namespace for this agent is not set up'}
-            />
-          ) : (
-            <Descriptions column={1} size="small">
-              <Descriptions.Item label="Name">{namespace?.display_name}</Descriptions.Item>
-              <Descriptions.Item label="Slug">
-                <Typography.Text code>
-                  {namespace?.slug ?? kb.primary_namespace_slug}
-                </Typography.Text>
-              </Descriptions.Item>
-              <Descriptions.Item label="Your permission">
-                <Tag>{namespace?.effective_permission ?? 'unknown'}</Tag>
-              </Descriptions.Item>
-              <Descriptions.Item label="Default document visibility">
-                <Tag>{namespace?.visibility_default ?? kb.default_visibility}</Tag>
-              </Descriptions.Item>
-              <Descriptions.Item label="Others can">
-                <Tag>{namespace?.others_can ?? 'unknown'}</Tag>
-              </Descriptions.Item>
-              <Descriptions.Item label="Memory path">
-                <Typography.Text code>
-                  {kb.memory_path_template ?? 'memory/{{YYYY-MM-DD}}.md'}
-                </Typography.Text>
-              </Descriptions.Item>
-            </Descriptions>
-          )}
+          <Space direction="vertical" size="middle" style={{ width: '100%' }}>
+            <Typography.Paragraph type="secondary" style={{ marginBottom: 0 }}>
+              The home namespace is where this teammate stores its memory and where
+              teammate-specific Knowledge tools start by default. Choose a namespace you can write
+              to.
+            </Typography.Paragraph>
+
+            {canEdit && (
+              <Space.Compact style={{ width: '100%' }}>
+                <Select
+                  showSearch
+                  aria-label="Home Knowledge namespace"
+                  placeholder="Select home Knowledge namespace"
+                  value={kb.primary_namespace_id}
+                  loading={loading}
+                  disabled={!client || repairing}
+                  optionFilterProp="label"
+                  onChange={selectHomeNamespace}
+                  style={{ minWidth: 360, flex: 1 }}
+                  options={namespaces.map((item) => {
+                    const canUseAsHome = HOME_NAMESPACE_PERMISSIONS.has(
+                      item.effective_permission ?? 'none'
+                    );
+                    return {
+                      label: namespaceSelectLabel(item),
+                      value: item.namespace_id,
+                      disabled: !canUseAsHome && item.namespace_id !== kb.primary_namespace_id,
+                    };
+                  })}
+                />
+                <Button
+                  type="primary"
+                  onClick={() => patchKb(kb)}
+                  loading={savingPolicy}
+                  disabled={!client || !kb.primary_namespace_id}
+                >
+                  Save home
+                </Button>
+              </Space.Compact>
+            )}
+
+            {loading ? (
+              <Spin />
+            ) : missing ? (
+              <Alert
+                type="warning"
+                showIcon
+                message="Home namespace is missing or unavailable"
+                description={error || 'namespace for this agent is not set up'}
+              />
+            ) : (
+              <Descriptions column={1} size="small">
+                <Descriptions.Item label="Name">{namespace?.display_name}</Descriptions.Item>
+                <Descriptions.Item label="Slug">
+                  <Typography.Text code>
+                    {namespace?.slug ?? kb.primary_namespace_slug}
+                  </Typography.Text>
+                </Descriptions.Item>
+                <Descriptions.Item label="Your permission">
+                  <Tag>{namespace?.effective_permission ?? 'unknown'}</Tag>
+                </Descriptions.Item>
+                <Descriptions.Item label="Default document visibility">
+                  <Tag>{namespace?.visibility_default ?? kb.default_visibility}</Tag>
+                </Descriptions.Item>
+                <Descriptions.Item label="Others can">
+                  <Tag>{namespace?.others_can ?? 'unknown'}</Tag>
+                </Descriptions.Item>
+                <Descriptions.Item label="Memory path">
+                  <Typography.Text code>
+                    {kb.memory_path_template ?? 'memory/{{YYYY-MM-DD}}.md'}
+                  </Typography.Text>
+                </Descriptions.Item>
+              </Descriptions>
+            )}
+          </Space>
         </Card>
 
         <Card
-          title="Assistant Knowledge access"
+          title="Teammate Knowledge access"
           extra={
             canEdit ? (
               <Button
@@ -288,7 +357,7 @@ export const KnowledgeTab: React.FC<KnowledgeTabProps> = ({
               <Typography.Text strong>Entire Knowledge Base fallback</Typography.Text>
               <Typography.Paragraph type="secondary" style={{ marginBottom: 8 }}>
                 Applies to any namespace that is not listed below. Choose none for a locked-down
-                assistant, read for broad context, or write for assistant tools that may update any
+                teammate, read for broad context, or write for teammate tools that may update any
                 namespace the current user can write.
               </Typography.Paragraph>
               <Select
@@ -304,7 +373,7 @@ export const KnowledgeTab: React.FC<KnowledgeTabProps> = ({
               <Typography.Text strong>Per-namespace overrides</Typography.Text>
               <Typography.Paragraph type="secondary" style={{ marginBottom: 8 }}>
                 Add namespaces to narrow or expand the fallback policy for specific spaces. The home
-                namespace is always available to assistant memory tools.
+                namespace is always available to teammate memory tools.
               </Typography.Paragraph>
               {canEdit && (
                 <Select

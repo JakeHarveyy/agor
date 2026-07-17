@@ -1,5 +1,41 @@
 import type { ChannelType } from '../types/gateway';
+import type { SessionID } from '../types/id';
+import { shortId } from '../types/id';
+import type { OutboundPayload } from './connector';
 import { markdownToMrkdwn } from './connectors/slack';
+
+const GATEWAY_SYSTEM_PREFIX = 'Agor:';
+
+/**
+ * Format a session reference for gateway lifecycle messages as markdown.
+ *
+ * When the daemon can resolve an Agor UI URL, the reference is markdown so
+ * channel-specific formatters can turn it into native links (Slack mrkdwn,
+ * GitHub markdown, etc.). Without a URL, fall back to a short ID rather than
+ * exposing a full UUID in external chat surfaces.
+ */
+export function formatGatewayMarkdownSessionReference(
+  sessionId: SessionID | string,
+  sessionUrl?: string | null
+): string {
+  return sessionUrl ? `[session](${sessionUrl})` : `session ${shortId(sessionId)}`;
+}
+
+export function formatGatewaySessionCreatedMessage(
+  sessionId: SessionID | string,
+  sessionUrl?: string | null
+): string {
+  return sessionUrl
+    ? `Session created: ${sessionUrl}`
+    : `Session ${shortId(sessionId)} created, sending prompt to agent.`;
+}
+
+export function formatGatewayFollowUpRoutingMessage(
+  sessionId: SessionID | string,
+  sessionUrl?: string | null
+): string {
+  return `Mention received — routing to ${formatGatewayMarkdownSessionReference(sessionId, sessionUrl)}.`;
+}
 
 /**
  * Format low-volume gateway lifecycle messages for external channels.
@@ -11,14 +47,52 @@ import { markdownToMrkdwn } from './connectors/slack';
  */
 export function formatGatewaySystemMessage(channelType: ChannelType, text: string): string {
   const sessionCreatedMatch = text.match(/^Session created: (https?:\/\/\S+)$/);
+  const slackMentionGuidance = 'Mention me again to follow up.';
 
   if (channelType === 'slack') {
     const markdown = sessionCreatedMatch
-      ? `[system] Session created: [View session](${sessionCreatedMatch[1]})`
-      : `[system] ${text}`;
+      ? `${GATEWAY_SYSTEM_PREFIX} Session created: [View session](${sessionCreatedMatch[1]}). ${slackMentionGuidance}`
+      : text.startsWith('Session ') && text.includes(' created, sending prompt to agent.')
+        ? `${GATEWAY_SYSTEM_PREFIX} ${text} ${slackMentionGuidance}`
+        : text.startsWith('Mention received')
+          ? `${GATEWAY_SYSTEM_PREFIX} ${text} ${slackMentionGuidance}`
+          : `${GATEWAY_SYSTEM_PREFIX} ${text}`;
 
     return markdownToMrkdwn(markdown);
   }
 
-  return `[system] ${text}`;
+  return `${GATEWAY_SYSTEM_PREFIX} ${text}`;
+}
+
+/**
+ * Format gateway lifecycle/debug messages as an outbound payload.
+ *
+ * Slack renders these as a muted `context` block so transient lifecycle
+ * notices match the bottom progress/status row instead of competing with the
+ * user's prompt or the agent's final answer.
+ */
+export function formatGatewaySystemPayload(
+  channelType: ChannelType,
+  text: string
+): OutboundPayload {
+  const formatted = formatGatewaySystemMessage(channelType, text);
+
+  if (channelType !== 'slack') {
+    return { text: formatted };
+  }
+
+  return {
+    text: formatted,
+    blocks: [
+      {
+        type: 'context',
+        elements: [
+          {
+            type: 'mrkdwn',
+            text: formatted,
+          },
+        ],
+      },
+    ],
+  };
 }

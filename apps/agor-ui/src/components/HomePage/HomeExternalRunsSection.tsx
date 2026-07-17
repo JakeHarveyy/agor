@@ -1,12 +1,11 @@
 import type { AgorClient, ExternalRun, ExternalRunStatus } from '@agor-live/client';
 import { ThunderboltOutlined } from '@ant-design/icons';
-import { Card, Drawer, Empty, List, Space, Tag, Typography, theme } from 'antd';
+import { Card, Drawer, Empty, List, Space, Tag, Tooltip, Typography, theme } from 'antd';
 import type React from 'react';
 import { useState } from 'react';
 import { useExternalRuns } from '../../hooks/useExternalRuns';
 import { formatRelativeTime } from '../../utils/time';
 import { ExternalRunDetail } from '../ExternalRunsSection/ExternalRunsSection';
-import { HomeSectionHeader } from './HomeSectionHeader';
 import { glassCardStyle } from './homeStyles';
 
 const { Text } = Typography;
@@ -34,30 +33,47 @@ export const HomeExternalRunsSection: React.FC<{
   const [drawerRun, setDrawerRun] = useState<ExternalRun | null>(null);
 
   return (
-    <Card
-      loading={loading && runs.length === 0}
-      style={{ minHeight: 0, flex: 1, ...glassCardStyle(token) }}
-      styles={{
-        body: {
-          height: '100%',
-          display: 'flex',
-          flexDirection: 'column',
-          background: 'transparent',
-        },
-      }}
+    <section
+      aria-label="External runs"
+      style={{ flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column' }}
     >
-      <HomeSectionHeader
-        title="External Runs"
-        icon={<ThunderboltOutlined />}
-        info="Native-harness work (Claude Code, Codex) logged back to Agor as first-class External Runs. Click a run for its event timeline and linked artefacts."
-      />
-      <div style={{ overflow: 'auto', minHeight: 0 }}>
+      <div style={{ display: 'flex', alignItems: 'center', marginBottom: 8, gap: 6 }}>
+        <Tooltip title="Native-harness work (Claude Code, Codex) logged back to Agor as first-class External Runs. Click a run for its event timeline and linked artefacts.">
+          <ThunderboltOutlined style={{ color: token.colorTextSecondary, fontSize: 13 }} />
+        </Tooltip>
+        <Text strong style={{ fontSize: 14 }}>
+          External Runs
+        </Text>
+      </div>
+      <Card
+        loading={loading && runs.length === 0}
+        style={{
+          flex: 1,
+          minHeight: 0,
+          border: `1px solid ${token.colorBorderSecondary}`,
+          borderRadius: token.borderRadiusLG,
+          ...glassCardStyle(token),
+        }}
+        styles={{
+          body: {
+            padding: 0,
+            height: '100%',
+            overflow: 'auto',
+            background: 'transparent',
+          },
+        }}
+      >
         {!connected ? (
-          <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="Reconnect to refresh runs" />
+          <Empty
+            image={Empty.PRESENTED_IMAGE_SIMPLE}
+            description="Reconnect to refresh runs"
+            style={{ padding: '24px 0' }}
+          />
         ) : runs.length === 0 ? (
           <Empty
             image={Empty.PRESENTED_IMAGE_SIMPLE}
             description="No external runs yet. Native Claude Code / Codex sessions log back here."
+            style={{ padding: '24px 0' }}
           />
         ) : (
           <List
@@ -66,7 +82,7 @@ export const HomeExternalRunsSection: React.FC<{
             renderItem={(run) => (
               <List.Item
                 onClick={() => setDrawerRun(run)}
-                style={{ cursor: 'pointer', padding: '10px 0' }}
+                style={{ cursor: 'pointer', padding: '10px 12px' }}
               >
                 <List.Item.Meta
                   title={
@@ -90,7 +106,7 @@ export const HomeExternalRunsSection: React.FC<{
             )}
           />
         )}
-      </div>
+      </Card>
       <Drawer
         open={!!drawerRun}
         onClose={() => setDrawerRun(null)}
@@ -107,7 +123,7 @@ export const HomeExternalRunsSection: React.FC<{
           />
         )}
       </Drawer>
-    </Card>
+    </section>
   );
 };
 

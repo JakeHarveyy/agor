@@ -11,18 +11,52 @@ vi.mock('@agor/core/sdk', () => ({ Claude: { query: vi.fn() } }));
 vi.mock('@agor/core/templates/session-context', () => ({
   renderAgorSystemPrompt: vi.fn().mockResolvedValue('prompt'),
 }));
+vi.mock('@agor/core/tools/mcp/http-headers', () => ({
+  mergeMCPRemoteHeaders: vi.fn(({ custom, auth }) => ({ ...(custom || {}), ...(auth || {}) })),
+}));
+vi.mock('@agor/core/tools/mcp/jwt-auth', () => ({
+  resolveMCPAuthHeaders: vi.fn().mockResolvedValue(undefined),
+}));
 vi.mock('../../config.js', () => ({
   getDaemonUrl: vi.fn().mockResolvedValue('http://localhost:3030'),
   resolveUserEnvironment: vi.fn().mockReturnValue({ env: {} }),
 }));
+vi.mock('../base/mcp-scoping.js', () => ({
+  getMcpServersForSession: vi.fn().mockResolvedValue([]),
+}));
+vi.mock('./models.js', () => ({
+  DEFAULT_CLAUDE_MODEL: 'claude-sonnet-4-6',
+}));
+vi.mock('./model-utils.js', () => ({
+  parseModelWithBetas: vi.fn((model: string) => ({
+    model: model.replace('[1m]', ''),
+    betas: model.includes('[1m]') ? ['context-1m-2025-08-07'] : [],
+  })),
+}));
+vi.mock('./permissions/permission-hooks.js', () => ({
+  createCanUseToolCallback: vi.fn(
+    () => () => Promise.resolve({ behavior: 'allow', updatedInput: {} })
+  ),
+}));
 
 import { Claude } from '@agor/core/sdk';
+import { resolveMCPAuthHeaders } from '@agor/core/tools/mcp/jwt-auth';
+import { getMcpServersForSession } from '../base/mcp-scoping.js';
 import { CLAUDE_CODE_DISALLOWED_TOOLS } from './constants.js';
-import { type QuerySetupDeps, setupQuery } from './query-builder.js';
+import { formatListForLog, type QuerySetupDeps, setupQuery } from './query-builder.js';
+
+describe('MCP logging helpers', () => {
+  it('formats long server lists without dumping every entry', () => {
+    expect(formatListForLog(['a', 'b', 'c'], 5)).toBe('a, b, c');
+    expect(formatListForLog(['a', 'b', 'c', 'd'], 2)).toBe('a, b +2 more');
+  });
+});
 
 describe('setupQuery - Local Settings Support', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    vi.mocked(getMcpServersForSession).mockResolvedValue([]);
+    vi.mocked(resolveMCPAuthHeaders).mockResolvedValue(undefined);
     vi.mocked(Claude.query).mockReturnValue({
       [Symbol.asyncIterator]: () => ({ next: () => Promise.resolve({ done: true }) }),
       interrupt: () => Promise.resolve(),
@@ -84,7 +118,167 @@ describe('setupQuery - Local Settings Support', () => {
     expect(callArgs.options.disallowedTools).toEqual([...CLAUDE_CODE_DISALLOWED_TOOLS]);
   });
 
-  it('passes session advisorModel through Claude Code SDK settings', async () => {
+  it('blocks on MCP startup for gateway sessions', async () => {
+    const deps = createMockDeps();
+    vi.mocked(deps.sessionsRepo.findById).mockResolvedValue({
+      session_id: 'test-session' as SessionID,
+      branch_id: 'test-branch' as BranchID,
+      mcp_token: 'test-token',
+      custom_context: { gateway_source: { channel_id: 'channel-1' } },
+    } as any);
+    deps.sessionMCPRepo = {} as any;
+    deps.mcpServerRepo = {} as any;
+    vi.mocked(getMcpServersForSession).mockResolvedValue([
+      {
+        server: {
+          name: 'remote',
+          transport: 'http',
+          url: 'https://example.com/mcp',
+        },
+      } as any,
+    ]);
+
+    await setupQuery('test-session' as SessionID, 'test prompt', deps);
+
+    const callArgs = vi.mocked(Claude.query).mock.calls[0][0];
+    const mcpServers = callArgs.options.mcpServers as Record<string, Record<string, unknown>>;
+    expect(mcpServers.agor).toMatchObject({ alwaysLoad: true });
+    expect(mcpServers.remote).toMatchObject({ alwaysLoad: true });
+  });
+
+  it('keeps MCP startup lazy for non-gateway sessions', async () => {
+    const deps = createMockDeps();
+    vi.mocked(deps.sessionsRepo.findById).mockResolvedValue({
+      session_id: 'test-session' as SessionID,
+      branch_id: 'test-branch' as BranchID,
+      mcp_token: 'test-token',
+    } as any);
+    deps.sessionMCPRepo = {} as any;
+    deps.mcpServerRepo = {} as any;
+    vi.mocked(getMcpServersForSession).mockResolvedValue([
+      {
+        server: {
+          name: 'remote',
+          transport: 'http',
+          url: 'https://example.com/mcp',
+        },
+      } as any,
+    ]);
+
+    await setupQuery('test-session' as SessionID, 'test prompt', deps);
+
+    const callArgs = vi.mocked(Claude.query).mock.calls[0][0];
+    const mcpServers = callArgs.options.mcpServers as Record<string, Record<string, unknown>>;
+    expect(mcpServers.agor.alwaysLoad).toBeUndefined();
+    expect(mcpServers.remote.alwaysLoad).toBeUndefined();
+  });
+
+  it('always loads authenticated OAuth MCP servers for non-gateway sessions', async () => {
+    const deps = createMockDeps();
+    vi.mocked(deps.sessionsRepo.findById).mockResolvedValue({
+      session_id: 'test-session' as SessionID,
+      branch_id: 'test-branch' as BranchID,
+      mcp_token: 'test-token',
+    } as any);
+    deps.sessionMCPRepo = {} as any;
+    deps.mcpServerRepo = {} as any;
+    vi.mocked(resolveMCPAuthHeaders).mockResolvedValue({ Authorization: 'Bearer oauth-token' });
+    vi.mocked(getMcpServersForSession).mockResolvedValue([
+      {
+        server: {
+          name: 'oauthRemote',
+          transport: 'http',
+          url: 'https://example.com/mcp',
+          auth: { type: 'oauth', oauth_access_token: 'oauth-token' },
+        },
+      } as any,
+    ]);
+
+    await setupQuery('test-session' as SessionID, 'test prompt', deps);
+
+    const callArgs = vi.mocked(Claude.query).mock.calls[0][0];
+    const mcpServers = callArgs.options.mcpServers as Record<string, Record<string, unknown>>;
+    expect(mcpServers.agor.alwaysLoad).toBeUndefined();
+    expect(mcpServers.oauthRemote).toMatchObject({
+      headers: { Authorization: 'Bearer oauth-token' },
+      alwaysLoad: true,
+    });
+  });
+
+  it('does not block gateway startup on unauthenticated OAuth servers with custom headers', async () => {
+    const deps = createMockDeps();
+    vi.mocked(deps.sessionsRepo.findById).mockResolvedValue({
+      session_id: 'test-session' as SessionID,
+      branch_id: 'test-branch' as BranchID,
+      mcp_token: 'test-token',
+      custom_context: { gateway_source: { channel_id: 'channel-1' } },
+    } as any);
+    deps.sessionMCPRepo = {} as any;
+    deps.mcpServerRepo = {} as any;
+    vi.mocked(resolveMCPAuthHeaders).mockResolvedValue(undefined);
+    vi.mocked(getMcpServersForSession).mockResolvedValue([
+      {
+        server: {
+          name: 'oauthRemote',
+          transport: 'http',
+          url: 'https://example.com/mcp',
+          auth: { type: 'oauth' },
+          headers: { 'X-Tenant': 'tenant-1' },
+        },
+      } as any,
+    ]);
+
+    await setupQuery('test-session' as SessionID, 'test prompt', deps);
+
+    const callArgs = vi.mocked(Claude.query).mock.calls[0][0];
+    const mcpServers = callArgs.options.mcpServers as Record<string, Record<string, unknown>>;
+    expect(mcpServers.agor).toMatchObject({ alwaysLoad: true });
+    expect(mcpServers.oauthRemote).toMatchObject({
+      headers: { 'X-Tenant': 'tenant-1' },
+    });
+    expect(mcpServers.oauthRemote.alwaysLoad).toBeUndefined();
+  });
+
+  it('does not block gateway startup on remote Bearer or JWT servers without resolved auth', async () => {
+    const deps = createMockDeps();
+    vi.mocked(deps.sessionsRepo.findById).mockResolvedValue({
+      session_id: 'test-session' as SessionID,
+      branch_id: 'test-branch' as BranchID,
+      mcp_token: 'test-token',
+      custom_context: { gateway_source: { channel_id: 'channel-1' } },
+    } as any);
+    deps.sessionMCPRepo = {} as any;
+    deps.mcpServerRepo = {} as any;
+    vi.mocked(resolveMCPAuthHeaders).mockResolvedValue(undefined);
+    vi.mocked(getMcpServersForSession).mockResolvedValue([
+      {
+        server: {
+          name: 'bearerRemote',
+          transport: 'http',
+          url: 'https://bearer.example.com/mcp',
+          auth: { type: 'bearer' },
+        },
+      } as any,
+      {
+        server: {
+          name: 'jwtRemote',
+          transport: 'http',
+          url: 'https://jwt.example.com/mcp',
+          auth: { type: 'jwt' },
+        },
+      } as any,
+    ]);
+
+    await setupQuery('test-session' as SessionID, 'test prompt', deps);
+
+    const callArgs = vi.mocked(Claude.query).mock.calls[0][0];
+    const mcpServers = callArgs.options.mcpServers as Record<string, Record<string, unknown>>;
+    expect(mcpServers.agor).toMatchObject({ alwaysLoad: true });
+    expect(mcpServers.bearerRemote.alwaysLoad).toBeUndefined();
+    expect(mcpServers.jwtRemote.alwaysLoad).toBeUndefined();
+  });
+
+  it('passes session advisorModel through the --advisor CLI flag, NOT settings', async () => {
     const deps = createMockDeps();
     vi.mocked(deps.sessionsRepo.findById).mockResolvedValue({
       session_id: 'test-session' as SessionID,
@@ -100,10 +294,15 @@ describe('setupQuery - Local Settings Support', () => {
     await setupQuery('test-session' as SessionID, 'test prompt', deps);
 
     const callArgs = vi.mocked(Claude.query).mock.calls[0][0];
-    expect(callArgs.options.settings).toMatchObject({ advisorModel: 'opus' });
+    // The advisor goes through the SDK's extraArgs → `--advisor opus`.
+    expect(callArgs.options.extraArgs).toMatchObject({ advisor: 'opus' });
+    // EACCES regression guard: we must NOT pass `settings` as an object, which
+    // makes the CLI materialize a content-addressed /tmp/claude-settings-*.json
+    // that collides across sessions/users (EACCES on open). See query-builder.ts.
+    expect(callArgs.options.settings).toBeUndefined();
   });
 
-  it('strips advisorModel [1m] suffix and adds the required SDK beta', async () => {
+  it('strips advisorModel [1m] suffix, passes base model via --advisor, adds the SDK beta', async () => {
     const deps = createMockDeps();
     vi.mocked(deps.sessionsRepo.findById).mockResolvedValue({
       session_id: 'test-session' as SessionID,
@@ -119,8 +318,55 @@ describe('setupQuery - Local Settings Support', () => {
     await setupQuery('test-session' as SessionID, 'test prompt', deps);
 
     const callArgs = vi.mocked(Claude.query).mock.calls[0][0];
-    expect(callArgs.options.settings).toMatchObject({ advisorModel: 'claude-opus-4-7' });
+    expect(callArgs.options.extraArgs).toMatchObject({ advisor: 'claude-opus-4-7' });
+    expect(callArgs.options.settings).toBeUndefined();
     expect(callArgs.options.betas).toEqual(['context-1m-2025-08-07']);
+  });
+
+  it('omits --advisor (and settings) entirely when no advisorModel is set', async () => {
+    // Turn-off contract: clearing the advisor leaves no --advisor flag and no
+    // settings object, so the session starts exactly as it did pre-advisor.
+    const deps = createMockDeps();
+    vi.mocked(deps.sessionsRepo.findById).mockResolvedValue({
+      session_id: 'test-session' as SessionID,
+      branch_id: 'test-branch' as BranchID,
+      model_config: {
+        mode: 'alias',
+        model: 'claude-sonnet-4-6',
+        updated_at: '2026-06-11T00:00:00.000Z',
+        // no advisorModel
+      },
+    } as any);
+
+    await setupQuery('test-session' as SessionID, 'test prompt', deps);
+
+    const callArgs = vi.mocked(Claude.query).mock.calls[0][0];
+    expect(
+      (callArgs.options.extraArgs as Record<string, unknown> | undefined)?.advisor
+    ).toBeUndefined();
+    expect(callArgs.options.settings).toBeUndefined();
+  });
+
+  it('ignores a whitespace-only advisorModel (no --advisor, no settings)', async () => {
+    const deps = createMockDeps();
+    vi.mocked(deps.sessionsRepo.findById).mockResolvedValue({
+      session_id: 'test-session' as SessionID,
+      branch_id: 'test-branch' as BranchID,
+      model_config: {
+        mode: 'alias',
+        model: 'claude-sonnet-4-6',
+        updated_at: '2026-06-11T00:00:00.000Z',
+        advisorModel: '   ',
+      },
+    } as any);
+
+    await setupQuery('test-session' as SessionID, 'test prompt', deps);
+
+    const callArgs = vi.mocked(Claude.query).mock.calls[0][0];
+    expect(
+      (callArgs.options.extraArgs as Record<string, unknown> | undefined)?.advisor
+    ).toBeUndefined();
+    expect(callArgs.options.settings).toBeUndefined();
   });
 });
 

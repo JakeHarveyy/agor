@@ -17,7 +17,8 @@
   },
   "dependencies": {
     "@agor/core": "workspace:*",
-    "@cursor/sdk": "^1.0.15",
+    "@agor/git": "workspace:*",
+    "@cursor/sdk": "^1.0.23",
     "@github/copilot-sdk": "^0.2.2",
     "@opencode-ai/sdk": "^1.2.20",
     "diff": "^7.0.0",
@@ -28,7 +29,7 @@
     "@types/diff": "^6.0.0",
     "@types/node": "^24.6.0",
     "typescript": "^6.0.3",
-    "vitest": "^4.1.8"
+    "vitest": "^4.1.10"
   },
   "files": [
     "dist",

@@ -349,7 +349,105 @@
       "idx": 49,
       "version": "7",
       "when": 1781600000000,
-      "tag": "0050_external_runs",
+      "tag": "0050_artifact_source_session",
+      "breakpoints": true
+    },
+    {
+      "idx": 50,
+      "version": "7",
+      "when": 1781700000000,
+      "tag": "0051_session_relationships",
+      "breakpoints": true
+    },
+    {
+      "idx": 51,
+      "version": "7",
+      "when": 1781800000000,
+      "tag": "0052_gateway_outbound_messages",
+      "breakpoints": true
+    },
+    {
+      "idx": 52,
+      "version": "7",
+      "when": 1781900000000,
+      "tag": "0053_user_token_invalidation",
+      "breakpoints": true
+    },
+    {
+      "idx": 53,
+      "version": "7",
+      "when": 1782000000000,
+      "tag": "0054_app_level_multitenancy",
+      "breakpoints": true
+    },
+    {
+      "idx": 54,
+      "version": "7",
+      "when": 1782100000000,
+      "tag": "0055_app_level_multitenancy_rls",
+      "breakpoints": true
+    },
+    {
+      "idx": 55,
+      "version": "7",
+      "when": 1782200000000,
+      "tag": "0056_composite_indexes",
+      "breakpoints": true
+    },
+    {
+      "idx": 56,
+      "version": "7",
+      "when": 1782300000000,
+      "tag": "0057_message_timestamp_indexes",
+      "breakpoints": true
+    },
+    {
+      "idx": 57,
+      "version": "7",
+      "when": 1782400000000,
+      "tag": "0058_primary_teammate_id",
+      "breakpoints": true
+    },
+    {
+      "idx": 58,
+      "version": "7",
+      "when": 1783800000000,
+      "tag": "0059_agentic_tool_presets",
+      "breakpoints": true
+    },
+    {
+      "idx": 59,
+      "version": "7",
+      "when": 1783900000000,
+      "tag": "0060_decouple_mcp_from_agentic_config",
+      "breakpoints": true
+    },
+    {
+      "idx": 60,
+      "version": "7",
+      "when": 1784000000000,
+      "tag": "0061_default_agentic_tool_presets",
+      "breakpoints": true
+    },
+    {
+      "idx": 61,
+      "version": "7",
+      "when": 1784000100000,
+      "tag": "0062_links",
+      "breakpoints": true
+    },
+    {
+      "idx": 63,
+      "version": "7",
+      "when": 1784000200000,
+      "tag": "0063_drop_links",
+      "breakpoints": true
+    },
+    {
+      "idx": 64,
+      "version": "7",
+      "when": 1784000201000,
+      "tag": "0064_external_runs",
       "breakpoints": true
     }
   ]

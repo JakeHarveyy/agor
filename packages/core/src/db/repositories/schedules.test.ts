@@ -88,6 +88,7 @@ describe('ScheduleRepository.create + findById', () => {
 
     const created = await ctx.scheduleRepo.create({
       ...scheduleData({ name: 'Daily summary' }),
+      mcp_server_ids: ['mcp-one', 'mcp-two'],
       branch_id: ctx.branchId,
       created_by: ctx.userId,
     });
@@ -99,12 +100,14 @@ describe('ScheduleRepository.create + findById', () => {
     expect(created.agentic_tool_config.agentic_tool).toBe('claude-code');
     expect(created.enabled).toBe(true);
     expect(created.allow_concurrent_runs).toBe(false);
+    expect(created.mcp_server_ids).toEqual(['mcp-one', 'mcp-two']);
 
     const fetched = await ctx.scheduleRepo.findById(created.schedule_id);
     expect(fetched).not.toBeNull();
     expect(fetched?.name).toBe('Daily summary');
     // agentic_tool_config round-trips through text/jsonb cleanly
     expect(fetched?.agentic_tool_config).toEqual({ agentic_tool: 'claude-code' });
+    expect(fetched?.mcp_server_ids).toEqual(['mcp-one', 'mcp-two']);
   });
 
   dbTest('rejects schedule without required fields', async ({ db }) => {
@@ -178,6 +181,26 @@ describe('ScheduleRepository.findDue', () => {
     expect(dueIds.has(due.schedule_id)).toBe(true);
     expect(dueIds.has(never.schedule_id)).toBe(true);
     expect(dueList.length).toBe(2);
+  });
+
+  dbTest('findDueRefs returns only due schedule routing refs', async ({ db }) => {
+    const ctx = await setupContext(db);
+    const now = Date.now();
+
+    const due = await ctx.scheduleRepo.create({
+      ...scheduleData({ name: 'due-ref', next_run_at: now - 1000 }),
+      branch_id: ctx.branchId,
+      created_by: ctx.userId,
+    });
+    await ctx.scheduleRepo.create({
+      ...scheduleData({ name: 'future-ref', next_run_at: now + 60 * 60 * 1000 }),
+      branch_id: ctx.branchId,
+      created_by: ctx.userId,
+    });
+
+    const refs = await ctx.scheduleRepo.findDueRefs(now);
+
+    expect(refs).toEqual([{ schedule_id: due.schedule_id }]);
   });
 });
 

@@ -1,7 +1,9 @@
-import type { AgorClient, Artifact, ArtifactPayload, User } from '@agor-live/client';
+import type { AgorClient, Artifact, ArtifactPayload, SessionID, User } from '@agor-live/client';
+import { sessionPath } from '@agor-live/client';
 import {
   ArrowLeftOutlined,
   EyeInvisibleOutlined,
+  MessageOutlined,
   ReloadOutlined,
   WarningOutlined,
 } from '@ant-design/icons';
@@ -13,11 +15,12 @@ import {
   ArtifactConsoleReporter,
   ArtifactRuntimeBridge,
   ArtifactSandpackErrorReporter,
-  renderArtifactTrustBadge,
+  ArtifactTrustStatusIcon,
 } from '@/components/artifacts/ArtifactRenderSupport';
 import { getDaemonUrl } from '@/config/daemon';
 import { getAuthHeaders } from '@/utils/authHeaders';
 import { ensureSandpackCryptoSubtle } from '@/utils/sandpackCrypto';
+import { uiRouteHref } from '@/utils/uiRoutes';
 import { ArtifactConsentModal } from '../components/ArtifactConsentModal/ArtifactConsentModal';
 import { BrandLogo } from '../components/BrandLogo';
 import { GlobalUserMenu } from '../components/GlobalUserMenu';
@@ -62,8 +65,6 @@ function ArtifactFullscreenNavbar({
   onLogout,
 }: ArtifactFullscreenNavbarProps) {
   const { token } = theme.useToken();
-  const trustBadge = payload ? renderArtifactTrustBadge(payload, onTrustClick) : null;
-
   return (
     <Header
       style={{
@@ -103,6 +104,7 @@ function ArtifactFullscreenNavbar({
           >
             {title}
           </Title>
+          {payload && <ArtifactTrustStatusIcon payload={payload} onTrustClick={onTrustClick} />}
           <Tooltip title="Hide navbar">
             <Button
               type="text"
@@ -119,9 +121,24 @@ function ArtifactFullscreenNavbar({
             />
           </Tooltip>
         </div>
-        {trustBadge}
       </Space>
       <Space style={{ flexShrink: 0 }}>
+        {(payload?.source_session_id || artifact?.source_session_id) && (
+          <Tooltip title="Open session that created this artifact">
+            <Button
+              icon={<MessageOutlined />}
+              href={uiRouteHref(
+                sessionPath(
+                  (payload?.source_session_id ?? artifact?.source_session_id) as SessionID
+                )
+              )}
+              target="_blank"
+              rel="noopener noreferrer"
+            >
+              Session
+            </Button>
+          </Tooltip>
+        )}
         {artifact?.url && (
           <Button href={artifact.url} target="_blank" rel="noopener noreferrer">
             Open board link
@@ -325,8 +342,14 @@ export function ArtifactFullscreenPage({
               showOpenInCodeSandbox={false}
               showRefreshButton
             />
-            <ArtifactConsoleReporter artifactId={payload.artifact_id} />
-            <ArtifactSandpackErrorReporter artifactId={payload.artifact_id} />
+            <ArtifactConsoleReporter
+              artifactId={payload.artifact_id}
+              contentHash={payload.runtime_report_hash ?? payload.content_hash}
+            />
+            <ArtifactSandpackErrorReporter
+              artifactId={payload.artifact_id}
+              contentHash={payload.runtime_report_hash ?? payload.content_hash}
+            />
             <ArtifactRuntimeBridge artifactId={payload.artifact_id} />
           </SandpackProvider>
         </div>

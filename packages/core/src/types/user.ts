@@ -1,4 +1,9 @@
-import type { CodexApprovalPolicy, CodexNetworkAccess, CodexSandboxMode } from './agentic-tool';
+import type {
+  AgenticToolName,
+  CodexApprovalPolicy,
+  CodexNetworkAccess,
+  CodexSandboxMode,
+} from './agentic-tool';
 import type { UserID } from './id';
 import type { EffortLevel, PermissionMode } from './session';
 
@@ -104,8 +109,6 @@ export interface DefaultAgenticToolConfig {
   modelConfig?: DefaultModelConfig;
   /** Default permission mode (Claude/Gemini unified mode) */
   permissionMode?: PermissionMode;
-  /** Default MCP server IDs to attach */
-  mcpServerIds?: string[];
   /** Codex-specific: sandbox mode */
   codexSandboxMode?: CodexSandboxMode;
   /** Codex-specific: approval policy */
@@ -127,6 +130,10 @@ export interface DefaultAgenticConfig {
   cursor?: DefaultAgenticToolConfig;
 }
 
+export type UserAgenticDefaultSelections = Partial<
+  Record<AgenticToolName, import('./agentic-tool-preset').UserAgenticDefaultSelection>
+>;
+
 /**
  * Per-tool credential field shapes.
  *
@@ -145,6 +152,9 @@ export interface CodexConfig {
   OPENAI_API_KEY?: string;
   OPENAI_BASE_URL?: string;
 }
+
+export type AgenticAuthMethod = 'api_key' | 'subscription';
+export type AgenticAuthMethods = Partial<Record<'claude-code' | 'codex', AgenticAuthMethod>>;
 
 export interface GeminiConfig {
   GEMINI_API_KEY?: string;
@@ -360,17 +370,23 @@ export interface EventStreamPreferences {
  * Per-user onboarding state (stored in user.preferences)
  */
 export interface OnboardingState {
+  /** Onboarding persona id the user selected (see ONBOARDING_PERSONAS in agor-ui). */
+  persona?: string;
   /** Which path the user took */
-  path?: 'assistant' | 'own-repo' | 'persisted-agent';
+  path?: 'teammate' | 'own-repo';
   /** The repo ID associated with this onboarding (framework repo or user's repo) */
   repoId?: string;
   /** The branch ID created during onboarding */
   branchId?: string;
   /** The board ID created for this user */
   boardId?: string;
-  /** Assistant display name captured during onboarding identity step */
+  /** Teammate display name captured during onboarding identity step */
+  teammateDisplayName?: string;
+  /** @deprecated Use teammateDisplayName. Read for pre-rename preferences compatibility only. */
   assistantDisplayName?: string;
-  /** Assistant emoji captured during onboarding identity step */
+  /** Teammate emoji captured during onboarding identity step */
+  teammateEmoji?: string;
+  /** @deprecated Use teammateEmoji. Read for pre-rename preferences compatibility only. */
   assistantEmoji?: string;
 }
 
@@ -383,6 +399,8 @@ export interface UserPreferences {
   onboarding?: OnboardingState;
   /** The user's personal/main board ID (created during onboarding or later) */
   mainBoardId?: string;
+  /** Whether to render Slack-synced avatar_url when available. Undefined defaults to true. */
+  use_slack_avatar?: boolean;
   // Future preferences can be added here
   [key: string]: unknown;
 }
@@ -417,7 +435,17 @@ export interface BaseUserFields {
  */
 export interface User extends BaseUserFields {
   user_id: UserID;
+  /**
+   * Preferred image avatar URL for this user.
+   *
+   * Stored in `users.data.avatar_url`. `avatar` is retained as a legacy alias
+   * for older launch-auth/MCP callers and should be treated as a fallback.
+   */
+  avatar_url?: string;
   avatar?: string;
+  avatar_source?: 'manual' | 'slack' | 'launch-auth' | string;
+  avatar_source_id?: string;
+  avatar_synced_at?: string;
   preferences?: UserPreferences;
   onboarding_completed: boolean;
   /** Force password change on next login (admin-settable, auto-cleared on password change) */
@@ -433,6 +461,8 @@ export interface User extends BaseUserFields {
    * encrypted-string to `boolean` for presence checking.
    */
   agentic_tools?: AgenticToolsStatus;
+  /** Explicit authentication method; inactive credentials remain stored but are never resolved. */
+  agentic_auth_methods?: AgenticAuthMethods;
   /**
    * Plaintext values for fields listed in `AGENTIC_TOOLS_PUBLIC_FIELDS` —
    * only populated when the requester is the field's owner. Lets the UI
@@ -447,7 +477,25 @@ export interface User extends BaseUserFields {
   env_vars?: Record<string, EnvVarMetadata>;
   // Default agentic tool configuration (prepopulates session creation forms)
   default_agentic_config?: DefaultAgenticConfig;
+  default_agentic_selection?: UserAgenticDefaultSelections;
+  // Default MCP selection, independent of the selected agentic tool.
+  default_mcp_server_ids?: string[];
 }
+
+/**
+ * Backend/internal user shape with auth invalidation metadata.
+ *
+ * Public user DTOs returned to browser clients intentionally omit this marker;
+ * auth services use it while validating or issuing browser tokens.
+ */
+export type UserAuthMetadata = object & {
+  /** Tokens issued at or before this timestamp are no longer valid. */
+  tokens_valid_after?: Date;
+  /** Backend-only tenant id used while issuing/validating runtime tokens. */
+  tenant_id?: string;
+};
+
+export type InternalUser = User & UserAuthMetadata;
 
 /**
  * Env var scope values.
@@ -491,6 +539,32 @@ export interface UserApiKey {
   last_used_at?: Date;
 }
 
+export interface UserAvatarSettings {
+  enabled: boolean;
+  provider: 'slack' | null;
+  gateway_channel_id: string | null;
+  last_sync_at?: string;
+  last_sync_result?: UserAvatarSyncResult;
+}
+
+export interface UserAvatarSyncResult {
+  ok: boolean;
+  mode: 'bulk' | 'single';
+  gateway_channel_id: string | null;
+  started_at: string;
+  finished_at: string;
+  matched: number;
+  updated: number;
+  skipped: number;
+  failed: number;
+  failures: Array<{ user_id?: string; email?: string; reason: string }>;
+}
+
+export interface UserAvatarSyncRequest {
+  gateway_channel_id?: string;
+  user_id?: string;
+}
+
 /**
  * Create user input (password required, not stored in User type)
  */
@@ -499,6 +573,11 @@ export interface CreateUserInput extends Partial<Omit<BaseUserFields, 'role'>> {
   password: string;
   role?: UserRole; // Optional, defaults to 'member' if not provided
   unix_username?: string;
+  avatar_url?: string;
+  avatar?: string;
+  avatar_source?: string;
+  avatar_source_id?: string;
+  avatar_synced_at?: string;
   /** Force user to change password on first login (admin-only) */
   must_change_password?: boolean;
 }
@@ -508,7 +587,11 @@ export interface CreateUserInput extends Partial<Omit<BaseUserFields, 'role'>> {
  */
 export interface UpdateUserInput extends Partial<BaseUserFields> {
   password?: string;
+  avatar_url?: string | null;
   avatar?: string;
+  avatar_source?: string | null;
+  avatar_source_id?: string | null;
+  avatar_synced_at?: string | null;
   preferences?: UserPreferences;
   onboarding_completed?: boolean;
   unix_username?: string;
@@ -521,6 +604,7 @@ export interface UpdateUserInput extends Partial<BaseUserFields> {
    * touched; `null` clears the field, a string sets it. Field names = env var names.
    */
   agentic_tools?: AgenticToolsUpdate;
+  agentic_auth_methods?: AgenticAuthMethods;
   // Environment variables for update (accepts plaintext, encrypted before storage).
   // `null` clears the variable. A plain `string` creates/updates the value and leaves
   // the existing scope in place (defaults to 'global' for new vars).
@@ -533,6 +617,9 @@ export interface UpdateUserInput extends Partial<BaseUserFields> {
   env_var_scopes?: Record<string, EnvVarScope>;
   // Default agentic tool configuration
   default_agentic_config?: DefaultAgenticConfig;
+  default_agentic_selection?: UserAgenticDefaultSelections;
+  // Default MCP selection, independent of the selected agentic tool.
+  default_mcp_server_ids?: string[];
 }
 
 /**

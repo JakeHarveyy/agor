@@ -5,7 +5,7 @@
  * Uses the repository pattern from @agor/core/db for type-safe database operations.
  */
 
-import type { Id, NullableId, Paginated, Params } from '@agor/core/types';
+import type { Id, NullableId, Paginated, Params, TenantContext } from '@agor/core/types';
 import { NotFoundError } from '@agor/core/utils/errors';
 
 /**
@@ -69,7 +69,20 @@ export interface Repository<T> {
  * Drizzle Service Adapter
  *
  * Implements FeathersJS service methods using a Drizzle repository.
- * Emits events for real-time WebSocket broadcasting.
+ *
+ * Realtime events are NOT emitted here. Feathers' own `eventHook`
+ * (`@feathersjs/feathers`) already emits the standard `created`/`updated`/
+ * `patched`/`removed` events with a full HookContext (correct `path` + `result`)
+ * for every method invoked through the `app.service(path)` proxy — that is the
+ * event browsers consume. An adapter-level `this.emit(event, result, params)`
+ * used to fire IN ADDITION to that, but `params` is not a HookContext: Feathers'
+ * transport-commons passes the third `emit` arg through UNCHANGED as the publish
+ * hook, so a `params` object (no `path`, no `result`) produced a duplicate wire
+ * event with an EMPTY name (``\`${path ?? ''} ${event}\`.trim()`` → bare
+ * `'created'`/`'patched'`) and a NULL payload — noise no client could consume.
+ * Internal call sites that mutate through the RAW method (`this.patch(...)`,
+ * bypassing the proxy + eventHook) and need a realtime event emit it explicitly
+ * via `emitServiceEvent(...)`, which builds a correctly-shaped hook.
  */
 // biome-ignore lint/suspicious/noExplicitAny: Generic service adapter needs default any type
 export class DrizzleService<T = any, D = Partial<T>, P extends Params = Params> {
@@ -81,6 +94,38 @@ export class DrizzleService<T = any, D = Partial<T>, P extends Params = Params> 
   // Event emitter for FeathersJS (will be injected by framework)
   // biome-ignore lint/suspicious/noExplicitAny: FeathersJS event system
   emit?: (event: string, ...args: any[]) => boolean;
+
+  /** Extract resolved tenant context from Feathers params. */
+  private getTenant(params?: P): TenantContext | undefined {
+    return (params as (P & { tenant?: TenantContext }) | undefined)?.tenant;
+  }
+
+  /**
+   * Whether a row belongs to the current tenant. Rows from pre-migration test
+   * fixtures that do not expose tenant_id are treated as visible so existing
+   * single-tenant unit tests keep working; migrated DB rows always carry it.
+   */
+  private rowBelongsToTenant(row: T, tenant: TenantContext | undefined): boolean {
+    if (!tenant) return true;
+    const record = row as Record<string, unknown>;
+    if (!('tenant_id' in record)) return true;
+    return record.tenant_id === tenant.tenant_id;
+  }
+
+  /** Stamp tenant_id onto created rows and prevent client-supplied drift. */
+  private withTenant(data: D | Partial<T>, params?: P): D | Partial<T> {
+    const tenant = this.getTenant(params);
+    if (!tenant || !data || typeof data !== 'object' || Array.isArray(data)) return data;
+    return { ...(data as Record<string, unknown>), tenant_id: tenant.tenant_id } as D | Partial<T>;
+  }
+
+  /** Never allow a patch/update to move a row across tenants. */
+  private stripTenantMutation(data: D | Partial<T>): D | Partial<T> {
+    if (!data || typeof data !== 'object' || Array.isArray(data)) return data;
+    const clone = { ...(data as Record<string, unknown>) };
+    delete clone.tenant_id;
+    return clone as D | Partial<T>;
+  }
 
   constructor(
     private repository: Repository<T>,
@@ -102,7 +147,7 @@ export class DrizzleService<T = any, D = Partial<T>, P extends Params = Params> 
   /**
    * Apply filters to data array (client-side filtering)
    */
-  private filterData(data: T[], query: Query): T[] {
+  protected filterData(data: T[], query: Query): T[] {
     let filtered = [...data];
 
     // Filter by field values
@@ -147,7 +192,7 @@ export class DrizzleService<T = any, D = Partial<T>, P extends Params = Params> 
   /**
    * Sort data array
    */
-  private sortData(data: T[], sortSpec?: Record<string, 1 | -1>): T[] {
+  protected sortData(data: T[], sortSpec?: Record<string, 1 | -1>): T[] {
     if (!sortSpec) return data;
 
     const sorted = [...data];
@@ -171,7 +216,7 @@ export class DrizzleService<T = any, D = Partial<T>, P extends Params = Params> 
   /**
    * Select specific fields from data
    */
-  private selectFields(data: T[], fields?: string[]): Partial<T>[] {
+  protected selectFields(data: T[], fields?: string[]): Partial<T>[] {
     if (!fields || fields.length === 0) return data;
 
     // biome-ignore lint/suspicious/noExplicitAny: Field selection requires dynamic property access
@@ -190,7 +235,7 @@ export class DrizzleService<T = any, D = Partial<T>, P extends Params = Params> 
   /**
    * Apply pagination to data
    */
-  private paginateData(data: T[], query: Query, total: number): Paginated<T> | T[] {
+  protected paginateData(data: T[], query: Query, total: number): Paginated<T> | T[] {
     const limit = query.$limit ?? this.paginate?.default ?? data.length;
     const skip = query.$skip ?? 0;
 
@@ -215,13 +260,32 @@ export class DrizzleService<T = any, D = Partial<T>, P extends Params = Params> 
   }
 
   /**
+   * Resolve the candidate row set that `find` filters, sorts, and paginates.
+   *
+   * The base implementation reads the whole table and relies on `filterData` to
+   * narrow it in memory. Subclasses may override this to push high-selectivity
+   * predicates into SQL; because `find` always re-applies every query filter via
+   * `filterData`, an override only needs to return a superset of the matching
+   * rows for the result to stay identical.
+   */
+  protected async fetchData(_query: Query, _params?: P): Promise<T[]> {
+    return this.repository.findAll();
+  }
+
+  /**
    * Find records
    */
   async find(params?: P): Promise<Paginated<T> | T[]> {
     const query = this.getQuery(params);
 
-    // Get all data from repository
-    let data = await this.repository.findAll();
+    // Get the candidate row set (whole table by default; subclasses may push
+    // predicates into SQL — filterData below still applies every query filter)
+    let data = await this.fetchData(query, params);
+
+    const tenant = this.getTenant(params);
+    if (tenant) {
+      data = data.filter((row) => this.rowBelongsToTenant(row, tenant));
+    }
 
     // Apply filters
     data = this.filterData(data, query);
@@ -263,12 +327,17 @@ export class DrizzleService<T = any, D = Partial<T>, P extends Params = Params> 
       prefetched &&
       prefetched.idField === this.id &&
       prefetched.id === String(id) &&
-      String((prefetched.record as Record<string, unknown>)[this.id]) === String(id)
+      String((prefetched.record as Record<string, unknown>)[this.id]) === String(id) &&
+      this.rowBelongsToTenant(prefetched.record, this.getTenant(_params))
     ) {
       return prefetched.record;
     }
 
     const result = await this.repository.findById(String(id));
+
+    if (result && !this.rowBelongsToTenant(result, this.getTenant(_params))) {
+      throw new NotFoundError(this.resourceType, String(id));
+    }
 
     if (!result) {
       throw new NotFoundError(this.resourceType, String(id));
@@ -284,36 +353,34 @@ export class DrizzleService<T = any, D = Partial<T>, P extends Params = Params> 
     if (Array.isArray(data)) {
       // Bulk create
       const results = await Promise.all(
-        data.map((item) => this.repository.create(item as Partial<T>))
+        data.map((item) =>
+          this.repository.create(this.withTenant(item as Partial<T>, params) as Partial<T>)
+        )
       );
-      // Emit created event for each item
-      for (const result of results) {
-        this.emit?.('created', result, params);
-      }
+      // Feathers' eventHook emits `created` for external callers; see class doc.
       return results;
     }
 
-    const result = await this.repository.create(data as Partial<T>);
-    this.emit?.('created', result, params);
+    const result = await this.repository.create(
+      this.withTenant(data as Partial<T>, params) as Partial<T>
+    );
     return result;
   }
 
   /**
    * Update a record (complete replacement).
    *
-   * Emits ONLY `'updated'` — per Feathers convention `patch()` emits
-   * `'patched'`. The previous implementation emitted both for "consistency",
-   * but that doubles up live-event delivery for any subscriber listening
-   * to both (e.g. UI hooks that want to catch any mutation). Subscribers
-   * that need to react to a complete-replacement should listen to
-   * `'updated'` directly.
+   * Realtime `updated` events are emitted by Feathers' eventHook for external
+   * callers (see class doc); the adapter does not emit them itself.
    */
   async update(id: Id, data: D, params?: P): Promise<T> {
     // Verify record exists (throws NotFoundError if not found)
     await this.get(id, params);
 
-    const result = await this.repository.update(String(id), data as Partial<T>);
-    this.emit?.('updated', result, params);
+    const result = await this.repository.update(
+      String(id),
+      this.stripTenantMutation(data as Partial<T>) as Partial<T>
+    );
     return result;
   }
 
@@ -330,22 +397,20 @@ export class DrizzleService<T = any, D = Partial<T>, P extends Params = Params> 
       // Find all matching records and patch them
       const query = this.getQuery(params);
       let records = await this.repository.findAll();
+      const tenant = this.getTenant(params);
+      if (tenant) records = records.filter((row) => this.rowBelongsToTenant(row, tenant));
       records = this.filterData(records, query);
 
       const results = await Promise.all(
         records.map((record) =>
           this.repository.update(
             (record as Record<string, unknown>)[this.id] as string,
-            data as Partial<T>
+            this.stripTenantMutation(data as Partial<T>) as Partial<T>
           )
         )
       );
 
-      // Emit events for each patched record
-      for (const result of results) {
-        this.emit?.('patched', result, params);
-      }
-
+      // Feathers' eventHook emits `patched` for external callers; see class doc.
       return results;
     }
 
@@ -353,8 +418,10 @@ export class DrizzleService<T = any, D = Partial<T>, P extends Params = Params> 
     // Verify record exists (throws NotFoundError if not found)
     await this.get(id, params);
 
-    const result = await this.repository.update(String(id), data as Partial<T>);
-    this.emit?.('patched', result, params);
+    const result = await this.repository.update(
+      String(id),
+      this.stripTenantMutation(data as Partial<T>) as Partial<T>
+    );
     return result;
   }
 
@@ -371,16 +438,14 @@ export class DrizzleService<T = any, D = Partial<T>, P extends Params = Params> 
       // Find all matching records and remove them
       const query = this.getQuery(params);
       let records = await this.repository.findAll();
+      const tenant = this.getTenant(params);
+      if (tenant) records = records.filter((row) => this.rowBelongsToTenant(row, tenant));
       records = this.filterData(records, query);
 
       // biome-ignore lint/suspicious/noExplicitAny: Need to access ID field dynamically
       await Promise.all(records.map((record) => this.repository.delete((record as any)[this.id])));
 
-      // Emit removed event for each record
-      for (const record of records) {
-        this.emit?.('removed', record, params);
-      }
-
+      // Feathers' eventHook emits `removed` for external callers; see class doc.
       return records;
     }
 
@@ -389,7 +454,6 @@ export class DrizzleService<T = any, D = Partial<T>, P extends Params = Params> 
     const existing = await this.get(id, params);
 
     await this.repository.delete(String(id));
-    this.emit?.('removed', existing, params);
     return existing;
   }
 }

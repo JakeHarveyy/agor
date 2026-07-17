@@ -1,4 +1,4 @@
-import type { AgenticToolName } from '@agor-live/client';
+import type { AgenticToolConfigField, AgenticToolName } from '@agor-live/client';
 import {
   CheckCircleOutlined,
   CloseCircleOutlined,
@@ -7,6 +7,7 @@ import {
 } from '@ant-design/icons';
 import { Button, Input, Space, Tooltip, Typography, theme } from 'antd';
 import { useState } from 'react';
+import { ClaudeSubscriptionTokenInstructions } from './ClaudeSubscriptionTokenInstructions';
 import { Tag } from './Tag';
 
 const { Text, Link } = Typography;
@@ -17,7 +18,7 @@ const { Text, Link } = Typography;
  */
 export interface AgenticToolFieldConfig {
   /** Env var name. Matches the key under `agentic_tools[tool][field]` on disk. */
-  field: string;
+  field: AgenticToolConfigField;
   /** Human-readable label shown above the input. */
   label: string;
   /** Short qualifier shown next to the label (e.g. "Pro / Max plan"). */
@@ -48,7 +49,12 @@ export const TOOL_FIELD_CONFIGS: Record<AgenticToolName, AgenticToolFieldConfig[
       label: 'Anthropic API Key',
       description: '(pay-as-you-go / Console)',
       placeholder: 'sk-ant-api03-...',
-      docUrl: 'https://console.anthropic.com',
+      docUrl: 'https://platform.claude.com/settings/keys',
+      helper: (
+        <Text type="secondary" style={{ fontSize: 12 }}>
+          If you use a Claude subscription, use the Claude Subscription Token below instead.
+        </Text>
+      ),
     },
     {
       field: 'CLAUDE_CODE_OAUTH_TOKEN',
@@ -78,6 +84,18 @@ export const TOOL_FIELD_CONFIGS: Record<AgenticToolName, AgenticToolFieldConfig[
       description: '(Codex)',
       placeholder: 'sk-proj-...',
       docUrl: 'https://platform.openai.com/api-keys',
+      helper: (
+        <Text type="secondary" style={{ fontSize: 12 }}>
+          Alternative: on the machine Agor runs sessions on, run{' '}
+          <Text code style={{ fontSize: 12 }}>
+            codex login --device-auth
+          </Text>{' '}
+          to use Codex CLI account auth without storing an OpenAI key in Agor.{' '}
+          <Link href="https://agor.live/guide/extended-install#authentication" target="_blank">
+            Learn more →
+          </Link>
+        </Text>
+      ),
     },
     {
       field: 'OPENAI_BASE_URL',
@@ -124,7 +142,12 @@ export const TOOL_FIELD_CONFIGS: Record<AgenticToolName, AgenticToolFieldConfig[
       label: 'Anthropic API Key',
       description: '(pay-as-you-go / Console)',
       placeholder: 'sk-ant-api03-...',
-      docUrl: 'https://console.anthropic.com',
+      docUrl: 'https://platform.claude.com/settings/keys',
+      helper: (
+        <Text type="secondary" style={{ fontSize: 12 }}>
+          If you use a Claude subscription, use the Claude Subscription Token below instead.
+        </Text>
+      ),
     },
     {
       field: 'CLAUDE_CODE_OAUTH_TOKEN',
@@ -137,7 +160,7 @@ export const TOOL_FIELD_CONFIGS: Record<AgenticToolName, AgenticToolFieldConfig[
 };
 
 /** Map field name → presence flag (true if the user has a value stored). */
-export type FieldStatus = Record<string, boolean>;
+export type FieldStatus = Partial<Record<AgenticToolConfigField, boolean>>;
 
 export interface ApiKeyFieldsProps {
   /**
@@ -148,11 +171,11 @@ export interface ApiKeyFieldsProps {
   /** Per-field set/unset flags from `user.agentic_tools[tool]`. */
   fieldStatus: FieldStatus;
   /** Persist a new value for one field (encrypts at rest). */
-  onSave: (field: string, value: string) => Promise<void>;
+  onSave: (field: AgenticToolConfigField, value: string) => Promise<void>;
   /** Clear the stored value for one field. */
-  onClear: (field: string) => Promise<void>;
+  onClear: (field: AgenticToolConfigField) => Promise<void>;
   /** Per-field saving spinner state. */
-  saving?: Record<string, boolean>;
+  saving?: Partial<Record<AgenticToolConfigField, boolean>>;
   /** Disable all inputs (e.g. while RBAC is loading). */
   disabled?: boolean;
   /**
@@ -170,7 +193,7 @@ export interface ApiKeyFieldsProps {
    * back to the user instead of just a "Set" tag — useful for base URLs
    * where the exact path matters.
    */
-  publicValues?: Record<string, string>;
+  publicValues?: Partial<Record<AgenticToolConfigField, string>>;
 }
 
 export const ApiKeyFields: React.FC<ApiKeyFieldsProps> = ({
@@ -184,11 +207,13 @@ export const ApiKeyFields: React.FC<ApiKeyFieldsProps> = ({
   publicValues,
 }) => {
   const { token } = theme.useToken();
-  const [inputValues, setInputValues] = useState<Record<string, string>>({});
+  const [inputValues, setInputValues] = useState<Partial<Record<AgenticToolConfigField, string>>>(
+    {}
+  );
 
   const configs = fields ?? TOOL_FIELD_CONFIGS[tool] ?? [];
 
-  const handleSave = async (field: string) => {
+  const handleSave = async (field: AgenticToolConfigField) => {
     const value = inputValues[field]?.trim();
     if (!value) return;
 
@@ -287,12 +312,7 @@ export const ApiKeyFields: React.FC<ApiKeyFieldsProps> = ({
           {/* Built-in per-field helpers retained from the legacy component. */}
           {field === 'CLAUDE_CODE_OAUTH_TOKEN' && !isSet && (
             <Text type="secondary" style={{ fontSize: token.fontSizeSM }}>
-              Run{' '}
-              <Text code style={{ fontSize: token.fontSizeSM }}>
-                claude setup-token
-              </Text>{' '}
-              in a terminal where the Claude CLI is installed and signed in to your Pro/Max plan,
-              then paste the resulting token here.
+              <ClaudeSubscriptionTokenInstructions />
             </Text>
           )}
           {field === 'ANTHROPIC_AUTH_TOKEN' && (

@@ -7,59 +7,65 @@
  * - No dots: Nothing active on current board
  */
 
-import type { BoardEntityObject, Session } from '@agor-live/client';
-import { SessionStatus } from '@agor-live/client';
 import { theme } from 'antd';
-import { useEffect, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
+import { brandMarkHref } from '../branding/brand';
+import { agorStore, shallow, useStoreWithEqualityFn } from '../store/agorStore';
+import { makeBoardSessionActivitySelector } from '../store/selectors';
 import { createFaviconWithDot } from '../utils/faviconDot';
 
-export function useFaviconStatus(
-  currentBoardId: string | null,
-  sessionsByBranch: Map<string, Session[]>,
-  boardObjects: BoardEntityObject[]
-) {
-  const [baseFaviconUrl] = useState(`${import.meta.env.BASE_URL}favicon.png`);
+// Favicon pixels render outside the themed application and need fixed contrast.
+// biome-ignore lint/plugin/noHardcodedColorLiteral: absolute favicon status color
+const FAVICON_RUNNING_COLOR = '#ffffff';
+// biome-ignore lint/plugin/noHardcodedColorLiteral: absolute favicon outline color
+const FAVICON_OUTLINE_COLOR = '#000000';
+
+export const getFaviconStatusColors = (readyColor: string) => ({
+  running: FAVICON_RUNNING_COLOR,
+  ready: readyColor,
+  border: FAVICON_OUTLINE_COLOR,
+});
+
+export function useFaviconStatus(currentBoardId: string | null) {
+  const [baseFaviconUrl] = useState(brandMarkHref());
   const { token } = theme.useToken();
 
+  // Subscribe to the two derived flags rather than the whole session /
+  // board-object maps: the favicon only changes when a flag flips, so the
+  // host component stays quiet across ordinary session churn.
+  const { hasRunning, hasReady } = useStoreWithEqualityFn(
+    agorStore,
+    useMemo(() => makeBoardSessionActivitySelector(currentBoardId), [currentBoardId]),
+    shallow
+  );
+
   useEffect(() => {
-    if (!currentBoardId) {
-      // No board selected - restore default favicon
-      createFaviconWithDot(baseFaviconUrl, false, false, token.colorSuccessText).then((dataUrl) => {
-        const link = document.querySelector("link[rel~='icon']") as HTMLLinkElement;
-        if (link) {
-          link.href = dataUrl;
-        }
-      });
-      return;
-    }
-
-    // Find branches on current board
-    const branchesOnBoard = new Set(
-      boardObjects
-        .filter((obj) => obj.board_id === currentBoardId && obj.branch_id)
-        .map((obj) => obj.branch_id!)
-    );
-
-    // Find sessions for those branches using O(1) Map lookups
-    const sessionsOnBoard = Array.from(branchesOnBoard)
-      .flatMap((branchId) => sessionsByBranch.get(branchId!) || [])
-      .filter((s) => !s.archived);
-
-    // Determine status: check for running and ready independently
-    // Use .some() for efficient short-circuiting
-    const hasRunning = sessionsOnBoard.some((session) => session.status === SessionStatus.RUNNING);
-
-    const hasReady = sessionsOnBoard.some((session) => session.ready_for_prompt);
-
-    // Update favicon with appropriate dots
-    // White dot (lower-left) for running, green dot (lower-right) for ready
-    createFaviconWithDot(baseFaviconUrl, hasRunning, hasReady, token.colorSuccessText).then(
-      (dataUrl) => {
-        const link = document.querySelector("link[rel~='icon']") as HTMLLinkElement;
-        if (link) {
-          link.href = dataUrl;
-        }
+    // createFaviconWithDot is async (it decodes an <img> and rasterizes to a
+    // canvas). If it resolves after this effect re-runs or the Workspace shell
+    // unmounts (e.g. navigating to a static surface that pins its own favicon),
+    // applying the stale result would clobber the new favicon. Guard with a
+    // cancellation flag cleared on cleanup.
+    let cancelled = false;
+    const applyFavicon = (dataUrl: string) => {
+      if (cancelled) return;
+      const link = document.querySelector("link[rel~='icon']") as HTMLLinkElement;
+      if (link) {
+        link.href = dataUrl;
       }
-    );
-  }, [currentBoardId, sessionsByBranch, boardObjects, baseFaviconUrl, token.colorSuccessText]);
+    };
+
+    // Update favicon with appropriate dots (both false with no board —
+    // the selector reports no activity — restoring the default favicon).
+    // White dot (lower-left) for running, green dot (lower-right) for ready
+    createFaviconWithDot(
+      baseFaviconUrl,
+      hasRunning,
+      hasReady,
+      getFaviconStatusColors(token.colorSuccessText)
+    ).then(applyFavicon);
+
+    return () => {
+      cancelled = true;
+    };
+  }, [hasRunning, hasReady, baseFaviconUrl, token.colorSuccessText]);
 }

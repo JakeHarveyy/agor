@@ -15,19 +15,10 @@
  * - Enforces retention policy per-schedule (deletes oldest scheduled
  *   sessions linked via `sessions.schedule_id`)
  *
- * **Per-schedule advisory lock (Postgres only):** each due schedule's
- * spawn runs inside its own transaction with
- * `pg_try_advisory_xact_lock(hash(schedule_id))`. This serves
- * same-schedule dedup if multi-daemon is ever wired up — but Agor
- * **is single-daemon only today**, and the per-schedule lock does NOT
- * by itself preserve the branch-wide `allow_concurrent_runs=false`
- * invariant across daemons (two daemons could lock two different
- * schedules on the same branch and both pass the branch concurrency
- * check). Branch-scoped advisory locking is deferred until multi-
- * daemon is actually supported; the partial unique index
- * `sessions_schedule_run_unique` provides DB-level dedup either way.
- * SQLite is single-node by definition; the lock helper is a no-op
- * there.
+ * Multi-daemon dedup is enforced by the partial unique index
+ * `sessions_schedule_run_unique`. We deliberately do not hold an advisory
+ * transaction while spawning an agent: external work must never extend a
+ * tenant DB transaction or monopolize a pooled connection.
  *
  * **Smart Recovery:**
  * - If scheduler is down for an extended period, only schedules LATEST
@@ -46,17 +37,22 @@
  *   as a v0.19 backwards-compat alias.
  */
 
-import type { Database } from '@agor/core/db';
 import {
-  advisoryLockKeyForUuid,
+  assertInlineAgenticConfigurationAllowed,
+  presetConfigurationToScheduleConfig,
+  resolveAgenticToolPreset,
+} from '@agor/core/config';
+import type { TenantScopeAwareDatabase } from '@agor/core/db';
+import {
   BranchRepository,
-  isPostgresDatabase,
+  getCurrentTenantId,
+  runWithSystemDatabaseScope,
+  runWithTenantContext,
+  runWithTenantDatabaseScope,
   ScheduleRepository,
   SessionMCPServerRepository,
   SessionRepository,
   shortId,
-  tryAdvisoryXactLock,
-  txAsDb,
   UsersRepository,
 } from '@agor/core/db';
 import { Forbidden } from '@agor/core/feathers';
@@ -69,6 +65,7 @@ import type {
   ScheduleID,
   Session,
   SessionID,
+  TenantID,
   User,
   UUID,
 } from '@agor/core/types';
@@ -82,6 +79,7 @@ import {
 } from '@agor/core/utils/cron';
 import Handlebars from 'handlebars';
 import type { Application } from '../declarations';
+import { emitServiceEvent } from '../utils/emit-service-event.js';
 
 /**
  * Session statuses that count as "actively consuming the branch" for
@@ -164,15 +162,15 @@ export function renderSchedulePrompt(
 }
 
 /**
- * Error thrown when execute-now is blocked because a session is already running
- * in the branch and allow_concurrent_runs is not enabled. Routes can catch
+ * Error thrown when execute-now is blocked because an active run from the same
+ * schedule exists and allow_concurrent_runs is not enabled. Routes can catch
  * this and surface it as a 409 Conflict.
  */
 export class ScheduleBusyError extends Error {
   public readonly code = 'schedule_busy';
-  constructor(branchName: string) {
+  constructor(scheduleName: string) {
     super(
-      `A session is already running in branch "${branchName}" and allow_concurrent_runs is disabled.`
+      `An active run from schedule "${scheduleName}" is already in progress and allow_concurrent_runs is disabled.`
     );
     this.name = 'ScheduleBusyError';
   }
@@ -200,12 +198,14 @@ export interface SchedulerConfig {
   debug?: boolean;
   /** Unix user mode for validation (default: 'simple') */
   unixUserMode?: UnixUserMode;
+  /** Static/single-tenant id used for request-less cron ticks. Undefined means discover due schedule tenants from schedule rows. */
+  tenantId?: TenantID | string;
 }
 
 export class SchedulerService {
   private app: Application;
-  private db: Database;
-  private config: Required<SchedulerConfig>;
+  private db: TenantScopeAwareDatabase;
+  private config: Required<Omit<SchedulerConfig, 'tenantId'>> & Pick<SchedulerConfig, 'tenantId'>;
   private intervalHandle?: NodeJS.Timeout;
   private isRunning = false;
   private branchRepo: BranchRepository;
@@ -214,7 +214,7 @@ export class SchedulerService {
   private userRepo: UsersRepository;
   private sessionMCPRepo: SessionMCPServerRepository;
 
-  constructor(db: Database, app: Application, config: SchedulerConfig = {}) {
+  constructor(db: TenantScopeAwareDatabase, app: Application, config: SchedulerConfig = {}) {
     this.app = app;
     this.db = db;
     this.config = {
@@ -222,12 +222,20 @@ export class SchedulerService {
       gracePeriod: config.gracePeriod ?? 120000, // 2 minutes
       debug: config.debug ?? false,
       unixUserMode: config.unixUserMode ?? 'simple',
+      tenantId:
+        typeof config.tenantId === 'string' && config.tenantId.trim()
+          ? config.tenantId.trim()
+          : undefined,
     };
     this.branchRepo = new BranchRepository(db);
     this.scheduleRepo = new ScheduleRepository(db);
     this.sessionRepo = new SessionRepository(db);
     this.userRepo = new UsersRepository(db);
     this.sessionMCPRepo = new SessionMCPServerRepository(db);
+  }
+
+  private withTenantDatabase<T>(work: () => Promise<T>): Promise<T> {
+    return runWithTenantDatabaseScope(this.db, getCurrentTenantId(), work);
   }
 
   /**
@@ -289,20 +297,33 @@ export class SchedulerService {
     const now = Date.now();
 
     try {
-      const dueSchedules = await this.scheduleRepo.findDue(now + this.config.gracePeriod);
+      const dueScheduleRefs = await this.findDueScheduleRefs(now);
 
       if (this.config.debug) {
-        console.log(`🔄 Scheduler tick: Found ${dueSchedules.length} due schedules`);
+        console.log(`🔄 Scheduler tick: Found ${dueScheduleRefs.length} due schedules`);
       }
 
-      for (const schedule of dueSchedules) {
-        try {
-          await this.processSchedule(schedule, now);
-        } catch (error) {
+      for (const ref of dueScheduleRefs) {
+        if (!ref.tenantId) {
           console.error(
-            `❌ Failed to process schedule ${schedule.schedule_id} (${schedule.name}):`,
-            error
+            `❌ Skipping due schedule ${shortId(ref.scheduleId)}: missing tenant metadata`
           );
+          continue;
+        }
+
+        try {
+          await runWithTenantContext(ref.tenantId, async () => {
+            // Re-load inside the tenant scope before reading schedule content or
+            // spawning work. The system discovery phase only supplies routing
+            // metadata.
+            const schedule = await this.withTenantDatabase(() =>
+              this.scheduleRepo.findById(ref.scheduleId)
+            );
+            if (!schedule) return;
+            await this.processSchedule(schedule, now);
+          });
+        } catch (error) {
+          console.error(`❌ Failed to process schedule ${shortId(ref.scheduleId)}:`, error);
           // Continue processing other schedules
         }
       }
@@ -310,6 +331,26 @@ export class SchedulerService {
       console.error('❌ Scheduler tick failed:', error);
       throw error;
     }
+  }
+
+  private async findDueScheduleRefs(
+    now: number
+  ): Promise<Array<{ scheduleId: ScheduleID; tenantId?: TenantID | string }>> {
+    const findDue = async (tenantId?: TenantID | string) => {
+      const dueSchedules = await this.scheduleRepo.findDueRefs(now + this.config.gracePeriod);
+      return dueSchedules.map((schedule) => ({
+        scheduleId: schedule.schedule_id,
+        tenantId: tenantId ?? schedule.tenant_id,
+      }));
+    };
+
+    if (this.config.tenantId) {
+      return runWithTenantDatabaseScope(this.db, this.config.tenantId, () =>
+        findDue(this.config.tenantId)
+      );
+    }
+
+    return runWithSystemDatabaseScope(this.db, 'scheduler due schedule discovery', () => findDue());
   }
 
   /**
@@ -354,11 +395,11 @@ export class SchedulerService {
       // returning the schedule on every tick until the next real fire,
       // turning the hot-path index back into a scan of stale rows.
       if (schedule.next_run_at == null || schedule.next_run_at <= now) {
-        await this.scheduleRepo
-          .update(schedule.schedule_id, { next_run_at: nextRunAt })
-          .catch((err) =>
-            console.error(`Failed to advance next_run_at for ${schedule.schedule_id}:`, err)
-          );
+        await this.withTenantDatabase(() =>
+          this.scheduleRepo.update(schedule.schedule_id, { next_run_at: nextRunAt })
+        ).catch((err) =>
+          console.error(`Failed to advance next_run_at for ${schedule.schedule_id}:`, err)
+        );
       }
       if (this.config.debug) {
         const timeUntilNext = nextRunAt - now;
@@ -369,35 +410,10 @@ export class SchedulerService {
       return;
     }
 
-    // Per-schedule advisory lock — Postgres only.
-    //
-    // The lock has to be acquired inside a transaction so that
-    // pg_try_advisory_xact_lock releases at commit/rollback. On SQLite
-    // there is no cross-process scheduler — and wrapping spawn in a
-    // transaction actively breaks it: spawnScheduledSession calls
-    // sessionsService.create(), which writes through a separate
-    // connection and deadlocks against the outer transaction's write
-    // lock (SQLITE_BUSY). So on SQLite we skip the wrapper entirely
-    // and call spawn directly.
-    if (isPostgresDatabase(this.db)) {
-      const lockKey = advisoryLockKeyForUuid(schedule.schedule_id);
-      await this.db.transaction(async (tx) => {
-        const acquired = await tryAdvisoryXactLock(txAsDb(tx), this.db, lockKey);
-        if (!acquired) {
-          if (this.config.debug) {
-            console.log(
-              `   🔒 ${schedule.name}: advisory lock not acquired — another daemon owns this tick`
-            );
-          }
-          return;
-        }
-        console.log(`   ✅ ${schedule.name}: Schedule is due, spawning session...`);
-        await this.spawnScheduledSession(schedule, scheduledRunAt, now, { source: 'cron' });
-      });
-    } else {
-      console.log(`   ✅ ${schedule.name}: Schedule is due, spawning session...`);
-      await this.spawnScheduledSession(schedule, scheduledRunAt, now, { source: 'cron' });
-    }
+    console.log(
+      `   🕒 Scheduler due: "${schedule.name}" scheduled_at=${new Date(scheduledRunAt).toISOString()} — spawning session`
+    );
+    await this.spawnScheduledSession(schedule, scheduledRunAt, now, { source: 'cron' });
   }
 
   /**
@@ -412,11 +428,11 @@ export class SchedulerService {
    * @throws ScheduleNotReadyError when the schedule is disabled or its
    *   branch can't be loaded.
    * @throws ScheduleBusyError when allow_concurrent_runs is false and
-   *   the branch already has an active session.
+   *   this schedule already has an active run.
    */
   async executeScheduleNow(opts: { scheduleId: ScheduleID; triggeredBy: UUID }): Promise<Session> {
     const { scheduleId, triggeredBy } = opts;
-    const schedule = await this.scheduleRepo.findById(scheduleId);
+    const schedule = await this.withTenantDatabase(() => this.scheduleRepo.findById(scheduleId));
     if (!schedule) {
       throw new ScheduleNotReadyError('schedule_incomplete', `Schedule not found: ${scheduleId}`);
     }
@@ -472,7 +488,9 @@ export class SchedulerService {
   private async resolveCreatorUnixUsername(
     schedule: Schedule
   ): Promise<{ creator: User; unixUsername: string | null }> {
-    const creator = await this.userRepo.findById(schedule.created_by);
+    const creator = await this.withTenantDatabase(() =>
+      this.userRepo.findById(schedule.created_by)
+    );
 
     if (!creator) {
       console.error(`      ❌ Cannot spawn scheduled session: Schedule creator not found`, {
@@ -520,9 +538,9 @@ export class SchedulerService {
    * 1. Look up the schedule's branch (cascaded delete means it should
    *    always exist; we still handle null defensively).
    * 2. Dedup against `sessions(schedule_id, scheduled_run_at)`.
-   * 3. Enforce `allow_concurrent_runs` against any active session in the
-   *    SAME BRANCH (sibling schedules on the same branch are sequential
-   *    by default; opt out per-schedule via allow_concurrent_runs).
+   * 3. Enforce `allow_concurrent_runs` against any active session spawned
+   *    by the SAME SCHEDULE. Different schedules on the same branch do not
+   *    block one another.
    * 4. Render prompt template (Handlebars).
    * 5. Look up creator's unix_username for execution context.
    * 6. Create session with schedule metadata + `schedule_id` FK.
@@ -535,13 +553,10 @@ export class SchedulerService {
    * 9. Enforce retention policy (oldest sessions on this schedule_id
    *    are deleted).
    *
-   * NOTE (multi-daemon, deferred): with the current per-schedule
-   * advisory lock, two daemons can each lock different schedules on
-   * the same branch and both pass the branch-wide concurrency guard
-   * before either creates a session, then both spawn. Branch-scoped
-   * coordination (lock on branch when allow_concurrent_runs=false)
-   * will be needed once we support multi-daemon. Out of scope for V1
-   * since multi-daemon isn't supported yet.
+   * NOTE (multi-daemon, deferred): the per-schedule advisory lock and
+   * partial unique index guard same-schedule races. They deliberately do
+   * not serialize sibling schedules on the same branch, matching the
+   * schedule-scoped meaning of `allow_concurrent_runs=false`.
    */
   private async spawnScheduledSession(
     schedule: Schedule,
@@ -552,7 +567,9 @@ export class SchedulerService {
     const { source, triggeredBy } = options;
     const manual = source === 'manual';
 
-    const branch = await this.branchRepo.findById(schedule.branch_id);
+    const branch = await this.withTenantDatabase(() =>
+      this.branchRepo.findById(schedule.branch_id)
+    );
     if (!branch) {
       console.error(
         `❌ Schedule ${schedule.schedule_id} references missing branch ${schedule.branch_id}`
@@ -564,9 +581,8 @@ export class SchedulerService {
     }
 
     // 1. Dedup: indexed (schedule_id, scheduled_run_at) lookup.
-    const existingSession = await this.sessionRepo.findScheduleRun(
-      schedule.schedule_id,
-      scheduledRunAt
+    const existingSession = await this.withTenantDatabase(() =>
+      this.sessionRepo.findScheduleRun(schedule.schedule_id, scheduledRunAt)
     );
 
     if (existingSession) {
@@ -576,25 +592,23 @@ export class SchedulerService {
       return existingSession;
     }
 
-    // 2. Concurrency guard — branch-wide. Any active session in the
-    //    branch blocks scheduled runs, regardless of which schedule it
-    //    came from. Sibling schedules on the same branch are sequential
-    //    by default; opt out per-schedule via allow_concurrent_runs.
-    //    Existence probe (LIMIT 1) — no need to count.
+    // 2. Concurrency guard — per-schedule. An active run from this same
+    //    schedule blocks its next fire by default, but sibling schedules
+    //    on the same branch are independent and should not suppress one
+    //    another. Existence probe (LIMIT 1) — no need to count.
     if (!schedule.allow_concurrent_runs) {
-      const active = await this.sessionRepo.existsInBranchWithStatuses(
-        branch.branch_id,
-        ACTIVE_SESSION_STATUSES
+      const active = await this.withTenantDatabase(() =>
+        this.sessionRepo.existsInScheduleWithStatuses(schedule.schedule_id, ACTIVE_SESSION_STATUSES)
       );
       if (active) {
         if (manual) {
           console.log(
-            `   ⛔ ${schedule.name}: manual run blocked — active session present (allow_concurrent_runs=false)`
+            `   ⛔ ${schedule.name}: manual run blocked — active run from this schedule present (allow_concurrent_runs=false)`
           );
-          throw new ScheduleBusyError(branch.name);
+          throw new ScheduleBusyError(schedule.name);
         }
         console.log(
-          `   ⏭️  ${schedule.name}: scheduled run skipped — active session present (allow_concurrent_runs=false)`
+          `   ⏭️  ${schedule.name}: scheduled run skipped — active run from this schedule present (allow_concurrent_runs=false)`
         );
         await this.updateScheduleMetadata(schedule, scheduledRunAt, null, now);
         return null;
@@ -606,13 +620,33 @@ export class SchedulerService {
 
     // 4. Run index = count of all sessions for this schedule + 1.
     //    Indexed COUNT, not a full scan + filter.
-    const runIndex = (await this.sessionRepo.countByScheduleId(schedule.schedule_id)) + 1;
+    const runIndex =
+      (await this.withTenantDatabase(() =>
+        this.sessionRepo.countByScheduleId(schedule.schedule_id)
+      )) + 1;
 
     try {
       // 5. Resolve unix_username (schedule's creator is the execution identity).
       const { creator, unixUsername } = await this.resolveCreatorUnixUsername(schedule);
 
-      const cfg = schedule.agentic_tool_config;
+      let cfg = schedule.agentic_tool_config;
+      if (cfg.preset_id) {
+        const presetId = cfg.preset_id;
+        // Cron ticks carry tenant identity but no ambient DB scope — open a
+        // short tenant unit of work like the repo calls above.
+        const preset = await this.withTenantDatabase(() =>
+          resolveAgenticToolPreset(this.db, cfg.agentic_tool, presetId)
+        );
+        cfg = presetConfigurationToScheduleConfig(
+          cfg.agentic_tool,
+          cfg.preset_id,
+          preset.configuration
+        );
+      } else {
+        await this.withTenantDatabase(() =>
+          assertInlineAgenticConfigurationAllowed(this.db, cfg.agentic_tool)
+        );
+      }
       const scheduleModelConfig = cfg.model_config
         ? resolveSessionDefaults({
             agenticTool: cfg.agentic_tool,
@@ -626,6 +660,7 @@ export class SchedulerService {
       const session: Partial<Session> = {
         branch_id: branch.branch_id,
         agentic_tool: cfg.agentic_tool,
+        agentic_tool_preset_id: cfg.preset_id,
         status: SessionStatus.IDLE,
         created_by: schedule.created_by,
         unix_username: unixUsername,
@@ -680,9 +715,8 @@ export class SchedulerService {
         createdSession = await sessionsService.create(session);
       } catch (err) {
         if (isUniqueConstraintError(err)) {
-          const winner = await this.sessionRepo.findScheduleRun(
-            schedule.schedule_id,
-            scheduledRunAt
+          const winner = await this.withTenantDatabase(() =>
+            this.sessionRepo.findScheduleRun(schedule.schedule_id, scheduledRunAt)
           );
           if (winner) {
             console.log(
@@ -704,8 +738,8 @@ export class SchedulerService {
       // An explicit empty array in schedule means "no MCPs" — does NOT
       // fall through to branch.
       const effectiveMcpIds =
-        cfg.mcp_server_ids !== undefined
-          ? cfg.mcp_server_ids
+        schedule.mcp_server_ids !== undefined
+          ? schedule.mcp_server_ids
           : branch.mcp_server_ids && branch.mcp_server_ids.length > 0
             ? branch.mcp_server_ids
             : [];
@@ -713,15 +747,21 @@ export class SchedulerService {
       if (effectiveMcpIds.length > 0) {
         for (const serverId of effectiveMcpIds) {
           try {
-            await this.sessionMCPRepo.addServer(
-              createdSession.session_id as SessionID,
-              serverId as MCPServerID
+            await this.withTenantDatabase(() =>
+              this.sessionMCPRepo.addServer(
+                createdSession.session_id as SessionID,
+                serverId as MCPServerID
+              )
             );
-            this.app.service('session-mcp-servers')?.emit?.('created', {
-              session_id: createdSession.session_id,
-              mcp_server_id: serverId,
-              enabled: true,
-              added_at: new Date(),
+            emitServiceEvent(this.app, {
+              path: 'session-mcp-servers',
+              event: 'created',
+              data: {
+                session_id: createdSession.session_id,
+                mcp_server_id: serverId,
+                enabled: true,
+                added_at: new Date(),
+              },
             });
           } catch {
             // Silently skip deleted/invalid MCP servers
@@ -731,6 +771,7 @@ export class SchedulerService {
 
       // 8. Trigger prompt execution (creates task and starts agent).
       const promptService = this.app.service('/sessions/:id/prompt');
+      const tenantId = getCurrentTenantId();
       await promptService.create(
         {
           prompt: renderedPrompt,
@@ -741,6 +782,7 @@ export class SchedulerService {
           route: { id: createdSession.session_id },
           provider: undefined, // Bypass auth for internal scheduler call
           user: creator, // Pass creator user for session token generation
+          ...(tenantId ? { tenant: { tenant_id: tenantId, source: 'explicit' as const } } : {}),
         } as import('@agor/core/types').AuthenticatedParams & { route: { id: string } }
       );
 
@@ -782,7 +824,7 @@ export class SchedulerService {
       };
       if (lastRunSessionId) updates.last_run_session_id = lastRunSessionId;
 
-      await this.scheduleRepo.update(schedule.schedule_id, updates);
+      await this.withTenantDatabase(() => this.scheduleRepo.update(schedule.schedule_id, updates));
     } catch (error) {
       console.error(`      ❌ Failed to update schedule metadata:`, error);
       throw error;
@@ -803,9 +845,11 @@ export class SchedulerService {
 
     try {
       // Indexed query, newest-first; slice past the keep-count for deletion.
-      const mine = await this.sessionRepo.findByScheduleId(schedule.schedule_id, {
-        orderByScheduledRunAt: 'desc',
-      });
+      const mine = await this.withTenantDatabase(() =>
+        this.sessionRepo.findByScheduleId(schedule.schedule_id, {
+          orderByScheduledRunAt: 'desc',
+        })
+      );
       const sessionsToDelete = mine.slice(schedule.retention);
 
       if (sessionsToDelete.length > 0) {

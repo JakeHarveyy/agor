@@ -11,6 +11,11 @@ import {
   type AgorConfig,
   isUnixImpersonationEnabled,
   loadConfig,
+  resolveExecutionSecurityMode,
+  resolveMultiTenancyConfig,
+  resolveMultiTenancyDatabaseDialect,
+  resolveTenantContext,
+  TenantResolutionError,
   type UnknownJson,
   validateRepoEnvironment,
   wrapV1AsV2,
@@ -19,10 +24,10 @@ import {
   ArtifactRepository,
   BoardRepository,
   type BranchRepository,
-  type Database,
   ScheduleRepository,
   type SessionRepository,
   shortId,
+  type TenantScopeAwareDatabase,
   UserMCPOAuthTokenRepository,
   type UsersRepository,
 } from '@agor/core/db';
@@ -49,7 +54,10 @@ import {
 import type {
   AuthenticatedParams,
   Board,
+  BoardID,
   Branch,
+  BranchID,
+  GroupID,
   HookContext,
   MCPServer,
   Paginated,
@@ -58,7 +66,12 @@ import type {
   User,
   UserID,
 } from '@agor/core/types';
-import { hasMinimumRole, ROLES } from '@agor/core/types';
+import {
+  GATEWAY_REDACTED_SENTINEL,
+  GATEWAY_SENSITIVE_CONFIG_FIELDS,
+  hasMinimumRole,
+  ROLES,
+} from '@agor/core/types';
 import { executorRuntimeScopeGuard } from './auth/executor-runtime-scope.js';
 import type {
   BoardsServiceImpl,
@@ -66,9 +79,14 @@ import type {
   SessionsServiceImpl,
 } from './declarations.js';
 import { gatewayRouteHook } from './hooks/gateway-route.js';
+import { resolveForUserIdWithGate } from './oauth-auth-helpers.js';
 import type { ArtifactsService } from './services/artifacts.js';
 import type { GatewayService } from './services/gateway.js';
 import { groupMembershipsHooks, groupsHooks } from './services/groups.js';
+import {
+  isRemoteRelationshipsEnrichedResult,
+  markRemoteRelationshipsEnrichedResult,
+} from './services/sessions.js';
 import { isLocalAuthenticationLookup } from './services/users.js';
 import { buildSessionCreatedAnalyticsProperties } from './utils/analytics-payloads.js';
 import { applySessionConfigDefaults } from './utils/apply-session-config-defaults.js';
@@ -92,17 +110,16 @@ import {
   loadScheduleAndBranch,
   loadSession,
   loadSessionBranch,
-  PERMISSION_RANK,
   resolveSessionContext,
-  scopeFindToAccessibleBoards,
-  scopeFindToAccessibleBranches,
-  scopeFindToAccessibleSessions,
+  scopeFindToAccessibleBoardsSql,
+  scopeFindToAccessibleBranchesSql,
+  scopeFindToAccessibleSessionsSql,
   scopeScheduleQuery,
-  scopeSessionQuery,
   setSessionUnixUsername,
   validateSessionUnixUsername,
 } from './utils/branch-authorization.js';
 import { inspectBranchViaExecutor } from './utils/branch-inspect.js';
+import { emitServiceEvent } from './utils/emit-service-event.js';
 import { resolveExecutorReadAsUser } from './utils/executor-read-impersonation.js';
 import { injectCreatedBy } from './utils/inject-created-by.js';
 import {
@@ -123,11 +140,21 @@ import {
   recomputeNextRunAt,
   validateScheduleConfig,
 } from './utils/schedule-hooks.js';
+import { deferWithSessionQueueTenantScope } from './utils/session-queue-tenant-scope.js';
+import {
+  isTerminalQueueProcessingSuppressed,
+  sessionCanStartTask,
+} from './utils/session-task-state.js';
 import {
   createServiceToken,
   getDaemonUrl,
+  serviceTokenScopeForParams,
   spawnExecutorFireAndForget,
 } from './utils/spawn-executor.js';
+import {
+  createTenantDatabaseScopeAroundHook,
+  deferWithTenantContext,
+} from './utils/tenant-db-scope.js';
 
 const DEBUG_MCP_TOKENS =
   process.env.AGOR_DEBUG_MCP_TOKENS === '1' || process.env.DEBUG?.includes('mcp-tokens');
@@ -151,6 +178,10 @@ function itemHasAnyField(item: Record<string, unknown>, fields: readonly string[
   return fields.some((field) => Object.hasOwn(item, field));
 }
 
+export function shouldValidateRepoEnvironmentPayload(value: unknown): boolean {
+  return value !== undefined && value !== null;
+}
+
 async function getManagedEnvExecutionMode() {
   const config = await loadConfig();
   return config.execution?.managed_envs_execution_mode ?? MANAGED_ENV_EXECUTION_MODE_DEFAULT;
@@ -162,7 +193,10 @@ function validateRepoEnvPolicyHook() {
     const items = Array.isArray(context.data) ? context.data : [context.data];
 
     for (const item of items as Array<Record<string, unknown>>) {
-      if (Object.hasOwn(item, 'environment') && item.environment !== null) {
+      if (
+        Object.hasOwn(item, 'environment') &&
+        shouldValidateRepoEnvironmentPayload(item.environment)
+      ) {
         try {
           const env = validateRepoEnvironment(item.environment);
           validateRepoEnvironmentLifecyclePolicy(env, mode);
@@ -171,7 +205,10 @@ function validateRepoEnvPolicyHook() {
         }
       }
 
-      if (Object.hasOwn(item, 'environment_config') && item.environment_config !== null) {
+      if (
+        Object.hasOwn(item, 'environment_config') &&
+        shouldValidateRepoEnvironmentPayload(item.environment_config)
+      ) {
         try {
           const env = wrapV1AsV2(item.environment_config as Parameters<typeof wrapV1AsV2>[0]);
           if (env) validateRepoEnvironmentLifecyclePolicy(env, mode, 'legacy repo environment');
@@ -277,6 +314,46 @@ export function isPromptFlowPatchOnly(data: unknown): boolean {
   return keys.every((key) => PROMPT_FLOW_PATCH_FIELDS.includes(key));
 }
 
+export function shouldRunSessionPostTurnHooks(
+  session: Pick<Session, 'status' | 'ready_for_prompt'>
+): boolean {
+  return sessionCanStartTask(session.status, session.ready_for_prompt);
+}
+
+export function shouldDrainQueueAfterSessionPostTurnPatch(
+  session: Pick<Session, 'status' | 'ready_for_prompt'>,
+  params?: Params
+): boolean {
+  return (
+    shouldRunSessionPostTurnHooks(session) &&
+    session.ready_for_prompt === true &&
+    !isTerminalQueueProcessingSuppressed(params)
+  );
+}
+
+export function getTrustedSessionTenantId(session: unknown): string | undefined {
+  const tenantId = (session as { tenant_id?: unknown } | undefined)?.tenant_id;
+  return typeof tenantId === 'string' && tenantId.length > 0 ? tenantId : undefined;
+}
+
+export async function enrichSessionFindResultWithRemoteRelationships(
+  result: Paginated<Session> | Session[],
+  sessionsService: Pick<SessionsServiceImpl, 'enrichRemoteRelationships'>
+): Promise<Paginated<Session> | Session[]> {
+  if (isRemoteRelationshipsEnrichedResult(result)) return result;
+
+  if (Array.isArray(result)) {
+    return markRemoteRelationshipsEnrichedResult(
+      await sessionsService.enrichRemoteRelationships(result)
+    );
+  }
+
+  return markRemoteRelationshipsEnrichedResult({
+    ...result,
+    data: await sessionsService.enrichRemoteRelationships(result.data),
+  });
+}
+
 /**
  * Extended Params with route ID parameter (needed by artifact routes in hooks).
  */
@@ -294,10 +371,9 @@ interface RouteParams extends Params {
  * Interface for dependencies needed by hook registration.
  */
 export interface RegisterHooksContext {
-  db: Database;
+  db: TenantScopeAwareDatabase;
   app: Application & { io?: import('socket.io').Server };
   config: AgorConfig;
-  svcEnabled: (group: string) => boolean;
   jwtSecret: string;
   branchRbacEnabled: boolean;
   requireAuth: (context: HookContext) => Promise<HookContext>;
@@ -315,12 +391,77 @@ export interface RegisterHooksContext {
 /**
  * Register all FeathersJS service hooks.
  */
+export const TENANT_OWNED_SERVICE_PATHS = [
+  'sessions',
+  'sessions/:id/mcp-servers',
+  'session-relationships',
+  'tasks',
+  'messages',
+  'boards',
+  'boards/:id/archive',
+  'boards/:id/unarchive',
+  'repos',
+  'branches',
+  'branches/:id/owners',
+  'boards/:id/owners',
+  'schedules',
+  'users',
+  'groups',
+  'group-memberships',
+  'branches/:id/group-grants',
+  'boards/:id/group-grants',
+  'app-variables',
+  'agentic-tool-settings',
+  'agentic-tool-presets',
+  'mcp-servers',
+  'mcp-servers/discover',
+  'mcp-servers/oauth-auth-headers',
+  'mcp-servers/oauth-complete',
+  'mcp-servers/oauth-disconnect',
+  'mcp-servers/oauth-refresh',
+  'mcp-servers/oauth-start',
+  'mcp-servers/oauth-status',
+  'mcp-servers/test-oauth',
+  'card-types',
+  'cards',
+  'artifacts',
+  'artifact-trust-grants',
+  'board-objects',
+  'session-mcp-servers',
+  'user-mcp-oauth-tokens',
+  'board-comments',
+  'gateway-channels',
+  'gateway',
+  'thread-session-map',
+  'gateway-outbound-messages',
+  'session-env-selections',
+  'kb/namespaces',
+  'kb/documents',
+  'kb/document-edits',
+  'kb/versions',
+  'kb/search',
+  'kb/settings',
+  'kb/indexing/status',
+  'kb/indexing/reindex',
+  'leaderboard',
+];
+
+// These endpoints perform network/process work after their tenant DB reads,
+// so they carry tenant identity for the full request and open short database
+// units of work at the call site instead of holding an HTTP-long transaction.
+const TENANT_IDENTITY_ONLY_SERVICE_PATHS = [
+  'check-auth',
+  'claude-models',
+  'copilot-models',
+  'cursor-models',
+  'terminals',
+] as const;
+
 export function registerHooks(ctx: RegisterHooksContext): void {
   const {
     db,
     app,
     config,
-    svcEnabled,
     jwtSecret,
     branchRbacEnabled,
     requireAuth,
@@ -338,6 +479,105 @@ export function registerHooks(ctx: RegisterHooksContext): void {
       return app.service(path);
     } catch {
       return undefined;
+    }
+  };
+
+  const multiTenancy = resolveMultiTenancyConfig(config);
+  const tenantColumnsEnabled = resolveMultiTenancyDatabaseDialect(config) === 'postgresql';
+  const executionMode = resolveExecutionSecurityMode(config);
+
+  const tenantOwnedServicePaths = TENANT_OWNED_SERVICE_PATHS;
+
+  const stampTenantData = (data: unknown, tenantId: string): unknown => {
+    if (Array.isArray(data)) return data.map((item) => stampTenantData(item, tenantId));
+    if (!data || typeof data !== 'object') return data;
+    return { ...(data as Record<string, unknown>), tenant_id: tenantId };
+  };
+
+  const stripTenantData = (data: unknown): unknown => {
+    if (Array.isArray(data)) return data.map(stripTenantData);
+    if (!data || typeof data !== 'object') return data;
+    const clone = { ...(data as Record<string, unknown>) };
+    delete clone.tenant_id;
+    return clone;
+  };
+
+  const resultBelongsToTenant = (result: unknown, tenantId: string): boolean => {
+    if (Array.isArray(result)) return result.every((item) => resultBelongsToTenant(item, tenantId));
+    if (!result || typeof result !== 'object') return true;
+    const record = result as Record<string, unknown>;
+    if (Array.isArray(record.data))
+      return record.data.every((item) => resultBelongsToTenant(item, tenantId));
+    if (!('tenant_id' in record)) return true;
+    return record.tenant_id === tenantId;
+  };
+
+  const tenantDatabaseScopeAround = createTenantDatabaseScopeAroundHook({
+    db,
+    config,
+    jwtSecret,
+  });
+  const tenantIdentityAround = createTenantDatabaseScopeAroundHook({
+    db,
+    config,
+    jwtSecret,
+    transaction: false,
+  });
+
+  const ensureTenantContext = async (context: HookContext): Promise<HookContext> => {
+    try {
+      context.params.tenant = resolveTenantContext(multiTenancy, { params: context.params });
+      return context;
+    } catch (error) {
+      if (error instanceof TenantResolutionError) {
+        throw new NotAuthenticated(error.message);
+      }
+      throw error;
+    }
+  };
+
+  const scopeTenantBefore = async (context: HookContext): Promise<HookContext> => {
+    await ensureTenantContext(context);
+    const tenantId = context.params.tenant?.tenant_id;
+    if (!tenantId) return context;
+
+    if (context.method === 'create') {
+      context.data = stampTenantData(context.data, tenantId) as typeof context.data;
+    } else if (context.method === 'update' || context.method === 'patch') {
+      context.data = stripTenantData(context.data) as typeof context.data;
+    }
+
+    // Do not inject tenant_id into Feathers find queries. Several services
+    // intentionally omit tenant_id from their public DTOs; the generic in-memory
+    // adapter would then filter every row out after RLS already did the DB-level
+    // isolation. Tenant isolation for reads is enforced by the transaction-local
+    // Postgres RLS setting plus the after-hook assertion below.
+    return context;
+  };
+
+  const assertTenantAfter = async (context: HookContext): Promise<HookContext> => {
+    const tenantId = context.params.tenant?.tenant_id;
+    if (tenantId && !resultBelongsToTenant(context.result, tenantId)) {
+      throw new NotAuthenticated('Tenant isolation check failed');
+    }
+    return context;
+  };
+
+  const registerTenantHooks = (): void => {
+    for (const path of tenantOwnedServicePaths) {
+      const service = safeService(path);
+      if (!service) continue;
+      service.hooks({
+        around: { all: [path === 'gateway' ? tenantIdentityAround : tenantDatabaseScopeAround] },
+        before: { all: [scopeTenantBefore] },
+        after: { all: [assertTenantAfter] },
+      });
+    }
+  };
+
+  const registerTenantIdentityHooks = (): void => {
+    for (const path of TENANT_IDENTITY_ONLY_SERVICE_PATHS) {
+      safeService(path)?.hooks({ around: { all: [tenantIdentityAround] } });
     }
   };
 
@@ -364,8 +604,147 @@ export function registerHooks(ctx: RegisterHooksContext): void {
     return context;
   };
 
+  safeService('agentic-tool-settings')?.hooks({
+    before: {
+      patch: [requireMinimumRole(ROLES.ADMIN, 'manage workspace agentic tools')],
+    },
+  });
+
+  safeService('agentic-tool-presets')?.hooks({
+    before: {
+      create: [requireMinimumRole(ROLES.ADMIN, 'manage agentic tool presets')],
+      patch: [requireMinimumRole(ROLES.ADMIN, 'manage agentic tool presets')],
+      remove: [requireMinimumRole(ROLES.ADMIN, 'manage agentic tool presets')],
+    },
+  });
+
   const invalidateRealtimeBranchFromRoute = async (context: HookContext): Promise<HookContext> => {
     await invalidateRealtimeBranchAccess(context.params.route?.id);
+    return context;
+  };
+
+  const createExecutorServiceToken = (
+    params: Partial<AuthenticatedParams> | undefined,
+    scope: Record<string, unknown>
+  ): string | undefined => {
+    if (!jwtSecret) return undefined;
+    return createServiceToken(jwtSecret, undefined, {
+      ...serviceTokenScopeForParams(params),
+      ...scope,
+    });
+  };
+
+  const syncBranchUnixAccess = (
+    branchId: BranchID,
+    logPrefix: string,
+    params?: Partial<AuthenticatedParams>,
+    options?: { delete?: boolean; scope?: Record<string, unknown> }
+  ): void => {
+    if (!executionMode.unixFsIsolationEnabled) return;
+    const serviceToken = createExecutorServiceToken(params, {
+      ...options?.scope,
+      branch_id: branchId,
+      command: 'unix.sync-branch',
+    });
+    if (!serviceToken) return;
+    spawnExecutorFireAndForget(
+      {
+        command: 'unix.sync-branch',
+        sessionToken: serviceToken,
+        daemonUrl: getDaemonUrl(),
+        params: {
+          branchId,
+          daemonUser: config.daemon?.unix_user,
+          ...(options?.delete ? { delete: true } : {}),
+        },
+      },
+      { logPrefix }
+    );
+  };
+
+  const syncUnixAccessForBoardAlignedBranches = async (
+    boardId: unknown,
+    logPrefix: string,
+    params?: Partial<AuthenticatedParams>
+  ): Promise<void> => {
+    if (!executionMode.unixFsIsolationEnabled) return;
+    if (typeof boardId !== 'string' || boardId.length === 0) return;
+    const alignedBranches = await branchRepository.findBoardAlignedBranches(boardId as BoardID);
+    if (alignedBranches.length === 0) return;
+    console.log(
+      `[Unix Integration] Queueing board permission sync for ${alignedBranches.length} board-aligned branch(es) on board ${shortId(boardId)}`
+    );
+    for (const branch of alignedBranches) {
+      await invalidateRealtimeBranchAccess(branch.branch_id);
+    }
+
+    const serviceToken = createExecutorServiceToken(params, {
+      board_id: boardId,
+      command: 'unix.sync-board',
+    });
+    if (!serviceToken) return;
+    spawnExecutorFireAndForget(
+      {
+        command: 'unix.sync-board',
+        sessionToken: serviceToken,
+        daemonUrl: getDaemonUrl(),
+        params: {
+          boardId,
+          daemonUser: config.daemon?.unix_user,
+        },
+      },
+      { logPrefix }
+    );
+  };
+
+  const syncUnixAccessForBoardFromRoute = async (
+    context: HookContext,
+    logPrefix: string
+  ): Promise<HookContext> => {
+    await syncUnixAccessForBoardAlignedBranches(
+      context.params.route?.id,
+      logPrefix,
+      context.params as Partial<AuthenticatedParams>
+    );
+    return context;
+  };
+
+  const membershipGroupIdFromContext = (context: HookContext): GroupID | undefined => {
+    const resultGroupId = (context.result as { group_id?: unknown } | undefined)?.group_id;
+    if (typeof resultGroupId === 'string' && resultGroupId.length > 0) {
+      return resultGroupId as GroupID;
+    }
+    const dataGroupId = (context.data as { group_id?: unknown } | undefined)?.group_id;
+    if (typeof dataGroupId === 'string' && dataGroupId.length > 0) return dataGroupId as GroupID;
+    const queryGroupId = context.params.query?.group_id;
+    if (typeof queryGroupId === 'string' && queryGroupId.length > 0) return queryGroupId as GroupID;
+    const routeGroupId = context.params.route?.groupId;
+    if (typeof routeGroupId === 'string' && routeGroupId.length > 0) return routeGroupId as GroupID;
+    return undefined;
+  };
+
+  const syncUnixAccessForGroupGrantedBranches = async (
+    context: HookContext,
+    logPrefix: string
+  ): Promise<HookContext> => {
+    if (!executionMode.unixFsIsolationEnabled) return context;
+    const groupId = membershipGroupIdFromContext(context);
+    if (!groupId) {
+      console.warn(
+        `[Unix Integration] Could not resolve group_id for ${context.path}.${context.method}; skipping group membership permission sync`
+      );
+      return context;
+    }
+
+    const branchIds = await branchRepository.findExplicitFsAccessBranchIdsForGroup(groupId);
+    if (branchIds.length === 0) return context;
+    console.log(
+      `[Unix Integration] Queueing group membership permission sync for ${branchIds.length} branch(es) granted to group ${shortId(groupId)}`
+    );
+    for (const branchId of branchIds) {
+      syncBranchUnixAccess(branchId, logPrefix, context.params as Partial<AuthenticatedParams>);
+      await invalidateRealtimeBranchAccess(branchId);
+    }
     return context;
   };
 
@@ -388,9 +767,7 @@ export function registerHooks(ctx: RegisterHooksContext): void {
         // RBAC: Scope messages.find() to sessions the caller can access.
         // Without this backstop, any authenticated member could list messages
         // across every session/branch by omitting the session_id filter.
-        ...(branchRbacEnabled
-          ? [scopeFindToAccessibleSessions(sessionsRepository, superadminOpts)]
-          : []),
+        ...(branchRbacEnabled ? [scopeFindToAccessibleSessionsSql(superadminOpts)] : []),
       ],
       get: [
         ...(branchRbacEnabled
@@ -477,7 +854,6 @@ export function registerHooks(ctx: RegisterHooksContext): void {
   // ============================================================================
   // Board objects hooks
   // ============================================================================
-
   safeService('board-objects')?.hooks({
     before: {
       all: [
@@ -485,84 +861,11 @@ export function registerHooks(ctx: RegisterHooksContext): void {
         requireAuth,
         requireMinimumRole(ROLES.MEMBER, 'manage board objects'),
       ],
-      // NOTE: We deliberately do NOT add scopeFindToAccessibleBranches here.
-      // Board-objects may reference `branch_id` (branch cards) OR `card_id`
-      // (kanban cards with no branch) OR neither (zones, layout objects).
-      // The before-hook would filter out rows with null branch_id, breaking
-      // card-only boards. Access control lives in the after-hook below, which
-      // correctly preserves card/zone rows while scoping branch-bound ones.
-    },
-    after: {
-      find: [
-        ...(branchRbacEnabled
-          ? [
-              // Filter board-objects based on branch access permissions
-              async (context: HookContext) => {
-                // Skip for internal calls
-                if (!context.params.provider) {
-                  return context;
-                }
-
-                const userId = context.params.user?.user_id as
-                  | import('@agor/core/types').UUID
-                  | undefined;
-                if (!userId) {
-                  // Not authenticated - return empty results
-                  context.result = {
-                    total: 0,
-                    limit: context.result?.limit ?? 0,
-                    skip: context.result?.skip ?? 0,
-                    data: [],
-                  };
-                  return context;
-                }
-
-                // Get all board objects from result
-                // biome-ignore lint/suspicious/noExplicitAny: BoardObject type not fully available in hook context
-                const boardObjects: any[] = context.result?.data ?? context.result ?? [];
-
-                // Filter based on branch access
-                const authorizedBoardObjects = [];
-                for (const boardObject of boardObjects) {
-                  // Board objects may reference branches or sessions
-                  if (boardObject.branch_id) {
-                    // Check branch access
-                    const branch = await branchRepository.findById(boardObject.branch_id);
-                    if (!branch) {
-                      continue; // Skip if branch doesn't exist
-                    }
-
-                    const effectivePermission = await branchRepository.resolveUserPermission(
-                      branch,
-                      userId
-                    );
-                    const hasAccess = PERMISSION_RANK[effectivePermission] >= PERMISSION_RANK.view;
-
-                    if (hasAccess) {
-                      authorizedBoardObjects.push(boardObject);
-                    }
-                  } else if (boardObject.card_id) {
-                    // Card board objects: cards inherit board-level access (no per-card RBAC)
-                    authorizedBoardObjects.push(boardObject);
-                  } else {
-                    // No branch or card reference - allow access (e.g., zones, other board objects)
-                    authorizedBoardObjects.push(boardObject);
-                  }
-                }
-
-                // Update result
-                if (context.result?.data) {
-                  context.result.data = authorizedBoardObjects;
-                  context.result.total = authorizedBoardObjects.length;
-                } else {
-                  context.result = authorizedBoardObjects;
-                }
-
-                return context;
-              },
-            ]
-          : []),
-      ],
+      // Board-objects may reference a branch or may be loose board/card/layout
+      // rows. The service composes this marker into an object-specific SQL
+      // predicate: branch-bound rows require branch access; loose rows require
+      // board visibility.
+      find: [...(branchRbacEnabled ? [scopeFindToAccessibleBoardsSql(superadminOpts)] : [])],
     },
   });
 
@@ -622,13 +925,10 @@ export function registerHooks(ctx: RegisterHooksContext): void {
       all: [requireAuth],
       find: [
         // RBAC: Artifacts carry a `branch_id` (nullable — survives branch deletion).
-        // Scope find() to the branches the caller can access. Rows with null
-        // branch_id (orphaned artifacts) will be excluded by the $in filter,
-        // which is the safe default — orphans can only be surfaced via explicit
-        // board-scoped queries.
-        ...(branchRbacEnabled
-          ? [scopeFindToAccessibleBranches(branchRepository, superadminOpts)]
-          : []),
+        // Scope find() to the branches the caller can access. The service pushes
+        // this into SQL as a correlated visibility predicate rather than
+        // preloading ids and injecting `branch_id IN (...)`.
+        ...(branchRbacEnabled ? [scopeFindToAccessibleBranchesSql(superadminOpts)] : []),
       ],
       create: [requireMinimumRole(ROLES.MEMBER, 'create artifacts'), injectCreatedBy()],
       patch: [requireMinimumRole(ROLES.MEMBER, 'update artifacts'), ensureArtifactOwnerOrAdmin()],
@@ -637,7 +937,7 @@ export function registerHooks(ctx: RegisterHooksContext): void {
   });
 
   // Custom REST routes for artifact payload and console
-  if (svcEnabled('artifacts')) {
+  {
     registerAuthenticatedRoute(
       app,
       '/artifacts/:id/payload',
@@ -658,7 +958,10 @@ export function registerHooks(ctx: RegisterHooksContext): void {
       '/artifacts/:id/console',
       {
         async create(
-          data: { entries: Array<{ timestamp: number; level: string; message: string }> },
+          data: {
+            entries: Array<{ timestamp: number; level: string; message: string }>;
+            content_hash?: string;
+          },
           _params: RouteParams
         ) {
           const artifactId = _params.route?.id;
@@ -673,7 +976,12 @@ export function registerHooks(ctx: RegisterHooksContext): void {
           if (!artifactsService.isVisibleTo(artifact, userId)) {
             throw new Error(`Artifact ${artifactId} not found`);
           }
-          artifactsService.appendConsoleLogs(artifactId, userId, data.entries as never);
+          await artifactsService.appendConsoleLogs(
+            artifactId,
+            userId,
+            data.entries as never,
+            data.content_hash
+          );
           return { success: true };
         },
       },
@@ -691,6 +999,7 @@ export function registerHooks(ctx: RegisterHooksContext): void {
           data: {
             error: import('@agor/core/types').SandpackError | null;
             status?: string;
+            content_hash?: string;
           },
           _params: RouteParams
         ) {
@@ -703,7 +1012,13 @@ export function registerHooks(ctx: RegisterHooksContext): void {
           if (!artifactsService.isVisibleTo(artifact, userId)) {
             throw new Error(`Artifact ${artifactId} not found`);
           }
-          artifactsService.setSandpackError(artifactId, userId, data.error, data.status);
+          await artifactsService.setSandpackError(
+            artifactId,
+            userId,
+            data.error,
+            data.status,
+            data.content_hash
+          );
           return { success: true };
         },
       },
@@ -845,6 +1160,12 @@ export function registerHooks(ctx: RegisterHooksContext): void {
   safeService('board-comments')?.hooks({
     before: {
       all: [typedValidateQuery(boardCommentQueryValidator), requireAuth],
+      find: [
+        // Board comments inherit board visibility for pure board/spatial
+        // comments and branch/session/task/message visibility for attached
+        // comments. The service pushes the marker into SQL.
+        ...(branchRbacEnabled ? [scopeFindToAccessibleBoardsSql(superadminOpts)] : []),
+      ],
       create: [requireMinimumRole(ROLES.MEMBER, 'create board comments'), injectCreatedBy()],
       patch: [requireMinimumRole(ROLES.MEMBER, 'update board comments')],
       remove: [requireMinimumRole(ROLES.MEMBER, 'delete board comments')],
@@ -889,11 +1210,9 @@ export function registerHooks(ctx: RegisterHooksContext): void {
         requireMinimumRole(ROLES.MEMBER, 'access branches'),
       ],
       find: [
-        // RBAC: compose an accessible branch_id filter and let BranchesService.find()
-        // handle service-level filters/enrichment (including virtual zone_id).
-        ...(branchRbacEnabled
-          ? [scopeFindToAccessibleBranches(branchRepository, superadminOpts)]
-          : []),
+        // RBAC: mark external regular-user finds for BranchesService to compose
+        // the shared branch visibility predicate directly into its SQL read.
+        ...(branchRbacEnabled ? [scopeFindToAccessibleBranchesSql(superadminOpts)] : []),
       ],
       get: [
         ...(branchRbacEnabled
@@ -923,8 +1242,8 @@ export function registerHooks(ctx: RegisterHooksContext): void {
               ensureBranchPermission('all', 'update branches', superadminOpts), // Require 'all' permission to update
             ]
           : []),
-        // Capture previous others_fs_access for comparison in after hook
-        ...(branchRbacEnabled
+        // Capture previous others_fs_access for comparison in after Unix sync hook.
+        ...(executionMode.unixFsIsolationEnabled
           ? [
               async (context: HookContext) => {
                 const patchData = context.data as Partial<import('@agor/core/types').Branch>;
@@ -934,7 +1253,7 @@ export function registerHooks(ctx: RegisterHooksContext): void {
                 };
                 if (Object.hasOwn(patchData, 'others_fs_access') && !params._skipUnixSync) {
                   // Fetch current value to compare in after hook
-                  const branch = await context.service.get(context.id);
+                  const branch = await context.service.get(context.id, context.params);
                   params._previousOthersFsAccess = branch.others_fs_access;
                 }
                 return context;
@@ -956,7 +1275,7 @@ export function registerHooks(ctx: RegisterHooksContext): void {
         ...(branchRbacEnabled
           ? [
               async (context: HookContext) => {
-                // RBAC + Unix Integration: Create Unix group and add initial owner
+                // RBAC: Add the creator as the initial branch owner
                 const branch = context.result as import('@agor/core/types').Branch;
                 const creatorId = branch.created_by;
 
@@ -981,7 +1300,7 @@ export function registerHooks(ctx: RegisterHooksContext): void {
       ],
       patch: [
         invalidateRealtimeBranchFromResult,
-        ...(branchRbacEnabled
+        ...(executionMode.unixFsIsolationEnabled
           ? [
               async (context: HookContext) => {
                 // Unix Integration: Sync branch permissions when others_fs_access changes
@@ -1020,29 +1339,16 @@ export function registerHooks(ctx: RegisterHooksContext): void {
                   return context;
                 }
 
-                // Fire-and-forget sync to executor
-                // The executor will handle permission changes idempotently
-                if (jwtSecret) {
-                  console.log(
-                    `[Unix Integration] Syncing permissions for branch ${shortId(branch.branch_id)} (others_fs_access: ${previousValue} -> ${branch.others_fs_access})`
-                  );
-                  const serviceToken = createServiceToken(jwtSecret, undefined, {
-                    branch_id: branch.branch_id,
-                    command: 'unix.sync-branch',
-                  });
-                  spawnExecutorFireAndForget(
-                    {
-                      command: 'unix.sync-branch',
-                      sessionToken: serviceToken,
-                      daemonUrl: getDaemonUrl(),
-                      params: {
-                        branchId: branch.branch_id,
-                        daemonUser: config.daemon?.unix_user,
-                      },
-                    },
-                    { logPrefix: '[Executor/branch.patch]' }
-                  );
-                }
+                // Fire-and-forget sync to executor.
+                // The executor will handle permission changes idempotently.
+                console.log(
+                  `[Unix Integration] Syncing permissions for branch ${shortId(branch.branch_id)} (others_fs_access: ${previousValue} -> ${branch.others_fs_access})`
+                );
+                syncBranchUnixAccess(
+                  branch.branch_id,
+                  '[Executor/branch.patch]',
+                  context.params as Partial<AuthenticatedParams>
+                );
 
                 return context;
               },
@@ -1051,32 +1357,19 @@ export function registerHooks(ctx: RegisterHooksContext): void {
       ],
       remove: [
         invalidateRealtimeBranchFromResult,
-        ...(branchRbacEnabled
+        ...(executionMode.unixFsIsolationEnabled
           ? [
               async (context: HookContext) => {
                 // Unix Integration: Delete Unix group when branch is deleted
                 const branchId = context.id as import('@agor/core/types').BranchID;
 
-                // Fire-and-forget sync with delete flag to executor
-                if (jwtSecret) {
-                  const serviceToken = createServiceToken(jwtSecret, undefined, {
-                    branch_id: branchId,
-                    command: 'unix.sync-branch',
-                  });
-                  spawnExecutorFireAndForget(
-                    {
-                      command: 'unix.sync-branch',
-                      sessionToken: serviceToken,
-                      daemonUrl: getDaemonUrl(),
-                      params: {
-                        branchId,
-                        daemonUser: config.daemon?.unix_user,
-                        delete: true, // Signal to delete the group instead of syncing
-                      },
-                    },
-                    { logPrefix: '[Executor/branch.remove]' }
-                  );
-                }
+                // Fire-and-forget sync with delete flag to executor.
+                syncBranchUnixAccess(
+                  branchId,
+                  '[Executor/branch.remove]',
+                  context.params as Partial<AuthenticatedParams>,
+                  { delete: true }
+                );
 
                 return context;
               },
@@ -1170,19 +1463,16 @@ export function registerHooks(ctx: RegisterHooksContext): void {
     const queryForUserId = (context.params?.query as Record<string, unknown>)?.forUserId as
       | string
       | undefined;
-    const userId = context.params?.user?.user_id || queryForUserId;
-    const source = context.params?.user?.user_id
-      ? 'socket-auth'
-      : queryForUserId
-        ? 'query-param'
-        : 'none';
-    console.log(
-      `[MCP OAuth] injectPerUserOAuthTokens called - userId: ${userId || 'NONE'}, ` +
-        `source: ${source}, provider: ${context.params?.provider || 'internal'}, ` +
-        `method: ${context.method}, resultCount: ${Array.isArray(context.result) ? context.result.length : 1}`
-    );
+    const authPayloadType = (
+      context.params?.authentication as { payload?: { type?: unknown } } | undefined
+    )?.payload?.type;
+    const userId = resolveForUserIdWithGate({
+      queryForUserId,
+      isServiceAccount: context.params?.user?._isServiceAccount,
+      authPayloadType,
+      callerUserId: context.params?.user?.user_id,
+    });
     if (!userId) {
-      console.log('[MCP OAuth] No user ID - skipping token injection');
       return context;
     }
 
@@ -1203,9 +1493,6 @@ export function registerHooks(ctx: RegisterHooksContext): void {
         const row = await userTokenRepo.getToken(tokenUserId, server.mcp_server_id);
 
         if (!row) {
-          console.log(
-            `[MCP OAuth] No token row for user=${tokenUserId ?? '<shared>'} server=${server.name}`
-          );
           return server;
         }
 
@@ -1314,9 +1601,7 @@ export function registerHooks(ctx: RegisterHooksContext): void {
       find: [
         requireMinimumRole(ROLES.MEMBER, 'list session MCP servers'),
         // RBAC: Scope to sessions the caller can access.
-        ...(branchRbacEnabled
-          ? [scopeFindToAccessibleSessions(sessionsRepository, superadminOpts)]
-          : []),
+        ...(branchRbacEnabled ? [scopeFindToAccessibleSessionsSql(superadminOpts)] : []),
       ],
     },
     after: {
@@ -1335,10 +1620,8 @@ export function registerHooks(ctx: RegisterHooksContext): void {
       all: [requireAuth],
       find: [
         requireMinimumRole(ROLES.MEMBER, 'list session env selections'),
-        // RBAC: Scope to sessions the caller can access.
-        ...(branchRbacEnabled
-          ? [scopeFindToAccessibleSessions(sessionsRepository, superadminOpts)]
-          : []),
+        // This top-level service is event-only and always returns []; do not
+        // run RBAC preloads for an intentionally empty result set.
       ],
     },
   });
@@ -1352,19 +1635,15 @@ export function registerHooks(ctx: RegisterHooksContext): void {
   // Also starts/stops Socket Mode listeners for created/updated/deleted channels.
   const refreshGatewayChannelState = async (context: HookContext) => {
     const gw = context.app.service('gateway') as unknown as GatewayService;
-
-    // Refresh the hasActiveChannels flag
-    gw.refreshChannelState().catch((err: unknown) =>
-      console.warn('[gateway] Failed to refresh channel state:', err)
-    );
-
-    // Start/stop listener for created/updated channel
     const channel = context.result as { id: string } | undefined;
-    if (channel?.id) {
-      gw.startListenerForChannel(channel.id).catch((err: unknown) =>
-        console.warn(`[gateway] Failed to manage listener for channel ${channel.id}:`, err)
-      );
-    }
+    deferWithTenantContext(
+      context.params,
+      async () => {
+        await gw.refreshChannelState();
+        if (channel?.id) await gw.startListenerForChannel(channel.id);
+      },
+      (err) => console.warn('[gateway] Failed to refresh channel/listener state:', err)
+    );
 
     return context;
   };
@@ -1376,8 +1655,10 @@ export function registerHooks(ctx: RegisterHooksContext): void {
     // Stop listener for deleted channel (use id from route params)
     const channelId = context.id as string | undefined;
     if (channelId) {
-      gw.stopChannelListener(channelId).catch((err: unknown) =>
-        console.warn(`[gateway] Failed to stop listener for channel ${channelId}:`, err)
+      deferWithTenantContext(
+        context.params,
+        () => gw.stopChannelListener(channelId),
+        (err) => console.warn(`[gateway] Failed to stop listener for channel ${channelId}:`, err)
       );
     }
 
@@ -1419,6 +1700,10 @@ export function registerHooks(ctx: RegisterHooksContext): void {
           const data = context.data as Record<string, unknown> | undefined;
           if (!data || !context.id) return context;
 
+          // Explicit null means clear all agentic config. Do not resurrect envVars
+          // from the existing row while resolving redacted sentinels.
+          if (data.agentic_config === null) return context;
+
           let ac = data.agentic_config as Record<string, unknown> | undefined;
           const hadAgenticConfigInPatch = ac !== undefined;
           const ensureAc = (): Record<string, unknown> => {
@@ -1429,7 +1714,7 @@ export function registerHooks(ctx: RegisterHooksContext): void {
             return ac;
           };
 
-          const SENTINEL = '••••••••';
+          const SENTINEL = GATEWAY_REDACTED_SENTINEL;
           const incomingVars = ac?.envVars as
             | { key: string; value: string; forceOverride: boolean }[]
             | undefined;
@@ -1498,15 +1783,9 @@ export function registerHooks(ctx: RegisterHooksContext): void {
           const redact = (channel: Record<string, unknown>) => {
             if (channel?.config && typeof channel.config === 'object') {
               const config = { ...(channel.config as Record<string, unknown>) };
-              for (const field of [
-                'bot_token',
-                'app_token',
-                'signing_secret',
-                'private_key',
-                'webhook_secret',
-              ]) {
+              for (const field of GATEWAY_SENSITIVE_CONFIG_FIELDS) {
                 if (config[field]) {
-                  config[field] = '••••••••';
+                  config[field] = GATEWAY_REDACTED_SENTINEL;
                 }
               }
               channel.config = config;
@@ -1517,7 +1796,11 @@ export function registerHooks(ctx: RegisterHooksContext): void {
               if (Array.isArray(ac.envVars)) {
                 ac.envVars = (
                   ac.envVars as { key: string; value: string; forceOverride: boolean }[]
-                ).map((v) => ({ key: v.key, value: '••••••••', forceOverride: v.forceOverride }));
+                ).map((v) => ({
+                  key: v.key,
+                  value: GATEWAY_REDACTED_SENTINEL,
+                  forceOverride: v.forceOverride,
+                }));
               }
             }
           };
@@ -1548,12 +1831,9 @@ export function registerHooks(ctx: RegisterHooksContext): void {
   // Gateway service create (postMessage) authenticates via channel_key, not user auth
   // No hooks needed — auth is handled internally by the service
 
-  app.service('config').hooks({
+  safeService('admin/local-actions')?.hooks({
     before: {
-      all: [requireAuth],
-      find: [requireMinimumRole(ROLES.ADMIN, 'view configuration')],
-      get: [requireMinimumRole(ROLES.ADMIN, 'view configuration')],
-      patch: [requireMinimumRole(ROLES.ADMIN, 'update configuration')],
+      create: [requireAuth, requireMinimumRole(ROLES.ADMIN, 'run local admin actions')],
     },
   });
 
@@ -1646,8 +1926,16 @@ export function registerHooks(ctx: RegisterHooksContext): void {
   safeService('group-memberships')?.hooks(groupMembershipsHooks);
   safeService('group-memberships')?.hooks({
     after: {
-      create: [clearRealtimeBranchVisibility],
-      remove: [clearRealtimeBranchVisibility],
+      create: [
+        clearRealtimeBranchVisibility,
+        (context: HookContext) =>
+          syncUnixAccessForGroupGrantedBranches(context, '[Executor/group-memberships.create]'),
+      ],
+      remove: [
+        clearRealtimeBranchVisibility,
+        (context: HookContext) =>
+          syncUnixAccessForGroupGrantedBranches(context, '[Executor/group-memberships.remove]'),
+      ],
     },
   });
   safeService('branches/:id/owners')?.hooks({
@@ -1658,22 +1946,81 @@ export function registerHooks(ctx: RegisterHooksContext): void {
   });
   safeService('branches/:id/group-grants')?.hooks({
     after: {
-      create: [invalidateRealtimeBranchFromRoute],
-      patch: [invalidateRealtimeBranchFromRoute],
-      remove: [invalidateRealtimeBranchFromRoute],
+      create: [
+        invalidateRealtimeBranchFromRoute,
+        (context: HookContext) => {
+          const branchId = context.params.route?.id;
+          if (typeof branchId === 'string') {
+            syncBranchUnixAccess(
+              branchId as BranchID,
+              '[Executor/branch-group-grants.create]',
+              context.params as Partial<AuthenticatedParams>
+            );
+          }
+          return context;
+        },
+      ],
+      patch: [
+        invalidateRealtimeBranchFromRoute,
+        (context: HookContext) => {
+          const branchId = context.params.route?.id;
+          if (typeof branchId === 'string') {
+            syncBranchUnixAccess(
+              branchId as BranchID,
+              '[Executor/branch-group-grants.patch]',
+              context.params as Partial<AuthenticatedParams>
+            );
+          }
+          return context;
+        },
+      ],
+      remove: [
+        invalidateRealtimeBranchFromRoute,
+        (context: HookContext) => {
+          const branchId = context.params.route?.id;
+          if (typeof branchId === 'string') {
+            syncBranchUnixAccess(
+              branchId as BranchID,
+              '[Executor/branch-group-grants.remove]',
+              context.params as Partial<AuthenticatedParams>
+            );
+          }
+          return context;
+        },
+      ],
     },
   });
   safeService('boards/:id/owners')?.hooks({
     after: {
-      create: [clearRealtimeBranchVisibility],
-      remove: [clearRealtimeBranchVisibility],
+      create: [
+        clearRealtimeBranchVisibility,
+        (context: HookContext) =>
+          syncUnixAccessForBoardFromRoute(context, '[Executor/board-owners.create]'),
+      ],
+      remove: [
+        clearRealtimeBranchVisibility,
+        (context: HookContext) =>
+          syncUnixAccessForBoardFromRoute(context, '[Executor/board-owners.remove]'),
+      ],
     },
   });
   safeService('boards/:id/group-grants')?.hooks({
     after: {
-      create: [clearRealtimeBranchVisibility],
-      patch: [clearRealtimeBranchVisibility],
-      remove: [clearRealtimeBranchVisibility],
+      create: [
+        clearRealtimeBranchVisibility,
+        (context: HookContext) =>
+          syncUnixAccessForBoardFromRoute(context, '[Executor/board-group-grants.create]'),
+      ],
+      patch: [
+        clearRealtimeBranchVisibility,
+        (context: HookContext) =>
+          syncUnixAccessForBoardFromRoute(context, '[Executor/board-group-grants.patch]'),
+      ],
+      remove: [
+        clearRealtimeBranchVisibility,
+        (context: HookContext) =>
+          syncUnixAccessForBoardFromRoute(context, '[Executor/board-group-grants.remove]'),
+      ],
     },
   });
 
@@ -1827,8 +2174,8 @@ export function registerHooks(ctx: RegisterHooksContext): void {
       // After user create/patch: optionally ensure Unix user exists and sync password
       create: [
         async (context: HookContext) => {
-          // Need JWT secret for service tokens (required by executor)
-          if (!jwtSecret) {
+          // Need Unix integration and JWT secret for executor service tokens.
+          if (!executionMode.unixImpersonationEnabled || !jwtSecret) {
             return context;
           }
 
@@ -1850,10 +2197,14 @@ export function registerHooks(ctx: RegisterHooksContext): void {
 
           // Fire-and-forget sync to executor
           console.log(`[Unix Integration] Syncing Unix user for: ${user.unix_username}`);
-          const serviceToken = createServiceToken(jwtSecret, undefined, {
-            user_id: user.user_id,
-            command: 'unix.sync-user',
-          });
+          const serviceToken = createExecutorServiceToken(
+            context.params as Partial<AuthenticatedParams>,
+            {
+              user_id: user.user_id,
+              command: 'unix.sync-user',
+            }
+          );
+          if (!serviceToken) return context;
           spawnExecutorFireAndForget(
             {
               command: 'unix.sync-user',
@@ -1870,11 +2221,29 @@ export function registerHooks(ctx: RegisterHooksContext): void {
 
           return context;
         },
+        async (context: HookContext) => {
+          if ((context.params as Params & { skipAvatarRefresh?: boolean }).skipAvatarRefresh) {
+            return context;
+          }
+          const user = context.result as User;
+          const avatarService = safeService('users') as
+            | { refreshAvatarFromSettings?: (userId: UserID) => Promise<unknown> }
+            | undefined;
+          if (avatarService?.refreshAvatarFromSettings) {
+            avatarService.refreshAvatarFromSettings(user.user_id).catch((error: unknown) => {
+              console.warn(
+                `[users/avatar-sync] Failed to refresh avatar for new user ${shortId(user.user_id)}:`,
+                error instanceof Error ? error.message : String(error)
+              );
+            });
+          }
+          return context;
+        },
       ],
       patch: [
         async (context: HookContext) => {
-          // Need JWT secret for service tokens (required by executor)
-          if (!jwtSecret) {
+          // Need Unix integration and JWT secret for executor service tokens.
+          if (!executionMode.unixImpersonationEnabled || !jwtSecret) {
             return context;
           }
 
@@ -1901,10 +2270,14 @@ export function registerHooks(ctx: RegisterHooksContext): void {
 
           // Fire-and-forget sync to executor
           console.log(`[Unix Integration] Syncing Unix user for: ${user.unix_username}`);
-          const serviceToken = createServiceToken(jwtSecret, undefined, {
-            user_id: user.user_id,
-            command: 'unix.sync-user',
-          });
+          const serviceToken = createExecutorServiceToken(
+            context.params as Partial<AuthenticatedParams>,
+            {
+              user_id: user.user_id,
+              command: 'unix.sync-user',
+            }
+          );
+          if (!serviceToken) return context;
           spawnExecutorFireAndForget(
             {
               command: 'unix.sync-user',
@@ -1921,6 +2294,28 @@ export function registerHooks(ctx: RegisterHooksContext): void {
 
           return context;
         },
+        async (context: HookContext) => {
+          if ((context.params as Params & { skipAvatarRefresh?: boolean }).skipAvatarRefresh) {
+            return context;
+          }
+          const data = context.data as { email?: string; preferences?: unknown } | undefined;
+          if (data?.email === undefined && data?.preferences === undefined) {
+            return context;
+          }
+          const user = context.result as User;
+          const avatarService = safeService('users') as
+            | { refreshAvatarFromSettings?: (userId: UserID) => Promise<unknown> }
+            | undefined;
+          if (avatarService?.refreshAvatarFromSettings) {
+            avatarService.refreshAvatarFromSettings(user.user_id).catch((error: unknown) => {
+              console.warn(
+                `[users/avatar-sync] Failed to refresh avatar for updated user ${shortId(user.user_id)}:`,
+                error instanceof Error ? error.message : String(error)
+              );
+            });
+          }
+          return context;
+        },
       ],
     },
   });
@@ -1931,11 +2326,13 @@ export function registerHooks(ctx: RegisterHooksContext): void {
 
   configureRealtimePublish({
     app,
+    db,
     branchRbacEnabled,
     branchRepository,
     sessionsRepository,
     accessCache: realtimeAccessCache,
     allowSuperadmin: superadminOpts.allowSuperadmin,
+    multiTenancy,
   });
 
   // ============================================================================
@@ -1946,8 +2343,9 @@ export function registerHooks(ctx: RegisterHooksContext): void {
     before: {
       all: [typedValidateQuery(sessionQueryValidator), requireAuth, executorRuntimeScopeGuard()],
       find: [
-        // RBAC: Optimized SQL-based filtering (single query with JOIN on branches, no N+1)
-        ...(branchRbacEnabled ? [scopeSessionQuery(sessionsRepository, superadminOpts)] : []),
+        // RBAC: mark external regular-user finds for SessionsService to compose
+        // the shared branch visibility predicate directly into its SQL read.
+        ...(branchRbacEnabled ? [scopeFindToAccessibleSessionsSql(superadminOpts)] : []),
       ],
       get: [
         ...(branchRbacEnabled
@@ -2028,6 +2426,9 @@ export function registerHooks(ctx: RegisterHooksContext): void {
                             | undefined
                         ),
                         logPrefix: `[sessions.create ${branch.name}]`,
+                        serviceTokenScope: serviceTokenScopeForParams(
+                          context.params as AuthenticatedParams
+                        ),
                       }
                     );
                     (context.data as Record<string, unknown>).git_state = {
@@ -2039,7 +2440,8 @@ export function registerHooks(ctx: RegisterHooksContext): void {
                       `✅ Auto-populated git_state from branch: ref=${currentRef}, sha=${currentSha.substring(0, 8)}`
                     );
                   } catch (gitError) {
-                    console.warn('Failed to auto-populate git_state from branch:', gitError);
+                    const message = gitError instanceof Error ? gitError.message : String(gitError);
+                    console.warn(`Failed to auto-populate git_state from branch: ${message}`);
                   }
                 }
               }
@@ -2048,11 +2450,12 @@ export function registerHooks(ctx: RegisterHooksContext): void {
             }
           }
 
-          // Validate user has prompt permission on callback target session's branch
+          // Validate user has prompt permission on callback target session's branch.
+          // Skip for internal calls (no provider) — those are trusted system calls.
           const cbConfig = (context.data as Record<string, unknown> | undefined)?.callback_config as
             | { callback_session_id?: string }
             | undefined;
-          if (cbConfig?.callback_session_id) {
+          if (cbConfig?.callback_session_id && context.params.provider) {
             // Use authenticated user, NOT context.data.created_by (which could be client-supplied)
             const authenticatedUserId =
               (context.params as { user?: { user_id: string } }).user?.user_id || 'unknown';
@@ -2095,11 +2498,14 @@ export function registerHooks(ctx: RegisterHooksContext): void {
               },
             ]
           : []),
-        // Validate user has prompt permission on callback target session's branch
+        // Validate user has prompt permission on callback target session's branch.
+        // Skip for internal calls (no provider) — patches from dispatchCompletionCallbacks
+        // spread the existing callback_config (which includes callback_session_id) and must
+        // not be blocked by this check.
         async (context) => {
           const patchCbConfig = (context.data as Record<string, unknown> | undefined)
             ?.callback_config as { callback_session_id?: string } | undefined;
-          if (patchCbConfig?.callback_session_id) {
+          if (patchCbConfig?.callback_session_id && context.params.provider) {
             const userId =
               (context.params as { user?: { user_id: string } }).user?.user_id || 'unknown';
             await ensureCanPromptTargetSession(
@@ -2124,6 +2530,17 @@ export function registerHooks(ctx: RegisterHooksContext): void {
       ],
     },
     after: {
+      find: [
+        async (context) => {
+          // Session find results may be produced by custom hooks or service
+          // methods. Enrich once, as a single batched query over the final page.
+          context.result = await enrichSessionFindResultWithRemoteRelationships(
+            context.result as Paginated<Session> | Session[],
+            sessionsService
+          );
+          return context;
+        },
+      ],
       get: [
         async (context) => {
           // Attach an MCP token for fetched session (cached/reused when still valid).
@@ -2139,14 +2556,16 @@ export function registerHooks(ctx: RegisterHooksContext): void {
             !canReceiveMcpTokenForSession({
               callerUserId: callerUser?.user_id,
               callerRole: callerUser?.role,
-              sessionCreatedBy: session.created_by,
             })
           ) {
             return context;
           }
 
           const { generateSessionToken } = await import('./mcp/tokens.js');
-          const userId = session.created_by || 'unknown';
+          const userId = callerUser?.user_id;
+          if (!userId) {
+            return context;
+          }
 
           const jwtSecret = app.settings.authentication?.secret;
           if (!jwtSecret) {
@@ -2184,24 +2603,31 @@ export function registerHooks(ctx: RegisterHooksContext): void {
         async (context) => {
           const session = context.result as Session;
           if (session.agentic_tool !== 'claude-code-cli') return context;
-          try {
-            const branch = await context.app
-              .service('branches')
-              .get(session.branch_id, { provider: undefined });
-            const cwd = (branch as { path?: string } | undefined)?.path;
-            if (cwd) {
+          // Session creation is tenant-transactional. Defer filesystem,
+          // watcher, and terminal integration until after commit while retaining
+          // tenant identity; each DB helper then opens its own short unit.
+          deferWithTenantContext(
+            context.params,
+            async () => {
+              const branch = await context.app
+                .service('branches')
+                .get(session.branch_id, { provider: undefined });
+              const cwd = (branch as { path?: string } | undefined)?.path;
+              if (!cwd) {
+                console.warn(
+                  `[claude-cli-integration] no branch.path for session ${session.session_id}; skipping spawn`
+                );
+                return;
+              }
               const { onCliSessionCreated } = await import('./services/claude-cli-integration.js');
               await onCliSessionCreated(context.app, session, cwd);
-            } else {
-              console.warn(
-                `[claude-cli-integration] no branch.path for session ${session.session_id}; skipping spawn`
-              );
+            },
+            (err) => {
+              // Never fail the committed session on integration errors — the
+              // session row is still useful even if the watcher misfires.
+              console.error('[claude-cli-integration] onCliSessionCreated failed:', err);
             }
-          } catch (err) {
-            // Never fail the session create on integration errors — the
-            // session row is still useful even if the watcher misfires.
-            console.error('[claude-cli-integration] onCliSessionCreated failed:', err);
-          }
+          );
           return context;
         },
         async (context) => {
@@ -2210,16 +2636,25 @@ export function registerHooks(ctx: RegisterHooksContext): void {
             return context;
           }
 
-          // Gate MCP token issuance on member+ role (see `after: get` note).
-          const callerRole = (context.params as AuthenticatedParams).user?.role;
-          if (!hasMinimumRole(callerRole, ROLES.MEMBER)) {
+          // Gate MCP token issuance through the same caller-scoped policy as `after:get`.
+          const callerUser = (context.params as AuthenticatedParams).user;
+          if (
+            !canReceiveMcpTokenForSession({
+              callerUserId: callerUser?.user_id,
+              callerRole: callerUser?.role,
+            })
+          ) {
             return context;
           }
 
           // Resolve MCP token for this session (cached/reused when still valid).
+          // Mint it for the active caller, not for an inherited/parent creator.
           const { generateSessionToken } = await import('./mcp/tokens.js');
           const session = context.result as Session;
-          const userId = session.created_by || 'unknown';
+          const userId = callerUser?.user_id;
+          if (!userId) {
+            return context;
+          }
 
           // Get JWT secret from app settings
           const jwtSecret = app.settings.authentication?.secret;
@@ -2253,7 +2688,7 @@ export function registerHooks(ctx: RegisterHooksContext): void {
         // unix groups. Without this, non-owners can't access the .git/ directory
         // (which uses 2770 = no others access) even if the branch directory itself
         // allows "others" access via ACLs.
-        ...(branchRbacEnabled
+        ...(executionMode.unixFsIsolationEnabled
           ? [
               async (context: HookContext) => {
                 const session = context.result as Session;
@@ -2277,29 +2712,16 @@ export function registerHooks(ctx: RegisterHooksContext): void {
                   }
 
                   // Fire-and-forget: trigger unix.sync-branch to add session user to groups
-                  if (jwtSecret) {
-                    console.log(
-                      `[Unix Integration] Non-owner session created in branch ${shortId(session.branch_id)} ` +
-                        `by ${session.unix_username} (others_fs_access: ${branch.others_fs_access}), syncing group membership`
-                    );
-                    const serviceToken = createServiceToken(jwtSecret, undefined, {
-                      branch_id: branch.branch_id,
-                      session_id: session.session_id,
-                      command: 'unix.sync-branch',
-                    });
-                    spawnExecutorFireAndForget(
-                      {
-                        command: 'unix.sync-branch',
-                        sessionToken: serviceToken,
-                        daemonUrl: getDaemonUrl(),
-                        params: {
-                          branchId: session.branch_id,
-                          daemonUser: config.daemon?.unix_user,
-                        },
-                      },
-                      { logPrefix: '[Executor/session.create.unix-group]' }
-                    );
-                  }
+                  console.log(
+                    `[Unix Integration] Non-owner session created in branch ${shortId(session.branch_id)} ` +
+                      `by ${session.unix_username} (others_fs_access: ${branch.others_fs_access}), syncing group membership`
+                  );
+                  syncBranchUnixAccess(
+                    branch.branch_id,
+                    '[Executor/session.create.unix-group]',
+                    context.params as Partial<AuthenticatedParams>,
+                    { scope: { session_id: session.session_id } }
+                  );
                 } catch (error) {
                   // Don't fail session creation if unix sync fails
                   console.error(
@@ -2315,44 +2737,73 @@ export function registerHooks(ctx: RegisterHooksContext): void {
       ],
       patch: [
         async (context) => {
-          // Automatically process queued tasks when session becomes IDLE
-          // This ensures queued tasks are processed regardless of how the session became IDLE
+          // Automatically run post-turn side effects when a session becomes promptable.
+          // Historically that meant IDLE; failed terminal tasks are now promptable too
+          // (status=failed, ready_for_prompt=true) so the UI can surface the failure
+          // without blocking queue draining or gateway finalization.
           const session = Array.isArray(context.result) ? context.result[0] : context.result;
 
-          if (session && session.status === 'idle') {
-            // Flush GitHub message buffer (fire-and-forget).
-            // When a GitHub-connected session finishes its turn, post the last
-            // buffered message as a PR/issue comment. Must happen before queue
-            // processing so the response is posted before the next prompt starts.
-            setImmediate(async () => {
+          if (session && shouldRunSessionPostTurnHooks(session)) {
+            // Flush the gateway outbound buffer (fire-and-forget).
+            // When a GitHub/Shortcut-connected session finishes its turn, post
+            // the last buffered message as a PR/issue/story comment. Must happen
+            // before queue processing so the response posts before the next prompt.
+            //
+            // Defer outside the just-finished transaction, then re-enter a fresh
+            // tenant scope so gateway DB work keeps Cloud RLS context without
+            // inheriting a committed transaction object.
+            deferWithTenantContext(context.params, async () => {
               try {
                 const gatewayService = context.app.service('gateway') as unknown as GatewayService;
-                await gatewayService.flushGitHubBuffer(session.session_id);
+                await gatewayService.flushOutboundBuffer(session.session_id);
+                await gatewayService.updateProgress({
+                  session_id: session.session_id,
+                  state: 'done',
+                });
               } catch (error) {
                 console.warn(
-                  `[gateway] Failed to flush GitHub buffer for session ${shortId(session.session_id)}:`,
+                  `[gateway] Failed to flush gateway buffers/status for session ${shortId(session.session_id)}:`,
                   error
                 );
               }
             });
 
-            if (session.ready_for_prompt) {
-              // Use setImmediate to avoid blocking the patch response
-              setImmediate(async () => {
-                try {
+            if (shouldDrainQueueAfterSessionPostTurnPatch(session, context.params)) {
+              const sessionTenantId = getTrustedSessionTenantId(session);
+              // Same fresh-scope pattern: queue processing must run outside the
+              // outer transaction but still inside the session tenant for RLS.
+              // Some completion/background paths have minimal params, so this
+              // relies on params.tenant, current tenant ALS, the already-returned
+              // session row tenant_id, or static tenant config and otherwise
+              // fails closed.
+              deferWithSessionQueueTenantScope(
+                {
+                  db,
+                  config,
+                  sessionId: session.session_id,
+                  params: context.params,
+                  tenantIdHint: sessionTenantId,
+                  label: 'SessionsService.after.patch queue drain',
+                },
+                async (queueParams) => {
                   console.log(
-                    `🔄 [SessionsService.after.patch] Session ${shortId(session.session_id)} became IDLE, checking for queued tasks...`
+                    `🔄 [SessionsService.after.patch] Session ${shortId(session.session_id)} became promptable (${session.status}), checking for queued tasks...`
                   );
 
-                  await sessionsService.triggerQueueProcessing(session.session_id, context.params);
-                } catch (error) {
+                  await sessionsService.triggerQueueProcessing(session.session_id, queueParams);
+                },
+                (error) => {
                   console.error(
                     `❌ [SessionsService.after.patch] Failed to process queue for session ${shortId(session.session_id)}:`,
                     error
                   );
                   // Don't throw - queue processing failure shouldn't break session patches
                 }
-              });
+              );
+            } else {
+              console.log(
+                `⏭️  [SessionsService.after.patch] Queue drain suppressed for session ${shortId(session.session_id)} (suppressTerminalQueueProcessing or not ready)`
+              );
             }
           }
 
@@ -2361,18 +2812,11 @@ export function registerHooks(ctx: RegisterHooksContext): void {
       ],
     },
   });
-
-  // ============================================================================
-  // Leaderboard hooks
-  // ============================================================================
-
-  if (svcEnabled('leaderboard')) {
-    app.service('leaderboard').hooks({
-      before: {
-        all: [requireAuth],
-      },
-    });
-  }
+  app.service('leaderboard').hooks({
+    before: {
+      all: [requireAuth],
+    },
+  });
 
   // ============================================================================
   // Schedules hooks
@@ -2471,9 +2915,7 @@ export function registerHooks(ctx: RegisterHooksContext): void {
       all: [typedValidateQuery(taskQueryValidator), requireAuth, executorRuntimeScopeGuard()],
       find: [
         // RBAC: Scope tasks.find() to sessions the caller can access.
-        ...(branchRbacEnabled
-          ? [scopeFindToAccessibleSessions(sessionsRepository, superadminOpts)]
-          : []),
+        ...(branchRbacEnabled ? [scopeFindToAccessibleSessionsSql(superadminOpts)] : []),
       ],
       get: [
         ...(branchRbacEnabled
@@ -2579,16 +3021,26 @@ export function registerHooks(ctx: RegisterHooksContext): void {
   const ensureCanViewBoard = (action: string) => ensureBoardAccess('view', action);
   const ensureCanMutateBoard = (action: string) => ensureBoardAccess('mutate', action);
 
+  const emitBoardPatched = (board: Board | undefined, context: HookContext<Board>) => {
+    if (board) {
+      emitServiceEvent(app, {
+        path: 'boards',
+        event: 'patched',
+        data: board,
+        params: context.params,
+        id: context.id,
+      });
+    }
+  };
+
   safeService('boards')?.hooks({
     before: {
       all: [typedValidateQuery(boardQueryValidator), requireAuth],
       find: [
         // RBAC: restrict boards.find to boards the caller created or has a
-        // branch on. Runs at the SQL layer via BoardRepository.findVisibleBoardIds
-        // to avoid hydrating every accessible branch in-memory.
-        ...(branchRbacEnabled
-          ? [scopeFindToAccessibleBoards(boardRepository, superadminOpts)]
-          : []),
+        // branch on. The service pushes this into the repository query as one
+        // SQL predicate, avoiding a preloaded `board_id IN (...)` list.
+        ...(branchRbacEnabled ? [scopeFindToAccessibleBoardsSql(superadminOpts)] : []),
       ],
       get: [ensureCanViewBoard('view this board')],
       findBySlug: [ensureCanViewBoard('view this board')],
@@ -2626,7 +3078,13 @@ export function registerHooks(ctx: RegisterHooksContext): void {
               objects: result.objects,
             });
             // Manually emit 'patched' event for WebSocket broadcasting (ONCE)
-            app.service('boards').emit('patched', result);
+            emitServiceEvent(app, {
+              path: 'boards',
+              event: 'patched',
+              data: result,
+              params: context.params,
+              id: context.id,
+            });
             // Skip normal patch flow to prevent double emit
             context.dispatch = result;
             return context;
@@ -2640,7 +3098,13 @@ export function registerHooks(ctx: RegisterHooksContext): void {
             );
             context.result = result;
             // Manually emit 'patched' event for WebSocket broadcasting (ONCE)
-            app.service('boards').emit('patched', result);
+            emitServiceEvent(app, {
+              path: 'boards',
+              event: 'patched',
+              data: result,
+              params: context.params,
+              id: context.id,
+            });
             // Skip normal patch flow to prevent double emit
             context.dispatch = result;
             return context;
@@ -2654,7 +3118,33 @@ export function registerHooks(ctx: RegisterHooksContext): void {
             );
             context.result = result;
             // Manually emit 'patched' event for WebSocket broadcasting (ONCE)
-            app.service('boards').emit('patched', result);
+            emitServiceEvent(app, {
+              path: 'boards',
+              event: 'patched',
+              data: result,
+              params: context.params,
+              id: context.id,
+            });
+            // Skip normal patch flow to prevent double emit
+            context.dispatch = result;
+            return context;
+          }
+
+          if (_action === 'mergeObjectFields' && objects) {
+            if (!context.id) throw new Error('Board ID required');
+            const result = await boardsService!.mergeBoardObjectFields(
+              context.id as string,
+              objects
+            );
+            context.result = result;
+            // Manually emit 'patched' event for WebSocket broadcasting (ONCE)
+            emitServiceEvent(app, {
+              path: 'boards',
+              event: 'patched',
+              data: result,
+              params: context.params,
+              id: context.id,
+            });
             // Skip normal patch flow to prevent double emit
             context.dispatch = result;
             return context;
@@ -2669,7 +3159,13 @@ export function registerHooks(ctx: RegisterHooksContext): void {
             );
             context.result = result.board;
             // Manually emit 'patched' event for WebSocket broadcasting
-            app.service('boards').emit('patched', result.board);
+            emitServiceEvent(app, {
+              path: 'boards',
+              event: 'patched',
+              data: result.board,
+              params: context.params,
+              id: context.id,
+            });
             return context;
           }
 
@@ -2691,17 +3187,17 @@ export function registerHooks(ctx: RegisterHooksContext): void {
       fromBlob: [requireMinimumRole(ROLES.MEMBER, 'import boards')],
       fromYaml: [requireMinimumRole(ROLES.MEMBER, 'import boards')],
       clone: [requireMinimumRole(ROLES.MEMBER, 'clone boards'), ensureCanViewBoard('clone boards')],
-      setPrimaryAssistant: [
-        requireMinimumRole(ROLES.MEMBER, 'set primary assistant'),
-        ensureCanMutateBoard('set primary assistant'),
+      setPrimaryTeammate: [
+        requireMinimumRole(ROLES.MEMBER, 'set primary teammate'),
+        ensureCanMutateBoard('set primary teammate'),
       ],
-      clearPrimaryAssistant: [
-        requireMinimumRole(ROLES.MEMBER, 'clear primary assistant'),
-        ensureCanMutateBoard('clear primary assistant'),
+      clearPrimaryTeammate: [
+        requireMinimumRole(ROLES.MEMBER, 'clear primary teammate'),
+        ensureCanMutateBoard('clear primary teammate'),
       ],
-      ensureAssistantWelcomeNote: [
-        requireMinimumRole(ROLES.MEMBER, 'create assistant welcome note'),
-        ensureCanMutateBoard('create assistant welcome note'),
+      ensureTeammateWelcomeNote: [
+        requireMinimumRole(ROLES.MEMBER, 'create teammate welcome note'),
+        ensureCanMutateBoard('create teammate welcome note'),
       ],
     },
     after: {
@@ -2781,7 +3277,12 @@ export function registerHooks(ctx: RegisterHooksContext): void {
         clearRealtimeBranchVisibility,
         async (context: HookContext<Board>) => {
           if (context.result) {
-            app.service('boards').emit('created', context.result);
+            emitServiceEvent(app, {
+              path: 'boards',
+              event: 'created',
+              data: context.result,
+              params: context.params,
+            });
           }
           return context;
         },
@@ -2790,7 +3291,12 @@ export function registerHooks(ctx: RegisterHooksContext): void {
         clearRealtimeBranchVisibility,
         async (context: HookContext<Board>) => {
           if (context.result) {
-            app.service('boards').emit('created', context.result);
+            emitServiceEvent(app, {
+              path: 'boards',
+              event: 'created',
+              data: context.result,
+              params: context.params,
+            });
           }
           return context;
         },
@@ -2799,39 +3305,38 @@ export function registerHooks(ctx: RegisterHooksContext): void {
         clearRealtimeBranchVisibility,
         async (context: HookContext<Board>) => {
           if (context.result) {
-            app.service('boards').emit('created', context.result);
+            emitServiceEvent(app, {
+              path: 'boards',
+              event: 'created',
+              data: context.result,
+              params: context.params,
+            });
           }
           return context;
         },
       ],
-      setPrimaryAssistant: [
+      setPrimaryTeammate: [
         clearRealtimeBranchVisibility,
         async (context: HookContext<Board>) => {
-          if (context.result) {
-            app.service('boards').emit('patched', context.result);
-          }
+          emitBoardPatched(context.result, context);
           return context;
         },
       ],
-      clearPrimaryAssistant: [
+      clearPrimaryTeammate: [
         clearRealtimeBranchVisibility,
         async (context: HookContext<Board>) => {
-          if (context.result) {
-            app.service('boards').emit('patched', context.result);
-          }
+          emitBoardPatched(context.result, context);
           return context;
         },
       ],
-      ensureAssistantWelcomeNote: [
+      ensureTeammateWelcomeNote: [
         clearRealtimeBranchVisibility,
         async (context: HookContext<Board>) => {
-          const assistantWelcomeNoteMutated = (
-            context.params as typeof context.params & {
-              assistantWelcomeNoteMutated?: boolean;
-            }
-          ).assistantWelcomeNoteMutated;
-          if (context.result && assistantWelcomeNoteMutated) {
-            app.service('boards').emit('patched', context.result);
+          const teammateWelcomeNoteMutated = context.params as typeof context.params & {
+            teammateWelcomeNoteMutated?: boolean;
+          };
+          if (context.result && teammateWelcomeNoteMutated.teammateWelcomeNoteMutated) {
+            emitBoardPatched(context.result, context);
           }
           return context;
         },
@@ -2884,4 +3389,12 @@ export function registerHooks(ctx: RegisterHooksContext): void {
       after: { create: [clearRealtimeBranchVisibility] },
     });
   } // end boards archive/unarchive
+
+  // Tenant hooks are registered last so service-specific authentication hooks
+  // (which populate params.user / params.authentication) run before tenant
+  // resolution in required_from_auth mode.
+  if (tenantColumnsEnabled) {
+    registerTenantHooks();
+  }
+  registerTenantIdentityHooks();
 }

@@ -430,10 +430,6 @@ export class TeamsConnector implements GatewayConnector {
               | string
               | undefined;
 
-            console.log(
-              `[teams] Inbound message: thread=${threadId} type=${conversationType} user=${userName ?? 'unknown'}`
-            );
-
             callback({
               threadId,
               text: messageText,

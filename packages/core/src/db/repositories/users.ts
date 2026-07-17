@@ -10,12 +10,13 @@ import type {
   AgenticToolName,
   AgenticToolsConfig,
   EnvVarMetadata,
+  InternalUser,
   StoredAgenticTools,
   User,
   UUID,
 } from '@agor/core/types';
 import { toAgenticToolsStatus } from '@agor/core/types';
-import { eq, like } from 'drizzle-orm';
+import { eq, like, sql } from 'drizzle-orm';
 import { normalizeStoredEnvMap, type RawStoredEnvVar } from '../../config/env-vars';
 import { generateId, shortId } from '../../lib/ids';
 import type { Database } from '../client';
@@ -33,7 +34,7 @@ import {
 /**
  * Users repository implementation
  */
-export class UsersRepository implements BaseRepository<User, Partial<User>> {
+export class UsersRepository implements BaseRepository<InternalUser, Partial<InternalUser>> {
   constructor(private db: Database) {}
 
   /**
@@ -41,7 +42,14 @@ export class UsersRepository implements BaseRepository<User, Partial<User>> {
    * Converts the encrypted `agentic_tools` blob to a boolean presence DTO so
    * decrypted credentials never leave this repository.
    */
-  private rowToUser(row: UserRow): User {
+  private rowToUser(row: UserRow): InternalUser {
+    const legacyDefaultMcpServerIds = Object.values(
+      (row.data.default_agentic_config ?? {}) as Record<string, { mcpServerIds?: unknown }>
+    ).flatMap((config) =>
+      Array.isArray(config?.mcpServerIds)
+        ? config.mcpServerIds.filter((id): id is string => typeof id === 'string')
+        : []
+    );
     return {
       user_id: row.user_id as UUID,
       created_at: new Date(row.created_at),
@@ -53,10 +61,16 @@ export class UsersRepository implements BaseRepository<User, Partial<User>> {
       unix_username: row.unix_username ?? undefined,
       onboarding_completed: row.onboarding_completed,
       must_change_password: row.must_change_password,
+      tokens_valid_after: row.tokens_valid_after ? new Date(row.tokens_valid_after) : undefined,
+      avatar_url: row.data.avatar_url ?? row.data.avatar,
       avatar: row.data.avatar,
+      avatar_source: row.data.avatar_source,
+      avatar_source_id: row.data.avatar_source_id,
+      avatar_synced_at: row.data.avatar_synced_at,
       preferences: row.data.preferences as User['preferences'],
       // Convert encrypted per-tool credential blobs into boolean presence flags.
       agentic_tools: toAgenticToolsStatus(row.data.agentic_tools as StoredAgenticTools | undefined),
+      agentic_auth_methods: row.data.agentic_auth_methods,
       // Convert stored env vars to presence + scope metadata (never exposes secrets).
       // Handles both legacy string form and v0.5 object form via normalizeStoredEnvMap.
       // The schema stores `scope` as a generic string (no SQL CHECK constraint); the
@@ -73,6 +87,10 @@ export class UsersRepository implements BaseRepository<User, Partial<User>> {
         return out;
       })(),
       default_agentic_config: row.data.default_agentic_config as User['default_agentic_config'],
+      default_agentic_selection: row.data.default_agentic_selection,
+      default_mcp_server_ids: row.data.default_mcp_server_ids ?? [
+        ...new Set(legacyDefaultMcpServerIds),
+      ],
     };
   }
 
@@ -81,7 +99,7 @@ export class UsersRepository implements BaseRepository<User, Partial<User>> {
    * For updates, this accepts the current user data from the database row
    */
   private userToInsert(
-    user: Partial<User> & {
+    user: Partial<InternalUser> & {
       password?: string;
       agentic_tools_raw?: StoredAgenticTools;
       env_vars_raw?: SchemaUserInsert['data']['env_vars'];
@@ -105,8 +123,14 @@ export class UsersRepository implements BaseRepository<User, Partial<User>> {
       role: user.role ?? 'member',
       unix_username: user.unix_username ?? null,
       onboarding_completed: user.onboarding_completed ?? false,
+      must_change_password: user.must_change_password ?? false,
+      tokens_valid_after: user.tokens_valid_after ? new Date(user.tokens_valid_after) : null,
       data: {
+        avatar_url: user.avatar_url,
         avatar: user.avatar,
+        avatar_source: user.avatar_source,
+        avatar_source_id: user.avatar_source_id,
+        avatar_synced_at: user.avatar_synced_at,
         preferences: user.preferences,
         // Encrypted per-tool credentials. Only forwarded when caller passes the
         // raw shape (internal credential mutators); regular updates leave it undefined,
@@ -115,11 +139,14 @@ export class UsersRepository implements BaseRepository<User, Partial<User>> {
         // contract); StoredAgenticTools widens that to string values for shape
         // uniformity. Runtime never writes opencode, so the cast is safe.
         agentic_tools: user.agentic_tools_raw as SchemaUserInsert['data']['agentic_tools'],
+        agentic_auth_methods: user.agentic_auth_methods,
         // Same pass-through as agentic_tools: env_vars are encrypted blobs
         // not represented on the public DTO. `update()` threads the raw value
         // from the existing row so a generic field update doesn't wipe them.
         env_vars: user.env_vars_raw,
         default_agentic_config: user.default_agentic_config,
+        default_agentic_selection: user.default_agentic_selection,
+        default_mcp_server_ids: user.default_mcp_server_ids,
       },
     };
   }
@@ -165,7 +192,7 @@ export class UsersRepository implements BaseRepository<User, Partial<User>> {
   /**
    * Create a new user
    */
-  async create(data: Partial<User>): Promise<User> {
+  async create(data: Partial<InternalUser>): Promise<InternalUser> {
     // Validate unix_username uniqueness if provided
     if (data.unix_username) {
       const isTaken = await this.isUnixUsernameTaken(data.unix_username);
@@ -195,7 +222,7 @@ export class UsersRepository implements BaseRepository<User, Partial<User>> {
   /**
    * Find user by ID (supports short ID resolution)
    */
-  async findById(id: string): Promise<User | null> {
+  async findById(id: string): Promise<InternalUser | null> {
     try {
       const fullId = await this.resolveId(id);
 
@@ -217,7 +244,7 @@ export class UsersRepository implements BaseRepository<User, Partial<User>> {
   /**
    * Find user by email
    */
-  async findByEmail(email: string): Promise<User | null> {
+  async findByEmail(email: string): Promise<InternalUser | null> {
     const result = await select(this.db).from(users).where(eq(users.email, email)).one();
 
     if (!result) {
@@ -228,9 +255,48 @@ export class UsersRepository implements BaseRepository<User, Partial<User>> {
   }
 
   /**
+   * Find user by email for external identity providers.
+   *
+   * Agor intentionally keeps exact/case-sensitive email lookup semantics for
+   * auth paths because the schema historically allowed case-distinct emails.
+   * External providers such as Slack and GitHub treat email addresses as a
+   * canonical identity hint, so their alignment path needs a case-insensitive
+   * match. Prefer an exact match when present; otherwise return a
+   * case-insensitive match only when it is unambiguous.
+   */
+  async findByEmailForAlignment(email: string): Promise<InternalUser | null> {
+    const normalizedEmail = email.trim().toLowerCase();
+    if (!normalizedEmail) return null;
+
+    const exact = await this.findByEmail(normalizedEmail);
+    if (exact) return exact;
+
+    const results = await select(this.db)
+      .from(users)
+      .where(sql`LOWER(${users.email}) = ${normalizedEmail}`)
+      .all();
+
+    if (results.length !== 1) {
+      if (results.length > 1) {
+        console.warn(
+          `[users] Ambiguous case-insensitive email alignment for ${normalizedEmail}: ${results
+            .map((row: unknown) => {
+              const userRow = row as UserRow;
+              return `${shortId(userRow.user_id)}:${userRow.email}`;
+            })
+            .join(', ')}`
+        );
+      }
+      return null;
+    }
+
+    return this.rowToUser(results[0] as UserRow);
+  }
+
+  /**
    * Find all users
    */
-  async findAll(): Promise<User[]> {
+  async findAll(): Promise<InternalUser[]> {
     const results = await select(this.db).from(users).all();
 
     return results.map((row: UserRow) => this.rowToUser(row));
@@ -239,7 +305,7 @@ export class UsersRepository implements BaseRepository<User, Partial<User>> {
   /**
    * Update user by ID
    */
-  async update(id: string, updates: Partial<User>): Promise<User> {
+  async update(id: string, updates: Partial<InternalUser>): Promise<InternalUser> {
     const fullId = await this.resolveId(id);
 
     // Get current user
@@ -263,7 +329,7 @@ export class UsersRepository implements BaseRepository<User, Partial<User>> {
     // doesn't nuke stored credentials — the boolean projection on `current`
     // can't round-trip back to encrypted bytes.
     const rawRow = await this.getRawRow(fullId);
-    const merged = { ...current, ...updates } as Partial<User> & {
+    const merged = { ...current, ...updates } as Partial<InternalUser> & {
       agentic_tools_raw?: StoredAgenticTools;
       env_vars_raw?: SchemaUserInsert['data']['env_vars'];
     };

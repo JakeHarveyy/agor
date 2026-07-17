@@ -26,6 +26,7 @@ import type { AgorClient, Group, User } from '@agor-live/client';
 import {
   ApartmentOutlined,
   ArrowLeftOutlined,
+  BulbOutlined,
   DeleteOutlined,
   DownOutlined,
   EditOutlined,
@@ -89,6 +90,7 @@ import {
   AutocompleteTextarea,
   hydrateKbDocLinks,
   type KbDocMention,
+  kbMentionFromDocument,
 } from '../components/AutocompleteTextarea';
 import { BrandLogo } from '../components/BrandLogo';
 import { AgorEmojiPicker } from '../components/EmojiPickerInput';
@@ -99,6 +101,8 @@ import { MarkdownRenderer } from '../components/MarkdownRenderer';
 import { ThemeSwitcher } from '../components/ThemeSwitcher';
 import { DiffBlock } from '../components/ToolUseRenderer/renderers/DiffBlock';
 import { useUserLocalStorage } from '../hooks/useUserLocalStorage';
+import { useAgorStore } from '../store/agorStore';
+import { selectUserById } from '../store/selectors';
 import {
   buildKnowledgeRoutePath,
   decodeKnowledgeRoutePath,
@@ -193,13 +197,9 @@ type KnowledgeNamespacesClientServiceWithMethods = KnowledgeNamespacesClientServ
 interface KnowledgePageProps {
   client: AgorClient | null;
   currentUser?: User | null;
-  /** All known users, keyed by id — powers `@` user mentions in the editor. */
-  userById?: Map<string, User>;
   onUserSettingsClick?: () => void;
   onLogout?: () => void;
 }
-
-const EMPTY_USER_MAP: Map<string, User> = new Map();
 
 const DEFAULT_MARKDOWN = `# New Knowledge Page\n\nWrite markdown here.\n`;
 const DRAFT_DOCUMENT_ID = '__knowledge_draft__' as CoreKnowledgeDocument['document_id'];
@@ -259,41 +259,45 @@ const kindLabels: Record<KnowledgeDocumentKind, string> = {
 
 const indexingStateMeta: Record<
   KnowledgeDocumentIndexingStatus['state'],
-  { label: string; color: string; tooltip: string }
+  {
+    label: string;
+    colorToken: 'colorTextSecondary' | 'colorInfo' | 'colorSuccess' | 'colorWarning' | 'colorError';
+    tooltip: string;
+  }
 > = {
   empty: {
     label: 'No semantic index',
-    color: 'default',
+    colorToken: 'colorTextSecondary',
     tooltip: 'No indexable units exist for the current version yet.',
   },
   not_configured: {
     label: 'Semantic indexing unavailable',
-    color: 'default',
+    colorToken: 'colorTextSecondary',
     tooltip: 'Semantic indexing is not configured for these chunks.',
   },
   queued: {
     label: 'Indexing',
-    color: '#1677ff',
+    colorToken: 'colorInfo',
     tooltip: 'Some chunks are queued for semantic indexing.',
   },
   ready: {
     label: 'Semantic index ready',
-    color: '#52c41a',
+    colorToken: 'colorSuccess',
     tooltip: 'Current chunks are available for semantic search.',
   },
   stale: {
     label: 'Needs semantic refresh',
-    color: '#faad14',
+    colorToken: 'colorWarning',
     tooltip: 'Some chunks are stale and need semantic index refresh.',
   },
   error: {
     label: 'Semantic index error',
-    color: '#ff4d4f',
+    colorToken: 'colorError',
     tooltip: 'At least one chunk failed semantic indexing.',
   },
   mixed: {
     label: 'Partial semantic index',
-    color: '#1677ff',
+    colorToken: 'colorInfo',
     tooltip: 'Chunks have mixed semantic indexing states.',
   },
 };
@@ -355,10 +359,11 @@ function IndexingStatusCue({
   status?: KnowledgeDocumentIndexingStatus | null;
   size?: number;
 }) {
+  const { token } = theme.useToken();
   if (!shouldShowIndexingCue(status) || !status) return null;
 
   const meta = indexingStateMeta[status.state];
-  const iconStyle = { color: meta.color, fontSize: size };
+  const iconStyle = { color: token[meta.colorToken], fontSize: size };
   const icon =
     status.state === 'queued' ? (
       <LoadingOutlined spin style={iconStyle} />
@@ -394,17 +399,6 @@ const kindForSegment = (segment: string): KnowledgeDocumentKind | undefined => {
   if (segment === 'Skills') return 'skill';
   if (segment === 'Memories') return 'memory';
   return undefined;
-};
-
-// Non-throwing leaf title used only as a fallback when a doc has no title.
-const leafTitleFromPath = (path: string): string => {
-  const leaf = path.split('/').filter(Boolean).pop() ?? path;
-  return (
-    leaf
-      .replace(/\.(md|markdown)$/i, '')
-      .replace(/[-_]+/g, ' ')
-      .trim() || path
-  );
 };
 
 const normalizeFindResult = <T,>(result: T[] | { data?: T[] }): T[] =>
@@ -557,6 +551,40 @@ type KnowledgeNamespaceOptionSource = Pick<
 const knowledgeNamespaceDisplayName = (namespace: KnowledgeNamespaceOptionSource) =>
   namespace.display_name?.trim() || namespace.slug;
 
+export function resolveKnowledgeSpaceAfterNamespacesLoad(
+  activeSpace: string,
+  namespaces: KnowledgeNamespaceOptionSource[]
+) {
+  if (activeSpace === 'all' || namespaces.some((ns) => ns.slug === activeSpace)) {
+    return activeSpace;
+  }
+  return namespaces.find((ns) => ns.slug === 'global')?.slug ?? namespaces[0]?.slug ?? 'global';
+}
+
+export function resolveKnowledgeSpaceAfterRouteOrNamespacesLoad(args: {
+  activeSpace: string;
+  routeNamespaceSlug?: string | null;
+  namespaces: KnowledgeNamespaceOptionSource[];
+}): string {
+  if (args.routeNamespaceSlug) return args.routeNamespaceSlug;
+  return resolveKnowledgeSpaceAfterNamespacesLoad(args.activeSpace, args.namespaces);
+}
+
+export function isKnowledgeDocumentsResponseCurrent(args: {
+  requestId: number;
+  currentRequestId: number;
+  requestedActiveSpace: string;
+  currentActiveSpace: string;
+  requestedKindFilter: string;
+  currentKindFilter: string;
+}): boolean {
+  return (
+    args.requestId === args.currentRequestId &&
+    args.requestedActiveSpace === args.currentActiveSpace &&
+    args.requestedKindFilter === args.currentKindFilter
+  );
+}
+
 export function buildKnowledgeNamespaceSelectOptions(namespaces: KnowledgeNamespaceOptionSource[]) {
   return [...namespaces]
     .sort((a, b) => {
@@ -689,10 +717,13 @@ interface FolderSection {
 export function KnowledgePage({
   client,
   currentUser = null,
-  userById = EMPTY_USER_MAP,
   onUserSettingsClick,
   onLogout,
 }: KnowledgePageProps) {
+  // Self-subscribe to the user map (powers `@` user mentions). The subscription
+  // used to live in the outer App shell; relocating it here keeps the shell from
+  // re-rendering on every user write.
+  const userById = useAgorStore(selectUserById);
   const { token } = theme.useToken();
   const { confirm } = useThemedModal();
   const navigate = useNavigate();
@@ -808,9 +839,17 @@ export function KnowledgePage({
   const sidebarPanelRef = useRef<ImperativePanelHandle>(null);
   const sidebarResizeDraggingRef = useRef(false);
   const globalSearchContainerRef = useRef<HTMLDivElement>(null);
-
-  useEffect(() => {
-    document.title = 'Knowledge · Agor';
+  const documentsRequestSeqRef = useRef(0);
+  const activeSpaceRef = useRef(activeSpace);
+  const kindFilterRef = useRef(kindFilter);
+  const graphRequestSeqRef = useRef(0);
+  const updateActiveSpace = useCallback((space: string) => {
+    activeSpaceRef.current = space;
+    setActiveSpace(space);
+  }, []);
+  const updateKindFilter = useCallback((filter: string) => {
+    kindFilterRef.current = filter;
+    setKindFilter(filter);
   }, []);
 
   useEffect(() => {
@@ -843,6 +882,14 @@ export function KnowledgePage({
   useEffect(() => {
     activeDocIdRef.current = activeDocId;
   }, [activeDocId]);
+
+  useEffect(() => {
+    activeSpaceRef.current = activeSpace;
+  }, [activeSpace]);
+
+  useEffect(() => {
+    kindFilterRef.current = kindFilter;
+  }, [kindFilter]);
 
   const activeDoc = useMemo(
     () =>
@@ -1141,14 +1188,12 @@ export function KnowledgePage({
     );
 
   const loadNamespaces = useCallback(async () => {
-    if (!client) return;
+    if (!client) return [];
     const result = await client.service('kb/namespaces').find({ query: { archived: false } });
     const rows = normalizeFindResult<KnowledgeNamespace>(result as KnowledgeNamespace[]);
     setNamespaces(rows);
-    if (!rows.some((ns) => ns.slug === activeSpace)) {
-      setActiveSpace(rows.find((ns) => ns.slug === 'global')?.slug ?? rows[0]?.slug ?? 'global');
-    }
-  }, [client, activeSpace]);
+    return rows;
+  }, [client]);
 
   // Load every readable doc (no namespace/kind filter) so `@` can reference
   // docs across spaces. Kept separate from `documents`, which is scoped by the
@@ -1158,20 +1203,9 @@ export function KnowledgePage({
     try {
       const result = await client.service('kb/documents').find({ query: { archived: false } });
       const rows = normalizeFindResult<KnowledgeDocument>(result as KnowledgeDocument[]);
-      const mentions = rows.reduce<KbDocMention[]>((acc, doc) => {
-        const path = doc.path?.trim();
-        if (!path) return acc;
-        const slug = namespaceSlugFromUri(doc.uri);
-        if (!slug) return acc;
-        acc.push({
-          title: doc.title?.trim() || leafTitleFromPath(path),
-          documentId: doc.document_id,
-          path,
-          uri: doc.uri,
-          routePath: buildKnowledgeRoutePath('/kb', slug, path),
-        });
-        return acc;
-      }, []);
+      const mentions = rows
+        .map((doc) => kbMentionFromDocument(doc, '/kb'))
+        .filter((doc): doc is KbDocMention => Boolean(doc));
       setMentionDocs(mentions);
     } catch (err) {
       console.error('Failed to load Knowledge mentions:', err);
@@ -1180,13 +1214,28 @@ export function KnowledgePage({
 
   const loadDocuments = useCallback(async () => {
     if (!client) return;
+    const requestId = documentsRequestSeqRef.current + 1;
+    documentsRequestSeqRef.current = requestId;
+    const requestedActiveSpace = activeSpace;
+    const requestedKindFilter = kindFilter;
+    const isCurrent = () =>
+      isKnowledgeDocumentsResponseCurrent({
+        requestId,
+        currentRequestId: documentsRequestSeqRef.current,
+        requestedActiveSpace,
+        currentActiveSpace: activeSpaceRef.current,
+        requestedKindFilter,
+        currentKindFilter: kindFilterRef.current,
+      });
+
     setLoading(true);
     setError(null);
     try {
       await loadNamespaces();
+      if (!isCurrent()) return;
       void loadMentionDocs();
-      const kind = kindForSegment(kindFilter);
-      const namespaceFilter = activeSpace === 'all' ? undefined : activeSpace;
+      const kind = kindForSegment(requestedKindFilter);
+      const namespaceFilter = requestedActiveSpace === 'all' ? undefined : requestedActiveSpace;
       const result = await client.service('kb/documents').find({
         query: {
           namespace_slug: namespaceFilter,
@@ -1195,18 +1244,30 @@ export function KnowledgePage({
           include_indexing: true,
         },
       });
+      if (!isCurrent()) return;
       setDocuments(normalizeFindResult<KnowledgeDocument>(result as KnowledgeDocument[]));
     } catch (err) {
+      if (!isCurrent()) return;
       console.error('Failed to load Knowledge:', err);
       setError(err instanceof Error ? err.message : String(err));
     } finally {
-      setLoading(false);
+      if (isCurrent()) setLoading(false);
     }
   }, [client, activeSpace, kindFilter, loadNamespaces, loadMentionDocs]);
 
   useEffect(() => {
     loadDocuments();
   }, [loadDocuments]);
+
+  useEffect(() => {
+    if (!namespaces.length) return;
+    const nextSpace = resolveKnowledgeSpaceAfterRouteOrNamespacesLoad({
+      activeSpace,
+      routeNamespaceSlug,
+      namespaces,
+    });
+    if (nextSpace !== activeSpace) updateActiveSpace(nextSpace);
+  }, [activeSpace, namespaces, routeNamespaceSlug, updateActiveSpace]);
 
   useEffect(() => {
     const query = globalSearchQuery.trim();
@@ -1554,7 +1615,7 @@ export function KnowledgePage({
           try {
             await client.service('kb/namespaces').remove(namespace.namespace_id);
             await loadNamespaces();
-            if (activeSpace === namespace.slug) setActiveSpace('all');
+            if (activeSpace === namespace.slug) updateActiveSpace('all');
           } catch (err) {
             console.error('Failed to archive Knowledge namespace:', err);
             setNamespaceError(err instanceof Error ? err.message : String(err));
@@ -1562,24 +1623,35 @@ export function KnowledgePage({
         },
       });
     },
-    [activeSpace, client, confirm, loadNamespaces]
+    [activeSpace, client, confirm, loadNamespaces, updateActiveSpace]
   );
 
   // The namespace graph is scoped to a single Space; "All Spaces" has no graph.
   const loadGraph = useCallback(async () => {
-    if (!client || activeSpace === 'all') {
+    const requestId = graphRequestSeqRef.current + 1;
+    graphRequestSeqRef.current = requestId;
+    const requestedActiveSpace = activeSpace;
+    const isCurrent = () =>
+      requestId === graphRequestSeqRef.current && requestedActiveSpace === activeSpaceRef.current;
+
+    if (!client || requestedActiveSpace === 'all') {
       setGraphData(null);
+      setGraphLoading(false);
       return;
     }
     setGraphLoading(true);
     try {
-      const result = await client.service('kb/graph').find({ query: { namespace: activeSpace } });
+      const result = await client.service('kb/graph').find({
+        query: { namespace: requestedActiveSpace },
+      });
+      if (!isCurrent()) return;
       setGraphData(result as unknown as KnowledgeNamespaceGraph);
     } catch (err) {
+      if (!isCurrent()) return;
       console.error('Failed to load Knowledge graph:', err);
       setGraphData(null);
     } finally {
-      setGraphLoading(false);
+      if (isCurrent()) setGraphLoading(false);
     }
   }, [client, activeSpace]);
 
@@ -1641,7 +1713,7 @@ export function KnowledgePage({
       setActiveDocId(null);
       setActiveDocSnapshot(null);
     }
-    if (routeNamespaceSlug && nextSpace !== activeSpace) setActiveSpace(nextSpace);
+    if (routeNamespaceSlug && nextSpace !== activeSpace) updateActiveSpace(nextSpace);
     setGlobalSearchQuery((current) => (current === nextQuery ? current : nextQuery));
     const pendingEditMode = pendingEditModeRef.current;
     if (pendingEditMode === null) {
@@ -1658,6 +1730,7 @@ export function KnowledgePage({
     routeNamespaceSlug,
     routeSearchParams,
     draftDocument,
+    updateActiveSpace,
   ]);
 
   useEffect(() => {
@@ -1883,13 +1956,15 @@ export function KnowledgePage({
       documentPath: activeDoc.path,
       currentSearch: location.search,
     });
-    const currentUrl = `${location.pathname}${location.search}`;
-    if (targetUrl !== currentUrl) navigate(targetUrl, { replace: true });
+    const targetUrlWithHash = `${targetUrl}${location.hash}`;
+    const currentUrl = `${location.pathname}${location.search}${location.hash}`;
+    if (targetUrlWithHash !== currentUrl) navigate(targetUrlWithHash, { replace: true });
   }, [
     activeDoc,
     activeDocId,
     documents,
     draftDocument,
+    location.hash,
     location.pathname,
     location.search,
     namespaceSlugForDocument,
@@ -2069,7 +2144,7 @@ export function KnowledgePage({
         change_summary: 'Initial version',
       } as unknown as Partial<CoreKnowledgeDocument>)) as KnowledgeDocument;
       setDocuments((prev) => [created, ...prev]);
-      setActiveSpace(namespaceSlug);
+      updateActiveSpace(namespaceSlug);
       setActiveDocSnapshot(created);
       activeDocIdRef.current = created.document_id;
       setActiveDocId(created.document_id);
@@ -2116,7 +2191,7 @@ export function KnowledgePage({
         setDocuments((prev) => [created, ...prev]);
         setDraftDocument(null);
         setDraftNamespaceSlug(null);
-        setActiveSpace(namespaceSlug);
+        updateActiveSpace(namespaceSlug);
         setActiveDocSnapshot(created);
         activeDocIdRef.current = created.document_id;
         setActiveDocId(created.document_id);
@@ -2411,7 +2486,7 @@ export function KnowledgePage({
     if (!(await confirmDiscardUnsavedChanges())) return;
     const doc = result.document;
     clearDraftDocument();
-    setActiveSpace(result.namespace.slug);
+    updateActiveSpace(result.namespace.slug);
     setActiveDocSnapshot(doc);
     activeDocIdRef.current = doc.document_id;
     setActiveDocId(doc.document_id);
@@ -2451,7 +2526,7 @@ export function KnowledgePage({
     setActiveDocId(null);
     setActiveDocSnapshot(null);
     const slug = namespaceSlugFromUri(node.uri) ?? activeSpace;
-    setKindFilter('All');
+    updateKindFilter('All');
     setSidebarFilterQuery('');
     pendingEditModeRef.current = false;
     setIsEditing(false);
@@ -2461,7 +2536,7 @@ export function KnowledgePage({
   const changeKnowledgeSpace = async (space: string) => {
     if (!(await confirmDiscardUnsavedChanges())) return;
     clearDraftDocument();
-    setActiveSpace(space);
+    updateActiveSpace(space);
     activeDocIdRef.current = null;
     setActiveDocId(null);
     setActiveDocSnapshot(null);
@@ -2844,6 +2919,29 @@ export function KnowledgePage({
     Boolean(activeDoc && (!activeDocMatchesRoute || !activeDocContentReady));
   const fillMain = isEditing || showGraph || showDocumentLoading || showRouteDocumentFailure;
 
+  useEffect(() => {
+    if (!location.hash || isEditing || showDocumentLoading || !activeDocMatchesRoute) return;
+
+    const hash = location.hash.slice(1);
+    const targetId = safeDecodeURIComponent(hash);
+    let cancelled = false;
+    const scrollToHeading = () => {
+      if (cancelled) return;
+      const target =
+        document.getElementById(targetId) ||
+        (targetId !== hash ? document.getElementById(hash) : null);
+      target?.scrollIntoView({ block: 'start' });
+    };
+
+    const frame = window.requestAnimationFrame(scrollToHeading);
+    const timeout = window.setTimeout(scrollToHeading, 80);
+    return () => {
+      cancelled = true;
+      window.cancelAnimationFrame(frame);
+      window.clearTimeout(timeout);
+    };
+  }, [activeDocMatchesRoute, isEditing, location.hash, showDocumentLoading]);
+
   return (
     <Layout style={{ height: '100vh', overflow: 'hidden', background: token.colorBgLayout }}>
       <Header
@@ -2865,8 +2963,19 @@ export function KnowledgePage({
               if (await confirmDiscardUnsavedChanges()) navigate('/');
             }}
           />
-          <BrandLogo level={5} />
-          <Text strong style={{ fontSize: 15, cursor: 'pointer' }} onClick={goToGraphHome}>
+          <BrandLogo level={3} style={{ marginTop: -4 }} />
+          <Text
+            strong
+            style={{
+              display: 'inline-flex',
+              alignItems: 'center',
+              gap: token.sizeUnit,
+              fontSize: 15,
+              cursor: 'pointer',
+            }}
+            onClick={goToGraphHome}
+          >
+            <BulbOutlined style={{ color: token.colorTextSecondary }} />
             Knowledge
           </Text>
           <Tooltip title="Knowledge is in beta — expect rough edges while the data model, MCP tools, and editor settle.">
@@ -3054,7 +3163,7 @@ export function KnowledgePage({
                   block
                   size="small"
                   value={kindFilter}
-                  onChange={(value) => setKindFilter(String(value))}
+                  onChange={(value) => updateKindFilter(String(value))}
                   options={['All', 'Pages', 'Skills', 'Memories']}
                 />
                 <Spin spinning={loading}>
@@ -3442,7 +3551,10 @@ export function KnowledgePage({
                               background: token.colorBgContainer,
                             }}
                           >
-                            <MarkdownRenderer content={hydrateKbLinks(markdownDraft)} />
+                            <MarkdownRenderer
+                              content={hydrateKbLinks(markdownDraft)}
+                              headingAnchors
+                            />
                           </div>
                         </div>
                       </Flex>
@@ -3461,6 +3573,7 @@ export function KnowledgePage({
                               ? stripFirstMarkdownTitleLine(markdownDraft)
                               : markdownDraft
                           )}
+                          headingAnchors
                         />
                       </div>
                     )}
@@ -3650,6 +3763,7 @@ export function KnowledgePage({
                     </Space>
                     <MarkdownRenderer
                       content={hydrateKbLinks(selectedVersion.content_text ?? '')}
+                      headingAnchors
                     />
                   </Space>
                 </div>

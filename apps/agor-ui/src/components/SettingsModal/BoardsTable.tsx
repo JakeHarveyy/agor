@@ -1,3 +1,4 @@
+import { GOLD_SHIMMER_BOARD_BACKGROUND } from '@agor/core/design/board-backgrounds';
 import type {
   AgorClient,
   Board,
@@ -39,6 +40,7 @@ import { ArchiveToggleButton } from '../ArchiveButton';
 import { BoardFormFields, extractBoardFormValues, isCustomCSS } from '../forms/BoardFormFields';
 import { HighlightMatch } from '../HighlightMatch';
 import { JSONEditor, validateJSON } from '../JSONEditor';
+import { SettingsActionGroup } from './SettingsActionGroup';
 
 interface BoardsTableProps {
   client: AgorClient | null;
@@ -75,23 +77,22 @@ export const BoardsTable: React.FC<BoardsTableProps> = ({
   const [searchTerm, setSearchTerm] = useState('');
   const [form] = Form.useForm();
 
-  // Calculate session count per board (branch-centric model)
+  // Calculate session count per board (branch-centric model). Build the
+  // board buckets once so opening Settings is O(branches + sessions) instead
+  // of O(boards × branches).
   const boardSessionCounts = useMemo(() => {
     const counts = new Map<string, number>();
 
+    for (const branch of branchById.values()) {
+      if (!branch.board_id) continue;
+      counts.set(
+        branch.board_id,
+        (counts.get(branch.board_id) ?? 0) + (sessionsByBranch.get(branch.branch_id)?.length ?? 0)
+      );
+    }
+
     for (const board of boardById.values()) {
-      const boardBranchIds: string[] = [];
-      for (const branch of branchById.values()) {
-        if (branch.board_id === board.board_id) {
-          boardBranchIds.push(branch.branch_id);
-        }
-      }
-
-      const sessionCount = boardBranchIds.flatMap(
-        (branchId) => sessionsByBranch.get(branchId) || []
-      ).length;
-
-      counts.set(board.board_id, sessionCount);
+      if (!counts.has(board.board_id)) counts.set(board.board_id, 0);
     }
 
     return counts;
@@ -394,9 +395,9 @@ export const BoardsTable: React.FC<BoardsTableProps> = ({
     {
       title: 'Actions',
       key: 'actions',
-      width: 280,
+      width: 184,
       render: (_: unknown, board: Board) => (
-        <Space size="small">
+        <SettingsActionGroup>
           <ArchiveToggleButton
             archived={Boolean(board.archived)}
             tooltip={board.archived ? 'Archived • Click to unarchive' : 'Archive board'}
@@ -445,7 +446,7 @@ export const BoardsTable: React.FC<BoardsTableProps> = ({
               <Button type="text" size="small" icon={<DeleteOutlined />} danger />
             </Tooltip>
           </Popconfirm>
-        </Space>
+        </SettingsActionGroup>
       ),
     },
   ];
@@ -484,7 +485,15 @@ export const BoardsTable: React.FC<BoardsTableProps> = ({
           <Button icon={<UploadOutlined />} onClick={handleImportClick}>
             Import Board
           </Button>
-          <Button type="primary" icon={<PlusOutlined />} onClick={() => setCreateModalOpen(true)}>
+          <Button
+            type="primary"
+            icon={<PlusOutlined />}
+            onClick={() => {
+              form.resetFields();
+              form.setFieldsValue({ background_color: GOLD_SHIMMER_BOARD_BACKGROUND });
+              setCreateModalOpen(true);
+            }}
+          >
             New Board
           </Button>
         </Space>
@@ -514,7 +523,7 @@ export const BoardsTable: React.FC<BoardsTableProps> = ({
         okText="Create"
       >
         <Form form={form} layout="vertical" preserve style={{ marginTop: 16 }}>
-          <BoardFormFields form={form} extra={customContextField} />
+          <BoardFormFields form={form} extra={customContextField} initialCustomCSS />
         </Form>
       </Modal>
 

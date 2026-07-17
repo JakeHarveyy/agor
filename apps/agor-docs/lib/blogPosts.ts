@@ -9,12 +9,36 @@ export interface BlogPost {
 /** Blog posts ordered newest-first. Keep in sync with pages/blog/*.mdx frontmatter. */
 export const blogPosts: BlogPost[] = [
   {
-    slug: 'agor-assistants',
-    title: 'Introducing Agor Assistants',
+    slug: 'claude-tag-vs-agor-assistants',
+    title: 'Claude Tag Validates the Category. Now Model Your Teammates.',
     description:
-      'What started as an OpenClaw experiment is now a first-class Agor feature. Meet Assistants — persistent AI entities with memory, skills, and team-wide reach through Slack.',
+      'Claude Tag brings @Claude into Slack. Here is why teams will still need modeled, governed, observable, multi-specialist teammates — and why Agor is built for that next step.',
+    date: '2026-06-26',
+    image: '/images/blog/claude-tag-vs-agor-teammates.png',
+  },
+  {
+    slug: 'raise-team-helper-agent',
+    title: 'Raise a Team Helper Agent in an Afternoon',
+    description:
+      'A practical recipe for turning an AI teammate into a PM-style helper that remembers context, coordinates work, reports progress, and keeps a team aligned.',
+    date: '2026-06-17',
+    image: '/images/blog/raise-team-helper-agent.png',
+  },
+  {
+    slug: 'agent-modeling-101',
+    title: 'Agent Modeling 101: Designing Long-Lived Agents for Teams',
+    description:
+      'High-level considerations for scoping, operating, governing, and building trust with persistent agents that help teams manage real workflows.',
+    date: '2026-06-15',
+    image: '/images/blog/agent-modeling-101.png',
+  },
+  {
+    slug: 'agor-assistants',
+    title: 'Introducing Agor Teammates',
+    description:
+      'What started as an OpenClaw experiment is now a first-class Agor feature. Meet Teammates — persistent AI entities with memory, skills, and team-wide reach through Slack.',
     date: '2026-03-03',
-    image: '/images/blog/agor-assistants.png',
+    image: '/images/blog/agor-teammates.png',
   },
   {
     slug: 'agor-openclaw',

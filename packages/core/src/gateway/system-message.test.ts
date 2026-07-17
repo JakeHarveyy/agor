@@ -1,34 +1,83 @@
 import { describe, expect, it } from 'vitest';
-import { formatGatewaySystemMessage } from './system-message';
+import {
+  formatGatewayFollowUpRoutingMessage,
+  formatGatewayMarkdownSessionReference,
+  formatGatewaySessionCreatedMessage,
+  formatGatewaySystemMessage,
+  formatGatewaySystemPayload,
+} from './system-message';
+
+const sessionId = '019e6fca-0000-7000-8000-000000000000';
+const sessionShortId = '019e6fca0000700080000000';
+const sessionUrl = 'https://agor.sandbox.preset.zone/ui/s/019e6fca/';
 
 describe('formatGatewaySystemMessage', () => {
   it('formats Slack session-created messages without markdown emphasis wrappers', () => {
-    expect(
-      formatGatewaySystemMessage(
-        'slack',
-        'Session created: https://agor.sandbox.preset.zone/ui/s/019e6fca/'
-      )
-    ).toBe(
-      '[system] Session created: <https://agor.sandbox.preset.zone/ui/s/019e6fca/|View session>'
-    );
+    const formatted = formatGatewaySystemMessage('slack', `Session created: ${sessionUrl}`);
+
+    expect(formatted).toContain(`Agor: Session created: <${sessionUrl}|View session>.`);
+    expect(formatted).toContain('Mention me again to follow up.');
+    expect(formatted).toContain('Mention me again to follow up.');
   });
 
   it('keeps generic Slack system messages plain', () => {
     expect(formatGatewaySystemMessage('slack', 'Creating new codex session...')).toBe(
-      '[system] Creating new codex session...'
+      'Agor: Creating new codex session...'
     );
   });
 
   it('escapes generic Slack system messages with the shared Slack markdown formatter', () => {
-    expect(formatGatewaySystemMessage('slack', 'A & B < C')).toBe('[system] A &amp; B &lt; C');
+    expect(formatGatewaySystemMessage('slack', 'A & B < C')).toBe('Agor: A &amp; B &lt; C');
+  });
+
+  it('formats Slack follow-up routing messages with a clickable session link', () => {
+    const text = formatGatewayFollowUpRoutingMessage(sessionId, sessionUrl);
+
+    expect(text).toBe(`Mention received — routing to [session](${sessionUrl}).`);
+    const formatted = formatGatewaySystemMessage('slack', text);
+    expect(formatted).toContain(`Agor: Mention received — routing to <${sessionUrl}|session>.`);
+    expect(formatted).toContain('Mention me again to follow up.');
+  });
+
+  it('formats Slack system messages as muted context-block payloads', () => {
+    expect(formatGatewaySystemPayload('slack', 'Creating new codex session...')).toEqual({
+      text: 'Agor: Creating new codex session...',
+      blocks: [
+        {
+          type: 'context',
+          elements: [{ type: 'mrkdwn', text: 'Agor: Creating new codex session...' }],
+        },
+      ],
+    });
+  });
+
+  it('falls back to a short session ID when no session URL is available', () => {
+    expect(formatGatewayMarkdownSessionReference(sessionId, null)).toBe(
+      `session ${sessionShortId}`
+    );
+    expect(formatGatewayFollowUpRoutingMessage(sessionId, null)).toBe(
+      `Mention received — routing to session ${sessionShortId}.`
+    );
+  });
+
+  it('centralizes created-session fallback wording', () => {
+    expect(formatGatewaySessionCreatedMessage(sessionId, sessionUrl)).toBe(
+      `Session created: ${sessionUrl}`
+    );
+    expect(formatGatewaySessionCreatedMessage(sessionId, null)).toBe(
+      `Session ${sessionShortId} created, sending prompt to agent.`
+    );
   });
 
   it('does not apply Slack link syntax to non-Slack channels', () => {
-    expect(
-      formatGatewaySystemMessage(
-        'github',
-        'Session created: https://agor.sandbox.preset.zone/ui/s/019e6fca/'
-      )
-    ).toBe('[system] Session created: https://agor.sandbox.preset.zone/ui/s/019e6fca/');
+    expect(formatGatewaySystemMessage('github', `Session created: ${sessionUrl}`)).toBe(
+      `Agor: Session created: ${sessionUrl}`
+    );
+  });
+
+  it('keeps non-Slack system payloads text-only', () => {
+    expect(formatGatewaySystemPayload('github', `Session created: ${sessionUrl}`)).toEqual({
+      text: `Agor: Session created: ${sessionUrl}`,
+    });
   });
 });

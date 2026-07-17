@@ -2,12 +2,21 @@ import type { AgorClient, Branch, Session, SessionID, SpawnConfig, User } from '
 import {
   getGatewaySource as getGatewaySourceCore,
   isGatewaySession as isGatewaySessionCore,
+  isSessionExecuting,
+  SessionStatus,
 } from '@agor-live/client';
 import {
+  ArrowUpOutlined,
   ClockCircleOutlined,
+  DisconnectOutlined,
+  ExclamationCircleOutlined,
+  ExportOutlined,
   EyeOutlined,
+  LinkOutlined,
   MessageOutlined,
+  MinusSquareOutlined,
   PlusOutlined,
+  PlusSquareOutlined,
   SettingOutlined,
 } from '@ant-design/icons';
 import {
@@ -24,10 +33,9 @@ import {
   theme,
 } from 'antd';
 import type React from 'react';
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useConnectionDisabled } from '../../contexts/ConnectionContext';
 import { useLocalStorage } from '../../hooks/useLocalStorage';
-import { useServiceEnabled } from '../../hooks/useServicesConfig';
 import { useSessionActions } from '../../hooks/useSessionActions';
 import { useThemedMessage } from '../../utils/message';
 import {
@@ -53,7 +61,15 @@ import {
 import { ToolIcon } from '../ToolIcon';
 import { buildSessionTree, type SessionTreeNode } from './buildSessionTree';
 
+// Stable theme object so the ConfigProvider context value doesn't churn.
+const NO_MOTION_THEME = { token: { motion: false } };
+
 export type BranchSessionSectionsMode = 'card' | 'panel';
+type CollapseKey = string | number;
+type RemoteRelationshipRef = {
+  relationship_type?: string;
+  source_session_id?: string;
+};
 
 export interface BranchSessionSectionsProps {
   branch: Branch;
@@ -81,6 +97,17 @@ const SessionItemWithActions: React.FC<{
   onArchive: (sessionId: string, e: React.MouseEvent) => void;
   onSettings?: (sessionId: string, e: React.MouseEvent) => void;
   onTogglePeek?: (sessionId: string, e: React.MouseEvent) => void;
+  onToggleCallback?: (sessionId: string, e: React.MouseEvent) => void;
+  onOpenRemoteParent?: (sessionId: string, e: React.MouseEvent) => void;
+  callbackToggle?: {
+    enabled: boolean;
+    disabled?: boolean;
+    tooltip: string;
+  };
+  remoteParentLink?: {
+    disabled?: boolean;
+    tooltip: string;
+  };
   children: React.ReactNode;
 }> = ({
   sessionId,
@@ -89,6 +116,10 @@ const SessionItemWithActions: React.FC<{
   onArchive,
   onSettings,
   onTogglePeek,
+  onToggleCallback,
+  onOpenRemoteParent,
+  callbackToggle,
+  remoteParentLink,
   children,
 }) => {
   const [hovered, setHovered] = useState(false);
@@ -114,7 +145,7 @@ const SessionItemWithActions: React.FC<{
 
   return (
     <div
-      style={{ position: 'relative', minWidth: 120 }}
+      style={{ position: 'relative', minWidth: 0, width: '100%' }}
       onMouseEnter={() => setHovered(true)}
       onMouseLeave={() => setHovered(false)}
     >
@@ -155,6 +186,37 @@ const SessionItemWithActions: React.FC<{
             />
           </Tooltip>
         )}
+        {onOpenRemoteParent && remoteParentLink && (
+          <Tooltip title={remoteParentLink.tooltip}>
+            <Button
+              type="text"
+              size="small"
+              disabled={remoteParentLink.disabled}
+              icon={<ArrowUpOutlined />}
+              onClick={(e) => onOpenRemoteParent(sessionId, e)}
+              style={{
+                ...buttonStyle,
+                color: token.colorTextSecondary,
+              }}
+            />
+          </Tooltip>
+        )}
+        {onToggleCallback && callbackToggle && (
+          <Tooltip title={callbackToggle.tooltip}>
+            <Button
+              type="text"
+              size="small"
+              disabled={callbackToggle.disabled}
+              icon={callbackToggle.enabled ? <LinkOutlined /> : <DisconnectOutlined />}
+              onClick={(e) => onToggleCallback(sessionId, e)}
+              style={{
+                ...buttonStyle,
+                color: callbackToggle.enabled ? token.colorPrimary : token.colorTextTertiary,
+                background: callbackToggle.enabled ? token.colorPrimaryBg : buttonStyle.background,
+              }}
+            />
+          </Tooltip>
+        )}
         <ArchiveActionButton
           tooltip="Archive session"
           loading={isArchiving}
@@ -187,8 +249,6 @@ export const BranchSessionSections: React.FC<BranchSessionSectionsProps> = ({
   const { modal } = App.useApp();
   const { showSuccess, showError } = useThemedMessage();
   const connectionDisabled = useConnectionDisabled();
-  const schedulerEnabled = useServiceEnabled('scheduler');
-  const gatewayEnabled = useServiceEnabled('gateway');
   const { archiveSession } = useSessionActions(client);
 
   const [forkSpawnModal, setForkSpawnModal] = useState<{
@@ -201,11 +261,46 @@ export const BranchSessionSections: React.FC<BranchSessionSectionsProps> = ({
     session: null,
   });
   const [expandedKeys, setExpandedKeys] = useState<React.Key[]>([]);
+  const previousExpandableKeysRef = useRef<Set<React.Key> | null>(null);
+  const manuallyCollapsedKeysRef = useRef<Set<React.Key>>(new Set());
   const [archivingSessionIds, setArchivingSessionIds] = useState<Set<string>>(new Set());
   const [searchQuery, setSearchQuery] = useState('');
   const [sort, setSort] = useLocalStorage<SessionSort>(SESSION_SORT_STORAGE_KEY, 'recent');
 
   const isPanel = mode === 'panel';
+  const [openSectionKeys, setOpenSectionKeys] = useState<CollapseKey[]>(() =>
+    defaultExpanded ? ['sessions'] : []
+  );
+  const isManualSessionsOpen = openSectionKeys.includes('sessions');
+  const isScheduledRunsOpen = openSectionKeys.includes('scheduled-runs');
+  const isGatewaySessionsOpen = openSectionKeys.includes('gateway-sessions');
+  const updateSectionOpenState = useCallback(
+    (sectionKey: CollapseKey, keys: CollapseKey | CollapseKey[]) => {
+      const sectionIsOpen = Array.isArray(keys) ? keys.includes(sectionKey) : keys === sectionKey;
+      setOpenSectionKeys((currentKeys) => {
+        const alreadyOpen = currentKeys.includes(sectionKey);
+        if (sectionIsOpen) return alreadyOpen ? currentKeys : [...currentKeys, sectionKey];
+        return alreadyOpen ? currentKeys.filter((key) => key !== sectionKey) : currentKeys;
+      });
+    },
+    []
+  );
+  const handleManualSessionsChange = useCallback(
+    (keys: CollapseKey | CollapseKey[]) => updateSectionOpenState('sessions', keys),
+    [updateSectionOpenState]
+  );
+  const handleScheduledRunsChange = useCallback(
+    (keys: CollapseKey | CollapseKey[]) => updateSectionOpenState('scheduled-runs', keys),
+    [updateSectionOpenState]
+  );
+  const handleGatewaySessionsChange = useCallback(
+    (keys: CollapseKey | CollapseKey[]) => updateSectionOpenState('gateway-sessions', keys),
+    [updateSectionOpenState]
+  );
+  useEffect(() => {
+    if (!defaultExpanded) return;
+    setOpenSectionKeys((keys) => (keys.includes('sessions') ? keys : [...keys, 'sessions']));
+  }, [defaultExpanded]);
   const peekedIds = peekedSessionIds ?? new Set<string>();
   const trimmedSearchQuery = searchQuery.trim();
   const searchActive = isSessionSearchActive(trimmedSearchQuery);
@@ -216,6 +311,116 @@ export const BranchSessionSections: React.FC<BranchSessionSectionsProps> = ({
       onTogglePeekSession?.(sessionId);
     },
     [onTogglePeekSession]
+  );
+
+  const getCallbackRelationship = useCallback((session: Session) => {
+    return (
+      session.remote_surrogate?.relationship ??
+      session.remote_relationships?.as_target?.find(
+        (relationship: RemoteRelationshipRef) => relationship.relationship_type === 'remote_create'
+      )
+    );
+  }, []);
+
+  const getRemoteParentId = useCallback(
+    (session: Session): string | undefined => {
+      if (session.remote_surrogate) return undefined;
+
+      const relationshipParentId = session.remote_relationships?.as_target?.find(
+        (relationship: RemoteRelationshipRef) => relationship.relationship_type === 'remote_create'
+      )?.source_session_id;
+      if (relationshipParentId) return relationshipParentId;
+
+      // Defensive fallback for live-patched session rows that may temporarily
+      // lack enriched remote_relationships. A cross-branch callback target is
+      // still local to the already-loaded Agor session store and points at the
+      // same creator/remote-parent session for remote-created children.
+      const callbackTargetId = session.callback_config?.callback_session_id;
+      const callbackTarget = callbackTargetId
+        ? sessions.find((candidate) => candidate.session_id === callbackTargetId)
+        : undefined;
+      if (callbackTarget && callbackTarget.branch_id !== session.branch_id) {
+        return callbackTargetId;
+      }
+
+      return undefined;
+    },
+    [sessions]
+  );
+
+  const getCallbackTargetId = useCallback(
+    (session: Session): string | undefined => {
+      const relationship = getCallbackRelationship(session);
+      return (
+        session.callback_config?.callback_session_id ??
+        relationship?.callback_session_id ??
+        session.genealogy?.parent_session_id ??
+        session.remote_surrogate?.source_session_id
+      );
+    },
+    [getCallbackRelationship]
+  );
+
+  const getCallbackToggle = useCallback(
+    (session: Session) => {
+      const targetId = getCallbackTargetId(session);
+      if (!targetId) return null;
+
+      const relationship = getCallbackRelationship(session);
+      const enabled = session.callback_config?.enabled ?? relationship?.callback_enabled ?? true;
+
+      return {
+        enabled,
+        disabled: connectionDisabled || !client,
+        tooltip: enabled
+          ? 'Callbacks linked — click to stop callback notifications while keeping the relationship'
+          : 'Callbacks unlinked — click to resume callback notifications for this relationship',
+      };
+    },
+    [client, connectionDisabled, getCallbackRelationship, getCallbackTargetId]
+  );
+
+  const handleToggleCallback = useCallback(
+    async (sessionId: string, e: React.MouseEvent) => {
+      e.stopPropagation();
+      if (!client) return;
+
+      const session = sessions.find((candidate) => candidate.session_id === sessionId);
+      if (!session) return;
+
+      const targetId = getCallbackTargetId(session);
+      if (!targetId) return;
+
+      const toggle = getCallbackToggle(session);
+      const nextEnabled = !(toggle?.enabled ?? false);
+
+      try {
+        await client.service('sessions').patch(session.session_id, {
+          callback_config: {
+            ...(session.callback_config ?? {}),
+            callback_session_id: targetId as SessionID,
+            enabled: nextEnabled,
+          },
+        });
+        showSuccess(nextEnabled ? 'Callbacks linked' : 'Callbacks unlinked');
+      } catch (error) {
+        showError(
+          `Failed to update callbacks: ${error instanceof Error ? error.message : String(error)}`
+        );
+      }
+    },
+    [client, getCallbackTargetId, getCallbackToggle, sessions, showError, showSuccess]
+  );
+
+  const handleOpenRemoteParent = useCallback(
+    (sessionId: string, e: React.MouseEvent) => {
+      e.stopPropagation();
+      const session = sessions.find((candidate) => candidate.session_id === sessionId);
+      const remoteParentId = session ? getRemoteParentId(session) : undefined;
+      if (!remoteParentId) return;
+      onSessionClick?.(remoteParentId);
+    },
+    [getRemoteParentId, onSessionClick, sessions]
   );
 
   const handleForkSpawnConfirm = async (config: string | Partial<SpawnConfig>) => {
@@ -229,13 +434,17 @@ export const BranchSessionSections: React.FC<BranchSessionSectionsProps> = ({
     }
   };
 
+  const closeForkSpawnModal = () => setForkSpawnModal((current) => ({ ...current, open: false }));
+  const unmountForkSpawnModal = () =>
+    setForkSpawnModal({ open: false, action: 'fork', session: null });
+
   const handleArchiveSession = useCallback(
     (sessionId: string, e: React.MouseEvent) => {
       e.stopPropagation();
 
       modal.confirm({
-        title: 'Archive session?',
-        content: 'Are you sure you want to archive this session?',
+        title: 'Archive session and child sessions?',
+        content: 'Are you sure you want to archive this session and its child sessions?',
         okText: 'Archive',
         cancelText: 'Cancel',
         onOk: async () => {
@@ -243,7 +452,7 @@ export const BranchSessionSections: React.FC<BranchSessionSectionsProps> = ({
           try {
             const result = await archiveSession(sessionId as SessionID);
             if (result) {
-              showSuccess('Session archived');
+              showSuccess('Session and child sessions archived');
             } else {
               showError('Failed to archive session');
             }
@@ -286,42 +495,18 @@ export const BranchSessionSections: React.FC<BranchSessionSectionsProps> = ({
     [activeSessions, isGatewaySession]
   );
   const searchablePanelSessions = useMemo(
-    () => [
-      ...manualSessions,
-      ...(schedulerEnabled ? scheduledSessions : []),
-      ...(gatewayEnabled ? gatewaySessions : []),
-    ],
-    [gatewayEnabled, gatewaySessions, manualSessions, scheduledSessions, schedulerEnabled]
+    () => [...manualSessions, ...scheduledSessions, ...gatewaySessions],
+    [gatewaySessions, manualSessions, scheduledSessions]
   );
   const sortedManualSessions = useMemo(
-    () => sortSessions(manualSessions, sort),
-    [manualSessions, sort]
+    () => (isManualSessionsOpen ? sortSessions(manualSessions, sort) : []),
+    [isManualSessionsOpen, manualSessions, sort]
   );
   const sessionTreeData = useMemo(
-    () => buildSessionTree(sortedManualSessions),
-    [sortedManualSessions]
+    () => (isManualSessionsOpen ? buildSessionTree(sortedManualSessions) : []),
+    [isManualSessionsOpen, sortedManualSessions]
   );
-  const searchResults = useMemo(
-    () =>
-      isPanel && searchActive
-        ? searchSessions(searchablePanelSessions, trimmedSearchQuery).map(({ session }) => session)
-        : [],
-    [isPanel, searchActive, searchablePanelSessions, trimmedSearchQuery]
-  );
-
-  const hasRunningScheduledSession = useMemo(
-    () => scheduledSessions.some((s) => s.status === 'running' || s.status === 'stopping'),
-    [scheduledSessions]
-  );
-  const hasRunningGatewaySession = useMemo(
-    () => gatewaySessions.some((s) => s.status === 'running' || s.status === 'stopping'),
-    [gatewaySessions]
-  );
-
-  const isCreating = branch.filesystem_status === 'creating';
-  const isFailed = branch.filesystem_status === 'failed';
-
-  useEffect(() => {
+  const expandableKeys = useMemo(() => {
     const collectKeysWithChildren = (nodes: SessionTreeNode[]): React.Key[] => {
       const keys: React.Key[] = [];
       for (const node of nodes) {
@@ -333,22 +518,106 @@ export const BranchSessionSections: React.FC<BranchSessionSectionsProps> = ({
       return keys;
     };
 
-    setExpandedKeys(collectKeysWithChildren(sessionTreeData));
+    return collectKeysWithChildren(sessionTreeData);
   }, [sessionTreeData]);
+  const searchResults = useMemo(
+    () =>
+      isPanel && searchActive
+        ? searchSessions(searchablePanelSessions, trimmedSearchQuery).map(({ session }) => session)
+        : [],
+    [isPanel, searchActive, searchablePanelSessions, trimmedSearchQuery]
+  );
+
+  const hasRunningScheduledSession = useMemo(
+    () => scheduledSessions.some(isSessionExecuting),
+    [scheduledSessions]
+  );
+  const hasRunningGatewaySession = useMemo(
+    () => gatewaySessions.some(isSessionExecuting),
+    [gatewaySessions]
+  );
+
+  const isCreating = branch.filesystem_status === 'creating';
+  const isFailed = branch.filesystem_status === 'failed';
+
+  const isSessionFailed = (session: Session): boolean => session.status === SessionStatus.FAILED;
+
+  useEffect(() => {
+    if (!isManualSessionsOpen) return;
+
+    const expandableKeySet = new Set(expandableKeys);
+    const previousExpandableKeys = previousExpandableKeysRef.current;
+    const manuallyCollapsedKeys = manuallyCollapsedKeysRef.current;
+
+    setExpandedKeys((previousExpandedKeys) => {
+      if (!previousExpandableKeys) {
+        return expandableKeys.filter((key) => !manuallyCollapsedKeys.has(key));
+      }
+
+      const nextExpandedKeys = previousExpandedKeys.filter((key) => expandableKeySet.has(key));
+      const nextExpandedKeySet = new Set(nextExpandedKeys);
+
+      for (const key of expandableKeys) {
+        if (
+          !previousExpandableKeys.has(key) &&
+          !nextExpandedKeySet.has(key) &&
+          !manuallyCollapsedKeys.has(key)
+        ) {
+          nextExpandedKeys.push(key);
+          nextExpandedKeySet.add(key);
+        }
+      }
+
+      return nextExpandedKeys;
+    });
+
+    previousExpandableKeysRef.current = expandableKeySet;
+  }, [expandableKeys, isManualSessionsOpen]);
+
+  const handleSessionTreeExpand = useCallback((keys: React.Key[]) => {
+    setExpandedKeys((previousKeys) => {
+      const nextKeys = [...keys];
+      const previousKeySet = new Set(previousKeys);
+      const nextKeySet = new Set(nextKeys);
+
+      for (const key of previousKeySet) {
+        if (!nextKeySet.has(key)) {
+          manuallyCollapsedKeysRef.current.add(key);
+        }
+      }
+      for (const key of nextKeySet) {
+        if (!previousKeySet.has(key)) {
+          manuallyCollapsedKeysRef.current.delete(key);
+        }
+      }
+
+      return nextKeys;
+    });
+  }, []);
 
   const sessionRowStyle = (session: Session): React.CSSProperties => {
     const isSessionSelected = session.session_id === selectedSessionId;
+    const isRemoteSurrogate = Boolean(session.remote_surrogate);
     return {
       border: session.ready_for_prompt
         ? `1px solid ${token.colorPrimary}`
-        : `1px solid ${isPanel ? token.colorBorderSecondary : 'rgba(255, 255, 255, 0.1)'}`,
+        : isRemoteSurrogate
+          ? `1px dashed ${token.colorBorderSecondary}`
+          : `1px solid ${token.colorBorderSecondary}`,
       borderRadius: isPanel ? 6 : 4,
       padding: isPanel ? 10 : 8,
-      background: isPanel ? token.colorBgContainer : 'transparent',
+      background: isRemoteSurrogate
+        ? token.colorFillQuaternary
+        : isPanel
+          ? token.colorBgContainer
+          : 'transparent',
       display: 'flex',
       alignItems: 'center',
+      width: '100%',
+      boxSizing: 'border-box',
       cursor: 'pointer',
       marginBottom: 4,
+      opacity: isRemoteSurrogate ? 0.78 : undefined,
       boxShadow: session.ready_for_prompt ? `0 0 12px ${token.colorPrimary}30` : undefined,
       ...(isSessionSelected
         ? { outline: `1px dashed ${token.colorTextBase}`, outlineOffset: -2 }
@@ -361,11 +630,12 @@ export const BranchSessionSections: React.FC<BranchSessionSectionsProps> = ({
     options: { strong?: boolean; secondary?: boolean; query?: string } = {}
   ) => {
     const titleText = getSessionDisplayTitle(session, { includeAgentFallback: true });
+    const failed = isSessionFailed(session);
 
     return (
       <Typography.Text
         strong={options.strong}
-        type={options.secondary ? 'secondary' : undefined}
+        type={failed ? 'danger' : options.secondary ? 'secondary' : undefined}
         style={{
           fontSize: isPanel ? 13 : 12,
           flex: 1,
@@ -378,8 +648,33 @@ export const BranchSessionSections: React.FC<BranchSessionSectionsProps> = ({
     );
   };
 
+  const renderSessionFailureIcon = (session: Session) => {
+    if (!isSessionFailed(session)) return null;
+
+    return (
+      <Tooltip title="Latest task failed">
+        <ExclamationCircleOutlined
+          aria-label="Latest task failed"
+          style={{ color: token.colorErrorText, fontSize: 12, flex: '0 0 auto' }}
+        />
+      </Tooltip>
+    );
+  };
+
+  const renderSessionTitleWithFailure = (
+    session: Session,
+    options: { strong?: boolean; secondary?: boolean; query?: string } = {}
+  ) => (
+    <>
+      {renderSessionFailureIcon(session)}
+      {renderSessionTitle(session, options)}
+    </>
+  );
+
   const renderFlatSessionRow = (session: Session, query = '') => {
-    const isActive = session.status === 'running' || session.status === 'stopping';
+    const isActive = isSessionExecuting(session);
+    const callbackToggle = getCallbackToggle(session);
+    const remoteParentId = getRemoteParentId(session);
     const titleText = getSessionDisplayTitle(session, { includeAgentFallback: true });
     const descriptionSnippet =
       query && session.title && session.description
@@ -398,6 +693,14 @@ export const BranchSessionSections: React.FC<BranchSessionSectionsProps> = ({
         sessionId={session.session_id}
         isArchiving={archivingSessionIds.has(session.session_id)}
         onArchive={handleArchiveSession}
+        callbackToggle={callbackToggle ?? undefined}
+        onToggleCallback={callbackToggle ? handleToggleCallback : undefined}
+        remoteParentLink={
+          remoteParentId
+            ? { tooltip: 'Open remote parent session that created this session' }
+            : undefined
+        }
+        onOpenRemoteParent={remoteParentId ? handleOpenRemoteParent : undefined}
         onSettings={
           onOpenSessionSettings
             ? (id, e) => {
@@ -412,7 +715,9 @@ export const BranchSessionSections: React.FC<BranchSessionSectionsProps> = ({
             {isActive ? <Spin size="small" /> : <ToolIcon tool={session.agentic_tool} size={20} />}
             <SessionRelationshipIcon session={session} size={10} />
             <div style={{ flex: 1, minWidth: 0 }}>
-              {renderSessionTitle(session, { strong: true, query })}
+              <div style={{ display: 'flex', alignItems: 'center', gap: 4, minWidth: 0 }}>
+                {renderSessionTitleWithFailure(session, { query })}
+              </div>
               {(sourceLabel || toolMatches) && (
                 <Typography.Text
                   type="secondary"
@@ -448,9 +753,61 @@ export const BranchSessionSections: React.FC<BranchSessionSectionsProps> = ({
     );
   };
 
+  const renderTreeSwitcherIcon = useCallback(
+    (nodeProps: {
+      eventKey?: React.Key;
+      expanded?: boolean;
+      isLeaf?: boolean;
+      session?: Session;
+    }) => {
+      const key = nodeProps.eventKey;
+      if (nodeProps.isLeaf || key == null) return null;
+
+      const expanded = Boolean(nodeProps.expanded);
+      const sessionTitle = nodeProps.session
+        ? getSessionDisplayTitle(nodeProps.session, { includeAgentFallback: true })
+        : 'session';
+      const Icon = expanded ? MinusSquareOutlined : PlusSquareOutlined;
+
+      return (
+        <button
+          type="button"
+          aria-label={`${expanded ? 'Collapse' : 'Expand'} ${sessionTitle}`}
+          aria-expanded={expanded}
+          onClick={(event) => {
+            event.stopPropagation();
+            setExpandedKeys((previousKeys) => {
+              if (previousKeys.includes(key)) {
+                manuallyCollapsedKeysRef.current.add(key);
+                return previousKeys.filter((expandedKey) => expandedKey !== key);
+              }
+
+              manuallyCollapsedKeysRef.current.delete(key);
+              return [...previousKeys, key];
+            });
+          }}
+          style={{
+            border: 0,
+            background: 'transparent',
+            padding: 0,
+            lineHeight: 0,
+            cursor: 'pointer',
+            color: 'inherit',
+          }}
+        >
+          <Icon />
+        </button>
+      );
+    },
+    []
+  );
+
   const renderSessionNode = (node: SessionTreeNode) => {
     const session = node.session;
-    const isActive = session.status === 'running' || session.status === 'stopping';
+    const isActive = isSessionExecuting(session);
+    const isRemoteSurrogate = node.relationshipType === 'remote';
+    const callbackToggle = getCallbackToggle(session);
+    const remoteParentId = getRemoteParentId(session);
 
     return (
       <SessionItemWithActions
@@ -459,6 +816,14 @@ export const BranchSessionSections: React.FC<BranchSessionSectionsProps> = ({
         isPeeked={peekedIds.has(session.session_id)}
         onArchive={handleArchiveSession}
         onTogglePeek={onTogglePeekSession ? handleTogglePeekSession : undefined}
+        callbackToggle={callbackToggle ?? undefined}
+        onToggleCallback={callbackToggle ? handleToggleCallback : undefined}
+        remoteParentLink={
+          remoteParentId
+            ? { tooltip: 'Open remote parent session that created this session' }
+            : undefined
+        }
+        onOpenRemoteParent={remoteParentId ? handleOpenRemoteParent : undefined}
         onSettings={
           onOpenSessionSettings
             ? (id, e) => {
@@ -479,29 +844,37 @@ export const BranchSessionSections: React.FC<BranchSessionSectionsProps> = ({
         >
           <div style={{ display: 'flex', alignItems: 'center', gap: 4, flex: 1, minWidth: 0 }}>
             {isActive ? <Spin size="small" /> : <ToolIcon tool={session.agentic_tool} size={20} />}
-            <SessionRelationshipIcon session={session} size={10} />
-            {renderSessionTitle(session, { strong: true })}
+            {isRemoteSurrogate ? (
+              <Tooltip title="Remote session created from this session. Click to open it in its own branch.">
+                <ExportOutlined style={{ fontSize: 11, color: token.colorTextTertiary }} />
+              </Tooltip>
+            ) : (
+              <SessionRelationshipIcon session={session} size={10} />
+            )}
+            {renderSessionTitleWithFailure(session)}
           </div>
         </div>
       </SessionItemWithActions>
     );
   };
 
-  const sessionListContent = (
+  const sessionListContent = isManualSessionsOpen ? (
     <ConfigProvider theme={{ components: { Tree: { colorBgContainer: 'transparent' } } }}>
       <Tree
         className="agor-flat-tree"
         treeData={sessionTreeData}
         expandedKeys={expandedKeys}
-        onExpand={(keys) => setExpandedKeys(keys as React.Key[])}
+        onExpand={(keys) => handleSessionTreeExpand(keys as React.Key[])}
         showLine
+        switcherIcon={renderTreeSwitcherIcon}
         showIcon={false}
+        blockNode
         selectable={false}
         style={{ background: 'transparent', borderRadius: 0, padding: 0 }}
         titleRender={renderSessionNode}
       />
     </ConfigProvider>
-  );
+  ) : null;
 
   const sessionListHeader = (
     <div
@@ -565,10 +938,12 @@ export const BranchSessionSections: React.FC<BranchSessionSectionsProps> = ({
     </div>
   );
 
-  const scheduledRunsContent = (
+  const scheduledRunsContent = isScheduledRunsOpen ? (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
       {scheduledSessions.map((session) => {
-        const isActive = session.status === 'running' || session.status === 'stopping';
+        const isActive = isSessionExecuting(session);
+        const callbackToggle = getCallbackToggle(session);
+        const remoteParentId = getRemoteParentId(session);
         return (
           <SessionItemWithActions
             key={session.session_id}
@@ -577,6 +952,14 @@ export const BranchSessionSections: React.FC<BranchSessionSectionsProps> = ({
             isPeeked={peekedIds.has(session.session_id)}
             onArchive={handleArchiveSession}
             onTogglePeek={onTogglePeekSession ? handleTogglePeekSession : undefined}
+            callbackToggle={callbackToggle ?? undefined}
+            onToggleCallback={callbackToggle ? handleToggleCallback : undefined}
+            remoteParentLink={
+              remoteParentId
+                ? { tooltip: 'Open remote parent session that created this session' }
+                : undefined
+            }
+            onOpenRemoteParent={remoteParentId ? handleOpenRemoteParent : undefined}
             onSettings={
               onOpenSessionSettings
                 ? (id, e) => {
@@ -596,14 +979,14 @@ export const BranchSessionSections: React.FC<BranchSessionSectionsProps> = ({
                 ) : (
                   <ToolIcon tool={session.agentic_tool} size={20} />
                 )}
-                {renderSessionTitle(session, { secondary: true })}
+                {renderSessionTitleWithFailure(session, { secondary: true })}
               </Space>
             </div>
           </SessionItemWithActions>
         );
       })}
     </div>
-  );
+  ) : null;
 
   const gatewaySessionsHeader = (
     <div
@@ -627,11 +1010,13 @@ export const BranchSessionSections: React.FC<BranchSessionSectionsProps> = ({
     </div>
   );
 
-  const gatewaySessionsContent = (
+  const gatewaySessionsContent = isGatewaySessionsOpen ? (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
       {gatewaySessions.map((session) => {
         const gatewaySource = getGatewaySource(session);
-        const isActive = session.status === 'running' || session.status === 'stopping';
+        const isActive = isSessionExecuting(session);
+        const callbackToggle = getCallbackToggle(session);
+        const remoteParentId = getRemoteParentId(session);
 
         return (
           <SessionItemWithActions
@@ -641,6 +1026,14 @@ export const BranchSessionSections: React.FC<BranchSessionSectionsProps> = ({
             isPeeked={peekedIds.has(session.session_id)}
             onArchive={handleArchiveSession}
             onTogglePeek={onTogglePeekSession ? handleTogglePeekSession : undefined}
+            callbackToggle={callbackToggle ?? undefined}
+            onToggleCallback={callbackToggle ? handleToggleCallback : undefined}
+            remoteParentLink={
+              remoteParentId
+                ? { tooltip: 'Open remote parent session that created this session' }
+                : undefined
+            }
+            onOpenRemoteParent={remoteParentId ? handleOpenRemoteParent : undefined}
             onSettings={
               onOpenSessionSettings
                 ? (id, e) => {
@@ -663,7 +1056,9 @@ export const BranchSessionSections: React.FC<BranchSessionSectionsProps> = ({
                 <div
                   style={{ flex: 1, minWidth: 0, display: 'flex', flexDirection: 'column', gap: 4 }}
                 >
-                  {renderSessionTitle(session)}
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 4, minWidth: 0 }}>
+                    {renderSessionTitleWithFailure(session)}
+                  </div>
                   <div style={{ alignSelf: 'flex-start' }}>
                     {gatewaySource ? (
                       <ChannelPill
@@ -686,7 +1081,7 @@ export const BranchSessionSections: React.FC<BranchSessionSectionsProps> = ({
         );
       })}
     </div>
-  );
+  ) : null;
 
   const sessionSearchBar =
     isPanel && activeSessions.length > 0 ? (
@@ -739,22 +1134,27 @@ export const BranchSessionSections: React.FC<BranchSessionSectionsProps> = ({
           </div>
         )}
 
-        <ForkSpawnModal
-          open={forkSpawnModal.open}
-          action={forkSpawnModal.action}
-          session={forkSpawnModal.session}
-          currentUser={currentUserId ? userById.get(currentUserId) : undefined}
-          onConfirm={handleForkSpawnConfirm}
-          onCancel={() => setForkSpawnModal({ open: false, action: 'fork', session: null })}
-          client={client}
-          userById={userById}
-        />
+        {forkSpawnModal.session && (
+          <ForkSpawnModal
+            open={forkSpawnModal.open}
+            action={forkSpawnModal.action}
+            session={forkSpawnModal.session}
+            currentUser={currentUserId ? userById.get(currentUserId) : undefined}
+            onConfirm={handleForkSpawnConfirm}
+            onCancel={closeForkSpawnModal}
+            afterClose={unmountForkSpawnModal}
+            client={client}
+            userById={userById}
+          />
+        )}
       </>
     );
   }
 
   return (
-    <>
+    // Card mode disables antd motion: 30 cards animating their collapse/tree
+    // mounts multiplies board-mount commits (#1768). Panel mode keeps motion.
+    <ConfigProvider theme={isPanel ? undefined : NO_MOTION_THEME}>
       {sessionSearchBar}
       {activeSessions.length === 0 ? (
         <div
@@ -811,7 +1211,8 @@ export const BranchSessionSections: React.FC<BranchSessionSectionsProps> = ({
         <>
           {manualSessions.length > 0 ? (
             <Collapse
-              defaultActiveKey={defaultExpanded ? ['sessions'] : []}
+              activeKey={openSectionKeys}
+              onChange={handleManualSessionsChange}
               items={[
                 {
                   key: 'sessions',
@@ -829,9 +1230,10 @@ export const BranchSessionSections: React.FC<BranchSessionSectionsProps> = ({
             <div style={{ marginTop: 8 }}>{sessionListHeader}</div>
           ) : null}
 
-          {schedulerEnabled && scheduledSessions.length > 0 && (
+          {scheduledSessions.length > 0 && (
             <Collapse
-              defaultActiveKey={[]}
+              activeKey={openSectionKeys}
+              onChange={handleScheduledRunsChange}
               items={[
                 {
                   key: 'scheduled-runs',
@@ -847,9 +1249,10 @@ export const BranchSessionSections: React.FC<BranchSessionSectionsProps> = ({
             />
           )}
 
-          {gatewayEnabled && gatewaySessions.length > 0 && (
+          {gatewaySessions.length > 0 && (
             <Collapse
-              defaultActiveKey={[]}
+              activeKey={openSectionKeys}
+              onChange={handleGatewaySessionsChange}
               items={[
                 {
                   key: 'gateway-sessions',
@@ -869,16 +1272,19 @@ export const BranchSessionSections: React.FC<BranchSessionSectionsProps> = ({
         </>
       )}
 
-      <ForkSpawnModal
-        open={forkSpawnModal.open}
-        action={forkSpawnModal.action}
-        session={forkSpawnModal.session}
-        currentUser={currentUserId ? userById.get(currentUserId) : undefined}
-        onConfirm={handleForkSpawnConfirm}
-        onCancel={() => setForkSpawnModal({ open: false, action: 'fork', session: null })}
-        client={client}
-        userById={userById}
-      />
-    </>
+      {forkSpawnModal.session && (
+        <ForkSpawnModal
+          open={forkSpawnModal.open}
+          action={forkSpawnModal.action}
+          session={forkSpawnModal.session}
+          currentUser={currentUserId ? userById.get(currentUserId) : undefined}
+          onConfirm={handleForkSpawnConfirm}
+          onCancel={closeForkSpawnModal}
+          afterClose={unmountForkSpawnModal}
+          client={client}
+          userById={userById}
+        />
+      )}
+    </ConfigProvider>
   );
 };

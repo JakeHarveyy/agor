@@ -5,10 +5,14 @@
  * board object management (zones/text), and JSON field handling.
  */
 
-import type { Board, BoardObject, UUID } from '@agor/core/types';
+import type { Board, BoardID, BoardObject, UUID } from '@agor/core/types';
+import { eq } from 'drizzle-orm';
 import { describe, expect } from 'vitest';
+import { DEFAULT_BOARD_BACKGROUND } from '../../design/board-backgrounds';
 import { generateId, shortId, toShortId } from '../../lib/ids';
 import type { Database } from '../client';
+import { select, update } from '../database-wrapper';
+import { boards as boardsTable } from '../schema';
 import { dbTest } from '../test-helpers';
 import { AmbiguousIdError, EntityNotFoundError } from './base';
 import { BoardRepository } from './boards';
@@ -38,8 +42,11 @@ function createBoardData(overrides?: Partial<Board>): Partial<Board> {
     default_others_fs_access: overrides?.default_others_fs_access,
     default_dangerously_allow_session_sharing: overrides?.default_dangerously_allow_session_sharing,
   };
-  if (Object.hasOwn(overrides ?? {}, 'primary_assistant_id')) {
-    data.primary_assistant_id = overrides?.primary_assistant_id;
+  if (overrides && Object.hasOwn(overrides, 'primary_teammate_id')) {
+    data.primary_teammate_id = overrides.primary_teammate_id;
+  }
+  if (overrides && Object.hasOwn(overrides, 'background_color')) {
+    data.background_color = overrides.background_color;
   }
   return data;
 }
@@ -64,7 +71,7 @@ async function createBranchForBoard(
   boardId: UUID,
   overrides: {
     name?: string;
-    assistant?: boolean;
+    teammate?: boolean;
     archived?: boolean;
     custom_context?: Record<string, unknown>;
   } = {}
@@ -86,10 +93,10 @@ async function createBranchForBoard(
     created_by: generateId(),
     custom_context:
       overrides.custom_context ??
-      (overrides.assistant
+      (overrides.teammate
         ? {
-            assistant: {
-              kind: 'assistant',
+            teammate: {
+              kind: 'teammate',
               displayName: name,
             },
           }
@@ -97,11 +104,33 @@ async function createBranchForBoard(
   });
 }
 
+async function getStoredBoardIcon(db: Database, boardId: UUID): Promise<string | undefined> {
+  const row = await select(db).from(boardsTable).where(eq(boardsTable.board_id, boardId)).one();
+  return (row?.data as { icon?: string } | undefined)?.icon;
+}
+
 // ============================================================================
 // Create
 // ============================================================================
 
 describe('BoardRepository.create', () => {
+  dbTest('defaults an omitted background to Gold Shimmer', async ({ db }) => {
+    const repo = new BoardRepository(db);
+
+    const created = await repo.create(createBoardData());
+
+    expect(created.background_color).toBe(DEFAULT_BOARD_BACKGROUND);
+  });
+
+  dbTest('preserves an explicitly supplied background', async ({ db }) => {
+    const repo = new BoardRepository(db);
+    const background = 'linear-gradient(90deg, red, blue)';
+
+    const created = await repo.create(createBoardData({ background_color: background }));
+
+    expect(created.background_color).toBe(background);
+  });
+
   dbTest('should create board with all required fields', async ({ db }) => {
     const repo = new BoardRepository(db);
     const data = createBoardData({
@@ -149,13 +178,13 @@ describe('BoardRepository.create', () => {
     await expect(repo.create(data)).rejects.toThrow(/created_by/);
   });
 
-  dbTest('should reject primary_assistant_id in generic create input', async ({ db }) => {
+  dbTest('should reject primary_teammate_id in generic create input', async ({ db }) => {
     const repo = new BoardRepository(db);
     const data = createBoardData({
-      primary_assistant_id: generateId(),
+      primary_teammate_id: generateId(),
     } as Partial<Board>);
 
-    await expect(repo.create(data)).rejects.toThrow(/setPrimaryAssistant/);
+    await expect(repo.create(data)).rejects.toThrow(/setPrimaryTeammate/);
   });
 
   dbTest('should store all optional fields correctly', async ({ db }) => {
@@ -220,6 +249,38 @@ describe('BoardRepository.create', () => {
       sprint: 42,
       deadline: '2025-03-15',
     });
+  });
+
+  dbTest('should normalize exact emoji shortcodes before storing board icons', async ({ db }) => {
+    const repo = new BoardRepository(db);
+
+    const created = await repo.create(createBoardData({ icon: '  :compass:  ' }));
+
+    expect(created.icon).toBe('🧭');
+    await expect(getStoredBoardIcon(db, created.board_id)).resolves.toBe('🧭');
+  });
+
+  dbTest('should preserve unicode emoji board icons', async ({ db }) => {
+    const repo = new BoardRepository(db);
+
+    const created = await repo.create(createBoardData({ icon: '🧭' }));
+
+    expect(created.icon).toBe('🧭');
+    await expect(getStoredBoardIcon(db, created.board_id)).resolves.toBe('🧭');
+  });
+
+  dbTest('should trim but preserve unknown board icon text and shortcodes', async ({ db }) => {
+    const repo = new BoardRepository(db);
+
+    const unknownShortcode = await repo.create(createBoardData({ icon: '  :not_real:  ' }));
+    const textIcon = await repo.create(
+      createBoardData({ name: 'Text Icon Board', icon: '  Team Icon  ' })
+    );
+
+    expect(unknownShortcode.icon).toBe(':not_real:');
+    await expect(getStoredBoardIcon(db, unknownShortcode.board_id)).resolves.toBe(':not_real:');
+    expect(textIcon.icon).toBe('Team Icon');
+    await expect(getStoredBoardIcon(db, textIcon.board_id)).resolves.toBe('Team Icon');
   });
 
   dbTest('should preserve timestamps if provided', async ({ db }) => {
@@ -371,6 +432,24 @@ describe('BoardRepository.findById', () => {
     expect(found?.objects).toEqual(data.objects);
     expect(found?.custom_context).toEqual(data.custom_context);
   });
+
+  dbTest('should normalize legacy shortcode board icons when reading rows', async ({ db }) => {
+    const repo = new BoardRepository(db);
+    const created = await repo.create(createBoardData({ icon: '🧭' }));
+    const row = await select(db)
+      .from(boardsTable)
+      .where(eq(boardsTable.board_id, created.board_id))
+      .one();
+    await update(db, boardsTable)
+      .set({ data: { ...(row?.data as Record<string, unknown>), icon: ':compass:' } })
+      .where(eq(boardsTable.board_id, created.board_id))
+      .run();
+
+    const found = await repo.findById(created.board_id);
+
+    expect(found?.icon).toBe('🧭');
+    await expect(getStoredBoardIcon(db, created.board_id)).resolves.toBe(':compass:');
+  });
 });
 
 // ============================================================================
@@ -483,6 +562,65 @@ describe('BoardRepository.findAll', () => {
     expect(found.created_at).toBeDefined();
     expect(found.last_updated).toBeDefined();
   });
+
+  dbTest('should filter by exact archived state', async ({ db }) => {
+    const repo = new BoardRepository(db);
+
+    const active = await repo.create(createBoardData({ name: 'Active', slug: 'active' }));
+    const archived = await repo.create(createBoardData({ name: 'Archived', slug: 'archived' }));
+    await repo.update(archived.board_id, { archived: true });
+
+    const activeOnly = await repo.findAll({ archived: false });
+    expect(activeOnly.map((b) => b.board_id)).toEqual([active.board_id]);
+
+    const archivedOnly = await repo.findAll({ archived: true });
+    expect(archivedOnly.map((b) => b.board_id)).toEqual([archived.board_id]);
+  });
+
+  dbTest('should restrict to an explicit boardIds set', async ({ db }) => {
+    const repo = new BoardRepository(db);
+
+    const b1 = await repo.create(createBoardData({ name: 'B1', slug: 'b1' }));
+    const b2 = await repo.create(createBoardData({ name: 'B2', slug: 'b2' }));
+    await repo.create(createBoardData({ name: 'B3', slug: 'b3' }));
+
+    const scoped = await repo.findAll({
+      boardIds: [b1.board_id as BoardID, b2.board_id as BoardID],
+    });
+    expect(scoped.map((b) => b.name).sort()).toEqual(['B1', 'B2']);
+  });
+
+  dbTest('should return no rows for an empty boardIds set', async ({ db }) => {
+    const repo = new BoardRepository(db);
+    await repo.create(createBoardData({ name: 'B1', slug: 'b1' }));
+
+    expect(await repo.findAll({ boardIds: [] })).toEqual([]);
+  });
+
+  dbTest('should push board visibility directly into findAll SQL', async ({ db }) => {
+    const repo = new BoardRepository(db);
+    const viewerId = generateId() as UUID;
+
+    const ownedPrivate = await repo.create(
+      createBoardData({
+        name: 'Owned private',
+        slug: 'owned-private',
+        access_mode: 'private',
+        created_by: viewerId,
+      })
+    );
+    await repo.create(
+      createBoardData({
+        name: 'Other private',
+        slug: 'other-private',
+        access_mode: 'private',
+        created_by: generateId() as UUID,
+      })
+    );
+
+    const visible = await repo.findAll({ visibleToUserId: viewerId });
+    expect(visible.map((b) => b.board_id)).toEqual([ownedPrivate.board_id]);
+  });
 });
 
 // ============================================================================
@@ -536,6 +674,16 @@ describe('BoardRepository.update', () => {
     expect(updated.icon).toBe('⚡');
   });
 
+  dbTest('should normalize exact emoji shortcodes when updating board icons', async ({ db }) => {
+    const repo = new BoardRepository(db);
+    const board = await repo.create(createBoardData({ icon: '📋' }));
+
+    const updated = await repo.update(board.board_id, { icon: ':compass:' });
+
+    expect(updated.icon).toBe('🧭');
+    await expect(getStoredBoardIcon(db, board.board_id)).resolves.toBe('🧭');
+  });
+
   dbTest('should update JSON fields (objects and custom_context)', async ({ db }) => {
     const repo = new BoardRepository(db);
     const data = createBoardData({
@@ -581,15 +729,15 @@ describe('BoardRepository.update', () => {
     await expect(repo.update('99999999', { name: 'Updated' })).rejects.toThrow(EntityNotFoundError);
   });
 
-  dbTest('should reject primary_assistant_id in generic update input', async ({ db }) => {
+  dbTest('should reject primary_teammate_id in generic update input', async ({ db }) => {
     const repo = new BoardRepository(db);
     const board = await repo.create(createBoardData());
 
     await expect(
       repo.update(board.board_id, {
-        primary_assistant_id: generateId(),
+        primary_teammate_id: generateId(),
       } as Partial<Board>)
-    ).rejects.toThrow(/setPrimaryAssistant/);
+    ).rejects.toThrow(/setPrimaryTeammate/);
   });
 
   dbTest('should preserve unchanged fields', async ({ db }) => {
@@ -626,18 +774,18 @@ describe('BoardRepository.update', () => {
 });
 
 // ============================================================================
-// Primary assistant
+// Primary teammate
 // ============================================================================
 
-describe('BoardRepository primary assistant', () => {
+describe('BoardRepository primary teammate', () => {
   dbTest(
-    'keeps private boards visible through an accessible primary assistant even after assistant moves',
+    'keeps private boards visible through an accessible primary teammate even after teammate moves',
     async ({ db }) => {
       const users = new UsersRepository(db);
       const boardRepo = new BoardRepository(db);
       const branchRepo = new BranchRepository(db);
       const viewer = await users.create({
-        email: 'primary-assistant-viewer@example.com',
+        email: 'primary-teammate-viewer@example.com',
         role: 'member',
       });
       const oldBoard = await boardRepo.create(
@@ -646,13 +794,13 @@ describe('BoardRepository primary assistant', () => {
       const newBoard = await boardRepo.create(
         createBoardData({ name: 'QBR Prep', access_mode: 'private' })
       );
-      const assistant = await createBranchForBoard(db, oldBoard.board_id, {
-        assistant: true,
-        name: 'kelly-assistant',
+      const teammate = await createBranchForBoard(db, oldBoard.board_id, {
+        teammate: true,
+        name: 'kelly-teammate',
       });
 
-      await boardRepo.setPrimaryAssistant(oldBoard.board_id, assistant.branch_id);
-      await branchRepo.update(assistant.branch_id, {
+      await boardRepo.setPrimaryTeammate(oldBoard.board_id, teammate.branch_id);
+      await branchRepo.update(teammate.branch_id, {
         board_id: newBoard.board_id,
         permission_source: 'override',
         others_can: 'none',
@@ -662,7 +810,7 @@ describe('BoardRepository primary assistant', () => {
         oldBoard.board_id
       );
 
-      await branchRepo.addOwner(assistant.branch_id, viewer.user_id as UUID);
+      await branchRepo.addOwner(teammate.branch_id, viewer.user_id as UUID);
 
       await expect(boardRepo.findVisibleBoardIds(viewer.user_id as UUID)).resolves.toContain(
         oldBoard.board_id
@@ -670,128 +818,128 @@ describe('BoardRepository primary assistant', () => {
     }
   );
 
-  dbTest('should set and fetch a valid primary assistant', async ({ db }) => {
+  dbTest('should set and fetch a valid primary teammate', async ({ db }) => {
     const boardRepo = new BoardRepository(db);
     const board = await boardRepo.create(createBoardData());
-    const assistant = await createBranchForBoard(db, board.board_id, {
-      assistant: true,
-      name: 'assistant-branch',
+    const teammate = await createBranchForBoard(db, board.board_id, {
+      teammate: true,
+      name: 'teammate-branch',
     });
 
-    const updated = await boardRepo.setPrimaryAssistant(board.board_id, assistant.branch_id);
+    const updated = await boardRepo.setPrimaryTeammate(board.board_id, teammate.branch_id);
 
-    expect(updated.primary_assistant_id).toBe(assistant.branch_id);
-    await expect(boardRepo.getPrimaryAssistant(board.board_id)).resolves.toMatchObject({
-      branch_id: assistant.branch_id,
-      name: 'assistant-branch',
+    expect(updated.primary_teammate_id).toBe(teammate.branch_id);
+    await expect(boardRepo.getPrimaryTeammate(board.board_id)).resolves.toMatchObject({
+      branch_id: teammate.branch_id,
+      name: 'teammate-branch',
       url: expect.any(String),
     });
   });
 
   dbTest(
-    'should accept short branch IDs when setting and clearing primary assistant',
+    'should accept short branch IDs when setting and clearing primary teammate',
     async ({ db }) => {
       const boardRepo = new BoardRepository(db);
       const board = await boardRepo.create(createBoardData());
-      const assistant = await createBranchForBoard(db, board.board_id, { assistant: true });
-      const assistantShortId = toShortId(assistant.branch_id, 8);
+      const teammate = await createBranchForBoard(db, board.board_id, { teammate: true });
+      const teammateShortId = toShortId(teammate.branch_id, 8);
 
-      const updated = await boardRepo.setPrimaryAssistant(board.board_id, assistantShortId);
+      const updated = await boardRepo.setPrimaryTeammate(board.board_id, teammateShortId);
 
-      expect(updated.primary_assistant_id).toBe(assistant.branch_id);
+      expect(updated.primary_teammate_id).toBe(teammate.branch_id);
 
-      const cleared = await boardRepo.clearPrimaryAssistantIfMatches(
+      const cleared = await boardRepo.clearPrimaryTeammateIfMatches(
         board.board_id,
-        assistantShortId
+        teammateShortId
       );
-      expect(cleared?.primary_assistant_id).toBeUndefined();
+      expect(cleared?.primary_teammate_id).toBeUndefined();
     }
   );
 
-  dbTest('should reject non-assistant primary branches', async ({ db }) => {
+  dbTest('should reject non-teammate primary branches', async ({ db }) => {
     const boardRepo = new BoardRepository(db);
     const board = await boardRepo.create(createBoardData());
     const branch = await createBranchForBoard(db, board.board_id);
 
-    await expect(boardRepo.setPrimaryAssistant(board.board_id, branch.branch_id)).rejects.toThrow(
-      /assistant branch/
+    await expect(boardRepo.setPrimaryTeammate(board.board_id, branch.branch_id)).rejects.toThrow(
+      /teammate branch/
     );
   });
 
-  dbTest('should reject archived assistant primary branches', async ({ db }) => {
+  dbTest('should reject archived teammate primary branches', async ({ db }) => {
     const boardRepo = new BoardRepository(db);
     const board = await boardRepo.create(createBoardData());
-    const assistant = await createBranchForBoard(db, board.board_id, {
-      assistant: true,
+    const teammate = await createBranchForBoard(db, board.board_id, {
+      teammate: true,
       archived: true,
     });
 
-    await expect(
-      boardRepo.setPrimaryAssistant(board.board_id, assistant.branch_id)
-    ).rejects.toThrow(/active/);
+    await expect(boardRepo.setPrimaryTeammate(board.board_id, teammate.branch_id)).rejects.toThrow(
+      /active/
+    );
   });
 
-  dbTest('should reject assistant branches from another board', async ({ db }) => {
+  dbTest('should reject teammate branches from another board', async ({ db }) => {
     const boardRepo = new BoardRepository(db);
     const boardA = await boardRepo.create(createBoardData({ name: 'Board A' }));
     const boardB = await boardRepo.create(createBoardData({ name: 'Board B' }));
-    const assistant = await createBranchForBoard(db, boardB.board_id, { assistant: true });
+    const teammate = await createBranchForBoard(db, boardB.board_id, { teammate: true });
 
-    await expect(
-      boardRepo.setPrimaryAssistant(boardA.board_id, assistant.branch_id)
-    ).rejects.toThrow(/belong to the board/);
+    await expect(boardRepo.setPrimaryTeammate(boardA.board_id, teammate.branch_id)).rejects.toThrow(
+      /belong to the board/
+    );
   });
 
-  dbTest('should conditionally set primary assistant only when unset', async ({ db }) => {
+  dbTest('should conditionally set primary teammate only when unset', async ({ db }) => {
     const boardRepo = new BoardRepository(db);
     const board = await boardRepo.create(createBoardData());
-    const firstAssistant = await createBranchForBoard(db, board.board_id, {
-      assistant: true,
-      name: 'first-assistant',
+    const firstTeammate = await createBranchForBoard(db, board.board_id, {
+      teammate: true,
+      name: 'first-teammate',
     });
-    const secondAssistant = await createBranchForBoard(db, board.board_id, {
-      assistant: true,
-      name: 'second-assistant',
+    const secondTeammate = await createBranchForBoard(db, board.board_id, {
+      teammate: true,
+      name: 'second-teammate',
     });
 
-    const firstUpdate = await boardRepo.setPrimaryAssistantIfUnset(
+    const firstUpdate = await boardRepo.setPrimaryTeammateIfUnset(
       board.board_id,
-      firstAssistant.branch_id
+      firstTeammate.branch_id
     );
-    const secondUpdate = await boardRepo.setPrimaryAssistantIfUnset(
+    const secondUpdate = await boardRepo.setPrimaryTeammateIfUnset(
       board.board_id,
-      secondAssistant.branch_id
+      secondTeammate.branch_id
     );
 
-    expect(firstUpdate?.primary_assistant_id).toBe(firstAssistant.branch_id);
+    expect(firstUpdate?.primary_teammate_id).toBe(firstTeammate.branch_id);
     expect(secondUpdate).toBeNull();
     await expect(boardRepo.findById(board.board_id)).resolves.toMatchObject({
-      primary_assistant_id: firstAssistant.branch_id,
+      primary_teammate_id: firstTeammate.branch_id,
     });
   });
 
-  dbTest('should clear primary assistant only when it matches', async ({ db }) => {
+  dbTest('should clear primary teammate only when it matches', async ({ db }) => {
     const boardRepo = new BoardRepository(db);
     const board = await boardRepo.create(createBoardData());
-    const assistant = await createBranchForBoard(db, board.board_id, { assistant: true });
-    const otherAssistant = await createBranchForBoard(db, board.board_id, { assistant: true });
+    const teammate = await createBranchForBoard(db, board.board_id, { teammate: true });
+    const otherTeammate = await createBranchForBoard(db, board.board_id, { teammate: true });
 
-    await boardRepo.setPrimaryAssistant(board.board_id, assistant.branch_id);
+    await boardRepo.setPrimaryTeammate(board.board_id, teammate.branch_id);
 
-    const skipped = await boardRepo.clearPrimaryAssistantIfMatches(
+    const skipped = await boardRepo.clearPrimaryTeammateIfMatches(
       board.board_id,
-      otherAssistant.branch_id
+      otherTeammate.branch_id
     );
     expect(skipped).toBeNull();
     await expect(boardRepo.findById(board.board_id)).resolves.toMatchObject({
-      primary_assistant_id: assistant.branch_id,
+      primary_teammate_id: teammate.branch_id,
     });
 
-    const cleared = await boardRepo.clearPrimaryAssistantIfMatches(
+    const cleared = await boardRepo.clearPrimaryTeammateIfMatches(
       board.board_id,
-      assistant.branch_id
+      teammate.branch_id
     );
-    expect(cleared?.primary_assistant_id).toBeUndefined();
+    expect(cleared?.primary_teammate_id).toBeUndefined();
   });
 });
 
@@ -1137,6 +1285,134 @@ describe('BoardRepository.batchUpsertBoardObjects', () => {
   });
 });
 
+describe('BoardRepository.mergeBoardObjectFields', () => {
+  dbTest('merges only the given fields, preserving the rest of the object', async ({ db }) => {
+    const repo = new BoardRepository(db);
+    const board = await repo.create(
+      createBoardData({
+        objects: {
+          'zone-1': {
+            type: 'zone',
+            x: 10,
+            y: 20,
+            width: 500,
+            height: 400,
+            label: 'Zone',
+            trigger: { template: 'hi', behavior: 'always_new' },
+          },
+        },
+      })
+    );
+
+    const updated = await repo.mergeBoardObjectFields(board.board_id, {
+      'zone-1': { zIndex: 250 },
+    });
+
+    // zIndex applied; label/trigger/position untouched (no field-drop).
+    expect(updated.objects?.['zone-1']).toEqual({
+      type: 'zone',
+      x: 10,
+      y: 20,
+      width: 500,
+      height: 400,
+      label: 'Zone',
+      trigger: { template: 'hi', behavior: 'always_new' },
+      zIndex: 250,
+    });
+  });
+
+  dbTest('applies patches to multiple objects in a single write', async ({ db }) => {
+    const repo = new BoardRepository(db);
+    const board = await repo.create(
+      createBoardData({
+        objects: {
+          'zone-1': { type: 'zone', x: 0, y: 0, width: 1, height: 1, label: 'A', zIndex: 100 },
+          'zone-2': { type: 'zone', x: 0, y: 0, width: 1, height: 1, label: 'B', zIndex: 105 },
+        },
+      })
+    );
+
+    const updated = await repo.mergeBoardObjectFields(board.board_id, {
+      'zone-1': { zIndex: 105 },
+      'zone-2': { zIndex: 100 },
+    });
+
+    expect(updated.objects?.['zone-1']?.zIndex).toBe(105);
+    expect(updated.objects?.['zone-2']?.zIndex).toBe(100);
+  });
+
+  dbTest('skips objects that no longer exist (never resurrects a deletion)', async ({ db }) => {
+    const repo = new BoardRepository(db);
+    const board = await repo.create(
+      createBoardData({
+        objects: {
+          'zone-1': { type: 'zone', x: 0, y: 0, width: 1, height: 1, label: 'A', zIndex: 100 },
+        },
+      })
+    );
+
+    const updated = await repo.mergeBoardObjectFields(board.board_id, {
+      'zone-1': { zIndex: 200 },
+      // 'zone-gone' was deleted concurrently — must not be re-created as a stub.
+      'zone-gone': { zIndex: 50 },
+    });
+
+    expect(updated.objects?.['zone-1']?.zIndex).toBe(200);
+    expect(updated.objects?.['zone-gone']).toBeUndefined();
+  });
+
+  dbTest('should throw EntityNotFoundError for non-existent board', async ({ db }) => {
+    const repo = new BoardRepository(db);
+    await expect(
+      repo.mergeBoardObjectFields('99999999', { 'zone-1': { zIndex: 1 } })
+    ).rejects.toThrow(EntityNotFoundError);
+  });
+
+  dbTest(
+    'ignores non-zIndex fields and clamps zIndex into the board-object band',
+    async ({ db }) => {
+      const repo = new BoardRepository(db);
+      const board = await repo.create(
+        createBoardData({
+          objects: {
+            'zone-1': { type: 'zone', x: 0, y: 0, width: 1, height: 1, label: 'A', zIndex: 100 },
+          },
+        })
+      );
+
+      const updated = await repo.mergeBoardObjectFields(board.board_id, {
+        // `type`/`label` are NOT mergeable — the narrow action must not reshape the
+        // object; only the clamped zIndex applies (600 → 499).
+        'zone-1': { type: 'markdown', label: 'hacked', zIndex: 600 } as never,
+      });
+
+      const obj = updated.objects?.['zone-1'];
+      expect(obj?.type).toBe('zone'); // type untouched
+      expect((obj as { label?: string })?.label).toBe('A'); // label untouched
+      expect(obj?.zIndex).toBe(499); // clamped below the card layer
+    }
+  );
+
+  dbTest('skips a patch whose zIndex is missing or non-finite', async ({ db }) => {
+    const repo = new BoardRepository(db);
+    const board = await repo.create(
+      createBoardData({
+        objects: {
+          'zone-1': { type: 'zone', x: 0, y: 0, width: 1, height: 1, label: 'A', zIndex: 100 },
+        },
+      })
+    );
+
+    const updated = await repo.mergeBoardObjectFields(board.board_id, {
+      'zone-1': { label: 'noop' } as never,
+    });
+
+    // No mergeable field → object left exactly as-is.
+    expect(updated.objects?.['zone-1']?.zIndex).toBe(100);
+    expect((updated.objects?.['zone-1'] as { label?: string })?.label).toBe('A');
+  });
+});
+
 // ============================================================================
 // DeleteZone (Deprecated)
 // ============================================================================
@@ -1174,6 +1450,42 @@ describe('BoardRepository.deleteZone', () => {
     const result = await repo.deleteZone(board.board_id, 'zone-1', true);
 
     expect(result.affectedSessions).toEqual([]);
+  });
+});
+
+// ============================================================================
+// Import/export
+// ============================================================================
+
+describe('BoardRepository import/export', () => {
+  dbTest('should normalize exact emoji shortcodes when importing board blobs', async ({ db }) => {
+    const repo = new BoardRepository(db);
+
+    const imported = await repo.fromBlob(
+      {
+        name: 'Imported Blob Board',
+        slug: 'imported-blob-board',
+        icon: ':compass:',
+      },
+      'test-user'
+    );
+
+    expect(imported.icon).toBe('🧭');
+    await expect(getStoredBoardIcon(db, imported.board_id)).resolves.toBe('🧭');
+  });
+
+  dbTest('should normalize exact emoji shortcodes when importing board YAML', async ({ db }) => {
+    const repo = new BoardRepository(db);
+
+    const imported = await repo.fromYaml(
+      ['name: Imported YAML Board', 'slug: imported-yaml-board', 'icon: ":compass:"', ''].join(
+        '\n'
+      ),
+      'test-user'
+    );
+
+    expect(imported.icon).toBe('🧭');
+    await expect(getStoredBoardIcon(db, imported.board_id)).resolves.toBe('🧭');
   });
 });
 

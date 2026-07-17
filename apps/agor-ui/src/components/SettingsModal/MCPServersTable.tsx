@@ -20,6 +20,7 @@ import { filterBySettingsSearch } from '@/utils/settingsSearch';
 import { HighlightMatch } from '../HighlightMatch';
 import { MCPServerEditModal, MCPServerFormFields } from '../MCPServer';
 import { buildAuthFromValues, parseEnvJSON, parseHeadersJSON } from '../MCPServer/mcp-oauth-utils';
+import { SettingsActionGroup } from './SettingsActionGroup';
 
 interface MCPServersTableProps {
   mcpServerById: Map<string, MCPServer>;
@@ -246,7 +247,6 @@ export const MCPServersTable: React.FC<MCPServersTableProps> = ({
       return {
         status: 'default' as const,
         text: 'Local process',
-        color: '#8c8c8c',
       };
     }
 
@@ -254,14 +254,12 @@ export const MCPServersTable: React.FC<MCPServersTableProps> = ({
       return {
         status: 'success' as const,
         text: `${toolCount} tools`,
-        color: '#52c41a',
       };
     }
 
     return {
       status: 'default' as const,
       text: 'Not tested',
-      color: '#8c8c8c',
     };
   };
 
@@ -323,14 +321,7 @@ export const MCPServersTable: React.FC<MCPServersTableProps> = ({
       width: 120,
       render: (_: unknown, server: MCPServer) => {
         const health = getServerHealth(server);
-        return (
-          <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-            <Badge status={health.status} />
-            <Typography.Text style={{ fontSize: 12, color: health.color }}>
-              {health.text}
-            </Typography.Text>
-          </div>
-        );
+        return <Badge status={health.status} text={health.text} />;
       },
     },
     {
@@ -347,9 +338,9 @@ export const MCPServersTable: React.FC<MCPServersTableProps> = ({
     {
       title: 'Actions',
       key: 'actions',
-      width: 140,
+      width: 96,
       render: (_: unknown, server: MCPServer) => (
-        <Space size="small">
+        <SettingsActionGroup>
           <Button
             type="text"
             size="small"
@@ -374,7 +365,7 @@ export const MCPServersTable: React.FC<MCPServersTableProps> = ({
           >
             <Button type="text" size="small" icon={<DeleteOutlined />} danger title="Delete" />
           </Popconfirm>
-        </Space>
+        </SettingsActionGroup>
       ),
     },
   ];

@@ -9,6 +9,8 @@
  * - Typography features
  */
 
+// biome-ignore-all lint/plugin/noHardcodedColorLiteral: demo content intentionally demonstrates Mermaid's exact palette syntax
+
 import { Card, Space, Typography } from 'antd';
 import type React from 'react';
 import { MarkdownRenderer } from '../MarkdownRenderer/MarkdownRenderer';
@@ -16,6 +18,43 @@ import { MarkdownRenderer } from '../MarkdownRenderer/MarkdownRenderer';
 const { Title } = Typography;
 
 const demoContent = `# Streamdown Feature Showcase
+
+## 📈 Vega-Lite (POC)
+
+The chart runtime loads only after Streamdown receives the complete fenced block:
+
+\`\`\`vega-lite
+{
+  "$schema": "https://vega.github.io/schema/vega-lite/v6.json",
+  "description": "Monthly revenue in thousands of dollars",
+  "width": "container",
+  "height": 240,
+  "data": {
+    "values": [
+      {"month": "Jan", "revenue": 28},
+      {"month": "Feb", "revenue": 55},
+      {"month": "Mar", "revenue": 43},
+      {"month": "Apr", "revenue": 91},
+      {"month": "May", "revenue": 81},
+      {"month": "Jun", "revenue": 53}
+    ]
+  },
+  "mark": "bar",
+  "encoding": {
+    "x": {"field": "month", "type": "nominal"},
+    "y": {"field": "revenue", "type": "quantitative", "title": "Revenue ($k)"},
+    "color": {"field": "month", "type": "nominal", "legend": null}
+  }
+}
+\`\`\`
+
+## 📣 GitHub-style callouts (POC)
+
+> [!NOTE]
+> This syntax stays a readable blockquote in ordinary Markdown and renders as an alert on GitHub.
+
+> [!CAUTION]
+> Conversation charts accept inline data only; remote data and image URLs are blocked.
 
 ## 🎨 Mermaid Diagrams
 
@@ -199,7 +238,7 @@ export const StreamdownDemo: React.FC = () => {
         <Title level={2}>Streamdown Feature Showcase</Title>
 
         <Card>
-          <MarkdownRenderer content={demoContent} />
+          <MarkdownRenderer content={demoContent} enableVegaLite />
         </Card>
       </Space>
     </div>

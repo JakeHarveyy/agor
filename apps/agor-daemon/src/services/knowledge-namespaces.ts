@@ -3,8 +3,12 @@
  */
 
 import { PAGINATION } from '@agor/core/config';
-import { type Database, GroupRepository, KnowledgeNamespaceRepository } from '@agor/core/db';
-import { BadRequest, Forbidden, NotFound } from '@agor/core/feathers';
+import {
+  GroupRepository,
+  KnowledgeNamespaceRepository,
+  type TenantScopeAwareDatabase,
+} from '@agor/core/db';
+import { type Application, BadRequest, Forbidden, NotFound } from '@agor/core/feathers';
 import type {
   AuthenticatedParams,
   GroupID,
@@ -20,6 +24,7 @@ import type {
   UserID,
 } from '@agor/core/types';
 import { DrizzleService } from '../adapters/drizzle';
+import { emitServiceEvent } from '../utils/emit-service-event.js';
 import { isKnowledgeAdmin } from './knowledge-access.js';
 
 export type KnowledgeNamespaceParams = QueryParams<{
@@ -53,7 +58,10 @@ export class KnowledgeNamespacesService extends DrizzleService<
   private repo: KnowledgeNamespaceRepository;
   private groups: GroupRepository;
 
-  constructor(db: Database) {
+  constructor(
+    db: TenantScopeAwareDatabase,
+    private app?: Application
+  ) {
     const repo = new KnowledgeNamespaceRepository(db);
     super(repo, {
       id: 'namespace_id',
@@ -321,7 +329,6 @@ export class KnowledgeNamespacesService extends DrizzleService<
         created_by: createdBy,
       });
     }
-    this.emit?.('created', result, params);
     return result;
   }
 
@@ -353,7 +360,6 @@ export class KnowledgeNamespacesService extends DrizzleService<
       created_by: existing.created_by,
       owner_user_id: data.owner_user_id ?? existing.owner_user_id,
     });
-    this.emit?.('patched', result, params);
     return result;
   }
 
@@ -374,7 +380,6 @@ export class KnowledgeNamespacesService extends DrizzleService<
       created_by: existing.created_by,
       owner_user_id: data.owner_user_id ?? existing.owner_user_id,
     });
-    this.emit?.('updated', result, params);
     return result;
   }
 
@@ -384,7 +389,6 @@ export class KnowledgeNamespacesService extends DrizzleService<
     if (!existing) throw new NotFound(`Knowledge namespace not found: ${id}`);
     await this.assertCanManage(existing, params);
     await this.repo.delete(String(id));
-    this.emit?.('removed', existing, params);
     return existing;
   }
 
@@ -417,7 +421,7 @@ export class KnowledgeNamespacesService extends DrizzleService<
         },
         acl
       );
-      this.emit?.('patched', result.namespace, params);
+      this.emitNamespaceEvent('patched', result.namespace, params);
       return result;
     }
 
@@ -431,8 +435,23 @@ export class KnowledgeNamespacesService extends DrizzleService<
       },
       acl
     );
-    this.emit?.('created', result.namespace, params);
+    this.emitNamespaceEvent('created', result.namespace, params);
     return result;
+  }
+
+  private emitNamespaceEvent(
+    event: 'created' | 'patched',
+    namespace: KnowledgeNamespace,
+    params?: KnowledgeNamespaceParams
+  ): void {
+    if (!this.app) return;
+    emitServiceEvent(this.app, {
+      path: 'kb/namespaces',
+      event,
+      data: namespace,
+      params,
+      id: namespace.namespace_id,
+    });
   }
 
   async listAcl(
@@ -509,6 +528,9 @@ export class KnowledgeNamespacesService extends DrizzleService<
   }
 }
 
-export function createKnowledgeNamespacesService(db: Database): KnowledgeNamespacesService {
-  return new KnowledgeNamespacesService(db);
+export function createKnowledgeNamespacesService(
+  db: TenantScopeAwareDatabase,
+  app?: Application
+): KnowledgeNamespacesService {
+  return new KnowledgeNamespacesService(db, app);
 }

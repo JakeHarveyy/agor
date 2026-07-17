@@ -78,6 +78,10 @@ export const sessions = sqliteTable(
     agentic_tool: text('agentic_tool', {
       enum: ['claude-code', 'claude-code-cli', 'codex', 'gemini', 'opencode', 'copilot', 'cursor'],
     }).notNull(),
+    agentic_tool_preset_id: text('agentic_tool_preset_id', { length: 36 }).references(
+      (): AnySQLiteColumn => agenticToolPresets.preset_id,
+      { onDelete: 'restrict' }
+    ),
     board_id: text('board_id', { length: 36 }), // NULL = no board
 
     // Genealogy (materialized for tree queries)
@@ -108,7 +112,7 @@ export const sessions = sqliteTable(
     // Archive state (cascaded from branch archive)
     archived: t.bool('archived').notNull().default(false),
     archived_reason: text('archived_reason', {
-      enum: ['branch_archived', 'manual', 'btw_completed'],
+      enum: ['branch_archived', 'manual', 'parent_archived', 'btw_completed'],
     }),
 
     // JSON blob for everything else (cross-DB via json() type)
@@ -146,7 +150,7 @@ export const sessions = sqliteTable(
             sandboxMode: CodexSandboxMode;
             approvalPolicy: CodexApprovalPolicy;
           };
-        };
+        } | null;
 
         // Model config (session-level model selection)
         model_config?: Session['model_config'];
@@ -221,7 +225,11 @@ export const sessions = sqliteTable(
   },
   (table) => ({
     statusIdx: index('sessions_status_idx').on(table.status),
+    statusReadyIdx: index('sessions_status_ready_idx').on(table.status, table.ready_for_prompt),
     agenticToolIdx: index('sessions_agentic_tool_idx').on(table.agentic_tool),
+    agenticToolPresetIdx: index('sessions_agentic_tool_preset_idx').on(
+      table.agentic_tool_preset_id
+    ),
     boardIdx: index('sessions_board_idx').on(table.board_id),
     branchIdx: index('sessions_branch_idx').on(table.branch_id),
     createdIdx: index('sessions_created_idx').on(table.created_at),
@@ -241,6 +249,51 @@ export const sessions = sqliteTable(
       // both are set. Non-scheduled sessions (schedule_id NULL) must
       // coexist freely.
       .where(sql`${table.schedule_id} IS NOT NULL AND ${table.scheduled_run_at} IS NOT NULL`),
+  })
+);
+
+/**
+ * Session Relationships table
+ *
+ * Durable cross-session links that are not necessarily canonical genealogy.
+ * Used for cross-branch remote-create provenance while keeping
+ * sessions.genealogy.parent_session_id branch-local.
+ */
+export const sessionRelationships = sqliteTable(
+  'session_relationships',
+  {
+    relationship_id: text('relationship_id', { length: 36 }).primaryKey(),
+    source_session_id: text('source_session_id', { length: 36 })
+      .notNull()
+      .references(() => sessions.session_id, { onDelete: 'cascade' }),
+    target_session_id: text('target_session_id', { length: 36 })
+      .notNull()
+      .references(() => sessions.session_id, { onDelete: 'cascade' }),
+    relationship_type: text('relationship_type', { enum: ['remote_create'] }).notNull(),
+    created_by: text('created_by', { length: 36 }).notNull(),
+    created_at: t.timestamp('created_at').notNull(),
+    updated_at: t.timestamp('updated_at'),
+    callback_enabled: t.bool('callback_enabled').notNull().default(false),
+    callback_session_id: text('callback_session_id', { length: 36 }).references(
+      () => sessions.session_id,
+      {
+        onDelete: 'set null',
+      }
+    ),
+    data: t.json<Record<string, unknown>>('data'),
+  },
+  (table) => ({
+    sourceIdx: index('session_relationships_source_idx').on(table.source_session_id),
+    targetIdx: index('session_relationships_target_idx').on(table.target_session_id),
+    callbackIdx: index('session_relationships_callback_idx').on(table.callback_session_id),
+    // Note: no tenant_source/tenant_target composite indexes here — SQLite schema
+    // has no tenant column on this table (RLS is Postgres-only). The standalone
+    // source/target indexes above are sufficient for SQLite.
+    sourceTargetTypeUnique: uniqueIndex('session_relationships_source_target_type_unique').on(
+      table.source_session_id,
+      table.target_session_id,
+      table.relationship_type
+    ),
   })
 );
 
@@ -432,6 +485,11 @@ export const messages = sqliteTable(
     sessionIdx: index('messages_session_id_idx').on(table.session_id),
     taskIdx: index('messages_task_id_idx').on(table.task_id),
     sessionIndexIdx: index('messages_session_index_idx').on(table.session_id, table.index),
+    timestampIdx: index('messages_timestamp_idx').on(table.timestamp),
+    sessionTimestampIdx: index('messages_session_timestamp_idx').on(
+      table.session_id,
+      table.timestamp
+    ),
   })
 );
 
@@ -451,6 +509,15 @@ export const boards = sqliteTable(
     // Materialized for lookups
     name: text('name').notNull(),
     slug: text('slug').unique(),
+    primary_teammate_id: text('primary_teammate_id', { length: 36 }).references(
+      (): AnySQLiteColumn => branches.branch_id,
+      {
+        onDelete: 'set null',
+      }
+    ),
+    // Deprecated SQLite compatibility column. Kept so upgraded local DBs can
+    // retain the legacy value without a destructive table rebuild; all new
+    // writes use primary_teammate_id.
     primary_assistant_id: text('primary_assistant_id', { length: 36 }).references(
       (): AnySQLiteColumn => branches.branch_id,
       {
@@ -796,7 +863,6 @@ export const schedules = sqliteTable(
 
     name: text('name').notNull(),
     description: text('description'),
-
     cron_expression: text('cron_expression').notNull(),
     timezone_mode: text('timezone_mode', { enum: ['local', 'utc'] })
       .notNull()
@@ -807,6 +873,11 @@ export const schedules = sqliteTable(
 
     // jsonb on PG; mirrors BranchScheduleConfig minus promoted fields.
     agentic_tool_config: t.json<unknown>('agentic_tool_config').notNull(),
+    agentic_tool_preset_id: text('agentic_tool_preset_id', { length: 36 }).references(
+      (): AnySQLiteColumn => agenticToolPresets.preset_id,
+      { onDelete: 'restrict' }
+    ),
+    mcp_server_ids: t.json<string[]>('mcp_server_ids'),
 
     enabled: t.bool('enabled').notNull().default(true),
     allow_concurrent_runs: t.bool('allow_concurrent_runs').notNull().default(false),
@@ -828,6 +899,9 @@ export const schedules = sqliteTable(
   (table) => ({
     // Scheduler hot path: WHERE enabled = true AND next_run_at <= ?
     enabledNextRunIdx: index('schedules_enabled_next_run_idx').on(table.enabled, table.next_run_at),
+    agenticToolPresetIdx: index('schedules_agentic_tool_preset_idx').on(
+      table.agentic_tool_preset_id
+    ),
     branchIdx: index('schedules_branch_idx').on(table.branch_id),
     createdByIdx: index('schedules_created_by_idx').on(table.created_by),
   })
@@ -870,11 +944,19 @@ export const users = sqliteTable(
     // Force password change flag (admin-settable, auto-cleared on password change)
     must_change_password: t.bool('must_change_password').notNull().default(false),
 
+    // Auth invalidation marker. Password changes set this timestamp so any
+    // previously issued browser access or refresh token is rejected.
+    tokens_valid_after: t.timestamp('tokens_valid_after'),
+
     // JSON blob for profile/preferences
     data: t
       .json<unknown>('data')
       .$type<{
         avatar?: string;
+        avatar_url?: string;
+        avatar_source?: string;
+        avatar_source_id?: string;
+        avatar_synced_at?: string;
         preferences?: Record<string, unknown>;
         // Stable external-auth identity mappings used by generic launch-code auth.
         external_identities?: UserExternalIdentity[];
@@ -920,6 +1002,7 @@ export const users = sqliteTable(
           };
           opencode?: Record<string, never>;
         };
+        agentic_auth_methods?: import('../types/user').AgenticAuthMethods;
         // Encrypted environment variables with scope metadata.
         //
         // Two stored value shapes are tolerated on read:
@@ -951,7 +1034,6 @@ export const users = sqliteTable(
               advisorModel?: string;
             };
             permissionMode?: string;
-            mcpServerIds?: string[];
           };
           'claude-code-cli'?: {
             modelConfig?: {
@@ -961,7 +1043,6 @@ export const users = sqliteTable(
               advisorModel?: string;
             };
             permissionMode?: string;
-            mcpServerIds?: string[];
           };
           codex?: {
             modelConfig?: {
@@ -970,7 +1051,6 @@ export const users = sqliteTable(
               effort?: EffortLevel;
             };
             permissionMode?: string;
-            mcpServerIds?: string[];
             codexSandboxMode?: string;
             codexApprovalPolicy?: string;
             codexNetworkAccess?: boolean;
@@ -982,7 +1062,6 @@ export const users = sqliteTable(
               effort?: EffortLevel;
             };
             permissionMode?: string;
-            mcpServerIds?: string[];
           };
           opencode?: {
             modelConfig?: {
@@ -999,9 +1078,10 @@ export const users = sqliteTable(
               effort?: EffortLevel;
             };
             permissionMode?: string;
-            mcpServerIds?: string[];
           };
         };
+        default_mcp_server_ids?: string[];
+        default_agentic_selection?: import('../types/user').UserAgenticDefaultSelections;
       }>()
       .notNull(),
   },
@@ -1146,6 +1226,31 @@ export const appVariables = sqliteTable(
   (table) => ({
     namespaceKeyIdx: uniqueIndex('app_variables_namespace_key_idx').on(table.namespace, table.key),
     namespaceIdx: index('app_variables_namespace_idx').on(table.namespace),
+  })
+);
+
+/** Tenant-owned, live agentic-tool runtime configuration presets. */
+export const agenticToolPresets = sqliteTable(
+  'agentic_tool_presets',
+  {
+    preset_id: text('preset_id').primaryKey(),
+    tool: text('tool', {
+      enum: ['claude-code', 'codex', 'gemini', 'copilot', 'cursor', 'opencode'],
+    }).notNull(),
+    name: text('name').notNull(),
+    description: text('description'),
+    is_default: t.bool('is_default').notNull().default(false),
+    configuration: t.json<unknown>('configuration').notNull(),
+    created_by: text('created_by').notNull(),
+    updated_by: text('updated_by').notNull(),
+    created_at: t.timestamp('created_at').notNull(),
+    updated_at: t.timestamp('updated_at').notNull(),
+  },
+  (table) => ({
+    toolNameUnique: uniqueIndex('agentic_tool_presets_tool_name_unique').on(table.tool, table.name),
+    tenantToolDefaultUnique: uniqueIndex('agentic_tool_presets_tenant_tool_default_unique')
+      .on(table.tool)
+      .where(sql`${table.is_default} = 1`),
   })
 );
 
@@ -1357,6 +1462,12 @@ export const artifacts = sqliteTable(
     branch_id: text('branch_id', { length: 36 }).references(() => branches.branch_id, {
       onDelete: 'set null',
     }),
+    source_session_id: text('source_session_id', { length: 36 }).references(
+      () => sessions.session_id,
+      {
+        onDelete: 'set null',
+      }
+    ),
     board_id: text('board_id', { length: 36 })
       .notNull()
       .references(() => boards.board_id, { onDelete: 'cascade' }),
@@ -1383,6 +1494,7 @@ export const artifacts = sqliteTable(
   },
   (table) => ({
     branchIdx: index('artifacts_branch_idx').on(table.branch_id),
+    sourceSessionIdx: index('artifacts_source_session_idx').on(table.source_session_id),
     boardIdx: index('artifacts_board_idx').on(table.board_id),
     archivedIdx: index('artifacts_archived_idx').on(table.archived),
     publicIdx: index('artifacts_public_idx').on(table.public),
@@ -1648,7 +1760,7 @@ export const gatewayChannels = sqliteTable(
     // Materialized for queries
     name: text('name').notNull(),
     channel_type: text('channel_type', {
-      enum: ['slack', 'discord', 'whatsapp', 'telegram', 'github', 'teams'],
+      enum: ['slack', 'discord', 'whatsapp', 'telegram', 'github', 'teams', 'shortcut'],
     }).notNull(),
     target_branch_id: text('target_branch_id', { length: 36 })
       .notNull()
@@ -1663,9 +1775,17 @@ export const gatewayChannels = sqliteTable(
 
     // JSON blob for agentic tool configuration (agent, model, permission mode, etc.)
     agentic_config: t.json<Record<string, unknown> | null>('agentic_config'),
+    agentic_tool_preset_id: text('agentic_tool_preset_id', { length: 36 }).references(
+      () => agenticToolPresets.preset_id,
+      { onDelete: 'restrict' }
+    ),
+    mcp_server_ids: t.json<string[]>('mcp_server_ids'),
   },
   (table) => ({
     channelKeyIdx: index('idx_gateway_channel_key').on(table.channel_key),
+    agenticToolPresetIdx: index('gateway_channels_agentic_tool_preset_idx').on(
+      table.agentic_tool_preset_id
+    ),
     enabledTypeIdx: index('idx_gateway_enabled_type').on(table.enabled, table.channel_type),
   })
 );
@@ -1714,6 +1834,84 @@ export const threadSessionMap = sqliteTable(
     sessionIdx: index('idx_thread_map_session_id').on(table.session_id),
     threadIdx: index('idx_thread_map_thread_id').on(table.thread_id),
     channelStatusIdx: index('idx_thread_map_channel_status').on(table.channel_id, table.status),
+  })
+);
+
+/**
+ * Gateway Outbound Messages table - Durable audit/seed rows for proactive outbound messages.
+ *
+ * Proactive emits seed external platform threads. They intentionally do NOT create
+ * thread_session_map rows until a human replies, preserving the invariant that one
+ * external conversation maps to one Agor session.
+ */
+export const gatewayOutboundMessages = sqliteTable(
+  'gateway_outbound_messages',
+  {
+    id: text('id', { length: 36 }).primaryKey(),
+    created_at: t.timestamp('created_at').notNull(),
+    updated_at: t.timestamp('updated_at').notNull(),
+
+    gateway_channel_id: text('gateway_channel_id', { length: 36 })
+      .notNull()
+      .references(() => gatewayChannels.id, { onDelete: 'cascade' }),
+    channel_type: text('channel_type', {
+      enum: ['slack', 'discord', 'whatsapp', 'telegram', 'github', 'teams', 'shortcut'],
+    }).notNull(),
+
+    platform_channel_id: text('platform_channel_id').notNull(),
+    platform_message_id: text('platform_message_id').notNull(),
+    platform_thread_id: text('platform_thread_id').notNull(),
+    platform_permalink: text('platform_permalink'),
+
+    target_branch_id: text('target_branch_id', { length: 36 })
+      .notNull()
+      .references(() => branches.branch_id),
+    emitted_by_user_id: text('emitted_by_user_id', { length: 36 })
+      .notNull()
+      .references(() => users.user_id),
+    emitted_by_session_id: text('emitted_by_session_id', { length: 36 }).references(
+      () => sessions.session_id,
+      {
+        onDelete: 'set null',
+      }
+    ),
+    emitted_by_task_id: text('emitted_by_task_id', { length: 36 }).references(() => tasks.task_id, {
+      onDelete: 'set null',
+    }),
+    emitted_by_schedule_id: text('emitted_by_schedule_id', { length: 36 }).references(
+      () => schedules.schedule_id,
+      {
+        onDelete: 'set null',
+      }
+    ),
+
+    message_text: text('message_text').notNull(),
+    message_preview: text('message_preview').notNull(),
+    metadata: t.json<Record<string, unknown> | null>('metadata'),
+    consumed_by_session_id: text('consumed_by_session_id', { length: 36 }).references(
+      () => sessions.session_id,
+      {
+        onDelete: 'set null',
+      }
+    ),
+    consumed_at: t.timestamp('consumed_at'),
+  },
+  (table) => ({
+    uniqueChannelThread: uniqueIndex('uniq_gateway_outbound_channel_thread').on(
+      table.gateway_channel_id,
+      table.platform_thread_id
+    ),
+    emittedSessionIdx: index('idx_gateway_outbound_emitted_session').on(
+      table.emitted_by_session_id
+    ),
+    emittedScheduleIdx: index('idx_gateway_outbound_emitted_schedule').on(
+      table.emitted_by_schedule_id
+    ),
+    targetBranchCreatedIdx: index('idx_gateway_outbound_branch_created').on(
+      table.target_branch_id,
+      table.created_at
+    ),
+    consumedIdx: index('idx_gateway_outbound_consumed').on(table.consumed_at),
   })
 );
 
@@ -2145,6 +2343,8 @@ export const kbGraphEdges = sqliteTable(
  */
 export type SessionRow = typeof sessions.$inferSelect;
 export type SessionInsert = typeof sessions.$inferInsert;
+export type SessionRelationshipRow = typeof sessionRelationships.$inferSelect;
+export type SessionRelationshipInsert = typeof sessionRelationships.$inferInsert;
 export type TaskRow = typeof tasks.$inferSelect;
 export type TaskInsert = typeof tasks.$inferInsert;
 export type MessageRow = typeof messages.$inferSelect;
@@ -2161,6 +2361,8 @@ export type UserRow = typeof users.$inferSelect;
 export type UserInsert = typeof users.$inferInsert;
 export type AppVariableRow = typeof appVariables.$inferSelect;
 export type AppVariableInsert = typeof appVariables.$inferInsert;
+export type AgenticToolPresetRow = typeof agenticToolPresets.$inferSelect;
+export type AgenticToolPresetInsert = typeof agenticToolPresets.$inferInsert;
 export type GroupRow = typeof groups.$inferSelect;
 export type GroupInsert = typeof groups.$inferInsert;
 export type GroupMembershipRow = typeof groupMemberships.$inferSelect;
@@ -2189,6 +2391,8 @@ export type GatewayChannelRow = typeof gatewayChannels.$inferSelect;
 export type GatewayChannelInsert = typeof gatewayChannels.$inferInsert;
 export type ThreadSessionMapRow = typeof threadSessionMap.$inferSelect;
 export type ThreadSessionMapInsert = typeof threadSessionMap.$inferInsert;
+export type GatewayOutboundMessageRow = typeof gatewayOutboundMessages.$inferSelect;
+export type GatewayOutboundMessageInsert = typeof gatewayOutboundMessages.$inferInsert;
 export type SerializedSessionRow = typeof serializedSessions.$inferSelect;
 export type SerializedSessionInsert = typeof serializedSessions.$inferInsert;
 export type KBNamespaceRow = typeof kbNamespaces.$inferSelect;
@@ -2220,7 +2424,7 @@ export type ExternalRunLinkInsert = typeof externalRunLinks.$inferInsert;
  * These enable automatic JOINs using db.query.sessions.findFirst({ with: { branch: true } })
  */
 
-export const sessionsRelations = relations(sessions, ({ one }) => ({
+export const sessionsRelations = relations(sessions, ({ one, many }) => ({
   branch: one(branches, {
     fields: [sessions.branch_id],
     references: [branches.branch_id],
@@ -2228,6 +2432,25 @@ export const sessionsRelations = relations(sessions, ({ one }) => ({
   schedule: one(schedules, {
     fields: [sessions.schedule_id],
     references: [schedules.schedule_id],
+  }),
+  outboundRelationships: many(sessionRelationships, { relationName: 'relationshipSource' }),
+  inboundRelationships: many(sessionRelationships, { relationName: 'relationshipTarget' }),
+}));
+
+export const sessionRelationshipsRelations = relations(sessionRelationships, ({ one }) => ({
+  sourceSession: one(sessions, {
+    fields: [sessionRelationships.source_session_id],
+    references: [sessions.session_id],
+    relationName: 'relationshipSource',
+  }),
+  targetSession: one(sessions, {
+    fields: [sessionRelationships.target_session_id],
+    references: [sessions.session_id],
+    relationName: 'relationshipTarget',
+  }),
+  callbackSession: one(sessions, {
+    fields: [sessionRelationships.callback_session_id],
+    references: [sessions.session_id],
   }),
 }));
 

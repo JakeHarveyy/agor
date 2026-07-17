@@ -10,7 +10,7 @@ import {
   type GeminiModel,
 } from '@agor-live/client';
 import { InfoCircleOutlined } from '@ant-design/icons';
-import { Input, Radio, Select, Space, Tooltip, theme } from 'antd';
+import { Input, Radio, Select, Space, Tooltip, Typography, theme } from 'antd';
 import { useEffect, useState } from 'react';
 import {
   DEFAULT_CURSOR_MODEL,
@@ -136,12 +136,16 @@ export const ModelSelector: React.FC<ModelSelectorProps> = ({
   // Determine which model list to use based on agentic_tool (with backwards compat for agent prop)
   const effectiveTool = agentic_tool || agent || 'claude-code';
 
-  // Copilot model list — fetched once when the picker opens for Copilot and
-  // a client is available. The daemon returns either the live `listModels()`
-  // result (source: 'dynamic') or the static fallback (source: 'static',
-  // typically when no GitHub token is configured). Either way we render
-  // whatever the server returns; the local static list is a last-resort
-  // fallback for when the call itself fails.
+  // Dynamic model lists — fetched once when the picker opens for a given tool
+  // and a client is available. The daemon returns either the live SDK result
+  // (source: 'dynamic') or the static fallback (source: 'static'). The local
+  // static list is a last-resort fallback for when the call itself fails.
+  const [claudeServerOptions, setClaudeServerOptions] = useState<Array<{
+    id: string;
+    label: string;
+    description?: string;
+  }> | null>(null);
+  const [claudeSource, setClaudeSource] = useState<'dynamic' | 'static' | null>(null);
   const [copilotServerOptions, setCopilotServerOptions] = useState<Array<{
     id: string;
     label: string;
@@ -156,6 +160,30 @@ export const ModelSelector: React.FC<ModelSelectorProps> = ({
   const [cursorSource, setCursorSource] = useState<'dynamic' | 'static' | null>(null);
   const [copilotDefaultModel, setCopilotDefaultModel] = useState(DEFAULT_COPILOT_MODEL);
   const [cursorDefaultModel, setCursorDefaultModel] = useState(DEFAULT_CURSOR_MODEL);
+
+  useEffect(() => {
+    if ((effectiveTool !== 'claude-code' && effectiveTool !== 'claude-code-cli') || !client) return;
+    let cancelled = false;
+    (async () => {
+      try {
+        const raw = await client.service('claude-models').find();
+        const response = raw as unknown as DynamicModelsResponse;
+        if (cancelled || !response?.models?.length) return;
+        const models = response.models.map((m) => ({
+          id: m.id,
+          label: m.displayName,
+          description: m.description,
+        }));
+        setClaudeServerOptions(models);
+        setClaudeSource(response.source);
+      } catch {
+        // Silent fallback to local static — best-effort.
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [effectiveTool, client]);
 
   useEffect(() => {
     if (effectiveTool !== 'copilot' || !client) return;
@@ -238,7 +266,7 @@ export const ModelSelector: React.FC<ModelSelectorProps> = ({
             ? (copilotServerOptions ?? COPILOT_STATIC_MODEL_OPTIONS)
             : effectiveTool === 'cursor'
               ? preferDefaultModel(cursorServerOptions ?? CURSOR_MODEL_OPTIONS, cursorDefaultModel)
-              : AVAILABLE_CLAUDE_MODEL_ALIASES;
+              : (claudeServerOptions ?? AVAILABLE_CLAUDE_MODEL_ALIASES);
 
   // Determine initial mode based on whether the value is in the aliases list
   // If no value provided, default to 'alias' mode (recommended)
@@ -322,7 +350,7 @@ export const ModelSelector: React.FC<ModelSelectorProps> = ({
       options.unshift({ value: currentValue, label: currentValue });
     }
 
-    return (
+    const modelSelect = (
       <Select
         value={currentValue}
         onChange={handleModelChange}
@@ -333,6 +361,33 @@ export const ModelSelector: React.FC<ModelSelectorProps> = ({
         style={{ width: '100%', fontSize: token.fontSizeSM }}
         options={options}
       />
+    );
+
+    // Surface the optional Claude Code advisor model in compact contexts too
+    // (e.g. the session run-settings popover) so it can be set OR cleared per
+    // session. `allowClear` → undefined removes the session-level override.
+    const showAdvisor = effectiveTool === 'claude-code' || effectiveTool === 'claude-code-cli';
+    if (!showAdvisor) return modelSelect;
+
+    return (
+      <Space orientation="vertical" size={6} style={{ width: '100%' }}>
+        {modelSelect}
+        <Select
+          allowClear
+          showSearch
+          size="small"
+          optionFilterProp="label"
+          placeholder="Advisor model: off"
+          value={value?.advisorModel}
+          onChange={handleAdvisorModelChange}
+          popupMatchSelectWidth={false}
+          style={{ width: '100%', fontSize: token.fontSizeSM }}
+          options={(claudeServerOptions ?? AVAILABLE_CLAUDE_MODEL_ALIASES).map((model) => ({
+            value: model.id,
+            label: `Advisor: ${model.id}`,
+          }))}
+        />
+      </Space>
     );
   }
 
@@ -362,8 +417,21 @@ export const ModelSelector: React.FC<ModelSelectorProps> = ({
                   label: m.id,
                 }))}
               />
+              {(effectiveTool === 'claude-code' || effectiveTool === 'claude-code-cli') &&
+                claudeSource && (
+                  <div style={{ marginTop: 6, fontSize: 12, color: token.colorTextTertiary }}>
+                    {claudeSource === 'dynamic' ? (
+                      <>Live list from the Anthropic Models API.</>
+                    ) : (
+                      <>
+                        Showing static fallback. Set <code>ANTHROPIC_API_KEY</code> to see the live
+                        model list.
+                      </>
+                    )}
+                  </div>
+                )}
               {effectiveTool === 'copilot' && copilotSource && (
-                <div style={{ marginTop: 6, fontSize: 12, color: 'rgba(255, 255, 255, 0.45)' }}>
+                <div style={{ marginTop: 6, fontSize: 12, color: token.colorTextTertiary }}>
                   {copilotSource === 'dynamic' ? (
                     <>
                       Live list from your Copilot account (via SDK <code>listModels()</code>).
@@ -377,7 +445,7 @@ export const ModelSelector: React.FC<ModelSelectorProps> = ({
                 </div>
               )}
               {effectiveTool === 'cursor' && cursorSource && (
-                <div style={{ marginTop: 6, fontSize: 12, color: 'rgba(255, 255, 255, 0.45)' }}>
+                <div style={{ marginTop: 6, fontSize: 12, color: token.colorTextTertiary }}>
                   {cursorSource === 'dynamic' ? (
                     <>
                       Live list from your Cursor account (via SDK <code>Cursor.models.list()</code>
@@ -421,9 +489,9 @@ export const ModelSelector: React.FC<ModelSelectorProps> = ({
                 }
                 style={{ width: '100%', minWidth: 400 }}
               />
-              <div style={{ marginTop: 8, fontSize: 12, color: 'rgba(255, 255, 255, 0.45)' }}>
+              <div style={{ marginTop: 8, fontSize: 12, color: token.colorTextTertiary }}>
                 Enter any model ID to pin to a specific version.{' '}
-                <a
+                <Typography.Link
                   href={
                     effectiveTool === 'codex'
                       ? 'https://platform.openai.com/docs/models'
@@ -438,10 +506,10 @@ export const ModelSelector: React.FC<ModelSelectorProps> = ({
                   target="_blank"
                   rel="noopener noreferrer"
                   onClick={(e) => e.stopPropagation()}
-                  style={{ fontSize: 12, color: '#1677ff' }}
+                  style={{ fontSize: 12 }}
                 >
                   View available models
-                </a>
+                </Typography.Link>
               </div>
             </div>
           )}
@@ -464,7 +532,7 @@ export const ModelSelector: React.FC<ModelSelectorProps> = ({
             value={value?.advisorModel}
             onChange={handleAdvisorModelChange}
             style={{ width: '100%', minWidth: 400, marginTop: 8 }}
-            options={AVAILABLE_CLAUDE_MODEL_ALIASES.map((model) => ({
+            options={(claudeServerOptions ?? AVAILABLE_CLAUDE_MODEL_ALIASES).map((model) => ({
               value: model.id,
               label: model.id,
             }))}

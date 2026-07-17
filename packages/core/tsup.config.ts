@@ -5,10 +5,13 @@ export default defineConfig({
   entry: {
     index: 'src/index.ts',
     'analytics/index': 'src/analytics/index.ts', // Backend analytics logger and plugin resolution
+    'telemetry/index': 'src/telemetry/index.ts', // Open-source install telemetry helpers
     'types/index': 'src/types/index.ts',
     'db/index': 'src/db/index.ts',
     'db/session-guard': 'src/db/session-guard.ts', // Defensive programming for deleted sessions
     'git/index': 'src/git/index.ts',
+    'git/pure': 'src/git/pure.ts',
+    'git/exec': 'src/git/exec.ts',
     'api/index': 'src/api/index.ts',
     'claude/index': 'src/claude/index.ts',
     'claude-cli/index': 'src/claude-cli/index.ts', // Pure utilities for the Claude Code CLI adapter (path slug, event types, JSONL translator)
@@ -20,7 +23,7 @@ export default defineConfig({
     'templates/handlebars-helpers': 'src/templates/handlebars-helpers.ts', // Handlebars helpers
     'templates/session-context': 'src/templates/session-context.ts', // Agor system prompt rendering
     'templates/spawn-subsession-template': 'src/templates/spawn-subsession-template.ts', // Spawn-subsession meta-prompt
-    'templates/assistant-welcome-note': 'src/templates/assistant-welcome-note.ts', // Assistant board welcome note renderer
+    'templates/teammate-welcome-note': 'src/templates/teammate-welcome-note.ts', // Teammate board welcome note renderer
     'templates/zone-trigger-context': 'src/templates/zone-trigger-context.ts', // Canonical zone-trigger context builder
     'environment/variable-resolver': 'src/environment/variable-resolver.ts', // Environment variable resolution
     'environment/render-snapshot': 'src/environment/render-snapshot.ts', // v2 branch env snapshot rendering
@@ -52,8 +55,10 @@ export default defineConfig({
     'tools/mcp/oauth-refresh': 'src/tools/mcp/oauth-refresh.ts', // MCP OAuth refresh_token persistence + mutex
     'tools/mcp/oauth-token-expiry': 'src/tools/mcp/oauth-token-expiry.ts', // MCP OAuth token expiry resolution cascade
     'unix/index': 'src/unix/index.ts', // Unix group management utilities for branch isolation
+    'local-actions/index': 'src/local-actions/index.ts', // Shared host-local admin actions
     'mcp/index': 'src/mcp/index.ts', // MCP template resolution utilities
     'gateway/index': 'src/gateway/index.ts', // Gateway platform connectors (Slack, etc.)
+    'gateway/connectors/slack-manifest': 'src/gateway/connectors/slack-manifest.ts', // Browser-safe Slack manifest/scope derivation (no connector deps)
     'yaml/index': 'src/yaml/index.ts', // Browser-safe js-yaml re-export
     'knowledge/index': 'src/knowledge/index.ts', // Knowledge editing helpers
   },

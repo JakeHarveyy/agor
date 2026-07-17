@@ -6,22 +6,28 @@
  */
 
 import { PAGINATION } from '@agor/core/config';
-import { BoardObjectRepository, BoardRepository, type Database } from '@agor/core/db';
 import {
-  ASSISTANT_WELCOME_NOTE_OBJECT_ID,
-  buildAssistantWelcomeNoteObject,
-} from '@agor/core/templates/assistant-welcome-note';
+  BoardObjectRepository,
+  BoardRepository,
+  type TenantScopeAwareDatabase,
+} from '@agor/core/db';
+import {
+  buildTeammateWelcomeNoteObject,
+  TEAMMATE_WELCOME_NOTE_OBJECT_ID,
+} from '@agor/core/templates/teammate-welcome-note';
 import type {
-  AssistantWelcomeNoteRequest,
   AuthenticatedParams,
   Board,
   BoardExportBlob,
+  BoardID,
   BoardObject,
   QueryParams,
+  TeammateWelcomeNoteRequest,
   UUID,
 } from '@agor/core/types';
 import { NotFoundError } from '@agor/core/utils/errors';
-import { DrizzleService } from '../adapters/drizzle';
+import { DrizzleService, type Query } from '../adapters/drizzle';
+import type { ManualServiceEvent } from '../utils/emit-service-event.js';
 import {
   type BoardObjectPatchedEventPayload,
   toBoardObjectPatchedEventPayload,
@@ -36,8 +42,10 @@ export interface BoardParams
     name?: string;
   }> {
   user?: AuthenticatedParams['user'];
-  /** Internal hook signal; set only when ensureAssistantWelcomeNote writes. */
-  assistantWelcomeNoteMutated?: boolean;
+  /** Internal hook signal; set only when ensureTeammateWelcomeNote writes. */
+  teammateWelcomeNoteMutated?: boolean;
+  /** Internal RBAC SQL pushdown marker set by register-hooks for external regular users. */
+  _agorSqlBoardAccessUserId?: UUID;
 }
 
 /**
@@ -46,11 +54,19 @@ export interface BoardParams
 export class BoardsService extends DrizzleService<Board, Partial<Board>, BoardParams> {
   private boardRepo: BoardRepository;
   private boardObjectRepo: BoardObjectRepository;
-  private emitBoardObjectPatched?: (boardObject: BoardObjectPatchedEventPayload) => void;
+  private emitBoardObjectPatched?: (
+    boardObject: BoardObjectPatchedEventPayload,
+    params?: BoardParams
+  ) => void;
+  private emitBoardEvent?: (event: Omit<ManualServiceEvent, 'path'>) => void;
 
   constructor(
-    db: Database,
-    emitBoardObjectPatched?: (boardObject: BoardObjectPatchedEventPayload) => void
+    db: TenantScopeAwareDatabase,
+    emitBoardObjectPatched?: (
+      boardObject: BoardObjectPatchedEventPayload,
+      params?: BoardParams
+    ) => void,
+    emitBoardEvent?: (event: Omit<ManualServiceEvent, 'path'>) => void
   ) {
     const boardRepo = new BoardRepository(db);
     super(boardRepo, {
@@ -65,6 +81,61 @@ export class BoardsService extends DrizzleService<Board, Partial<Board>, BoardPa
     this.boardRepo = boardRepo;
     this.boardObjectRepo = new BoardObjectRepository(db);
     this.emitBoardObjectPatched = emitBoardObjectPatched;
+    this.emitBoardEvent = emitBoardEvent;
+  }
+
+  /**
+   * Push the list read's high-selectivity predicates into SQL.
+   *
+   * The generic adapter would read the entire boards table and filter in
+   * memory. `boards` is fetched on initial app load, so we narrow the read to
+   * explicit board ids and any RBAC SQL visibility marker before rows leave the
+   * database. `find` still re-applies every query filter in memory, so this
+   * only ever returns a superset of the matching rows and the downstream
+   * sort/pagination is unaffected.
+   *
+   * `lean` is a list-only projection flag — it omits each board's heavy
+   * `data.objects` / `data.custom_css` (a client `$select` can't trim them:
+   * they live inside the `data` JSON column). Routing it through this one
+   * repository read is exactly what keeps the lean list from ever widening
+   * board visibility — it inherits the same RBAC + id pushdown as every other
+   * list read. It is NOT a board column, so we strip it from `query` before
+   * `find` hands the query to `filterData`, which would otherwise treat it as an
+   * equality filter on a non-existent `lean` column and empty the result;
+   * `$sort` / `$select` / pagination never touch the omitted fields, and
+   * `boards.get(id)` is unaffected and always returns the full board.
+   *
+   * The boards query validator (`boardQuerySchema`) accepts `board_id` and
+   * `lean` but strips `archived`, so there is no archived predicate to push. A
+   * `{ $in }` is only pushed when every element is a string, keeping the
+   * superset invariant unconditional.
+   */
+  protected async fetchData(query: Query, params?: BoardParams): Promise<Board[]> {
+    const filter: { boardIds?: BoardID[]; visibleToUserId?: UUID; lean?: boolean } = {};
+
+    if (params?._agorSqlBoardAccessUserId) {
+      filter.visibleToUserId = params._agorSqlBoardAccessUserId;
+    }
+
+    const leanQuery = query as Query & { lean?: boolean };
+    if (leanQuery.lean) {
+      filter.lean = true;
+    }
+    delete leanQuery.lean;
+
+    const boardId = query.board_id;
+    if (typeof boardId === 'string') {
+      filter.boardIds = [boardId as BoardID];
+    } else if (
+      boardId &&
+      typeof boardId === 'object' &&
+      Array.isArray(boardId.$in) &&
+      boardId.$in.every((el: unknown) => typeof el === 'string')
+    ) {
+      filter.boardIds = boardId.$in as BoardID[];
+    }
+
+    return this.boardRepo.findAll(filter);
   }
 
   /**
@@ -147,7 +218,9 @@ export class BoardsService extends DrizzleService<Board, Partial<Board>, BoardPa
       });
 
       for (const boardObject of cleared) {
-        this.emitBoardObjectPatched?.(toBoardObjectPatchedEventPayload(boardObject));
+        const payload = toBoardObjectPatchedEventPayload(boardObject);
+        if (_params) this.emitBoardObjectPatched?.(payload, _params);
+        else this.emitBoardObjectPatched?.(payload);
       }
     }
 
@@ -155,14 +228,14 @@ export class BoardsService extends DrizzleService<Board, Partial<Board>, BoardPa
   }
 
   /**
-   * Custom method: Create the bundled assistant welcome note when missing.
+   * Custom method: Create the bundled teammate welcome note when missing.
    *
    * Rendering is intentionally server-side from a static Handlebars template so
    * the browser bundle does not import Handlebars (blocked by CSP unsafe-eval),
    * and callers never provide template source for this path.
    */
-  async ensureAssistantWelcomeNote(
-    data: AssistantWelcomeNoteRequest,
+  async ensureTeammateWelcomeNote(
+    data: TeammateWelcomeNoteRequest,
     params?: BoardParams
   ): Promise<Board> {
     const boardIdentifier = data.boardId ?? data.id;
@@ -173,26 +246,30 @@ export class BoardsService extends DrizzleService<Board, Partial<Board>, BoardPa
       throw new NotFoundError('Board', String(boardIdentifier));
     }
 
-    const objectData = buildAssistantWelcomeNoteObject({
-      assistantName: typeof data.assistantName === 'string' ? data.assistantName : '',
-      assistantEmoji: typeof data.assistantEmoji === 'string' ? data.assistantEmoji : null,
+    const teammateName = typeof data.teammateName === 'string' ? data.teammateName : '';
+    const teammateEmoji = typeof data.teammateEmoji === 'string' ? data.teammateEmoji : null;
+    const objectData = buildTeammateWelcomeNoteObject({
+      teammateName,
+      teammateEmoji,
     });
 
-    const existing = board.objects?.[ASSISTANT_WELCOME_NOTE_OBJECT_ID];
+    const existing = board.objects?.[TEAMMATE_WELCOME_NOTE_OBJECT_ID];
     if (existing) return board;
 
-    if (params) params.assistantWelcomeNoteMutated = true;
+    if (params) {
+      params.teammateWelcomeNoteMutated = true;
+    }
     return this.boardRepo.upsertBoardObject(
       board.board_id,
-      ASSISTANT_WELCOME_NOTE_OBJECT_ID,
+      TEAMMATE_WELCOME_NOTE_OBJECT_ID,
       objectData
     );
   }
 
   /**
-   * Custom method: Set the board's primary assistant branch.
+   * Custom method: Set the board's primary teammate branch.
    */
-  async setPrimaryAssistant(
+  async setPrimaryTeammate(
     data: { boardId?: string; id?: string; branchId?: string } | string,
     branchIdOrParams?: string | BoardParams,
     _maybeParams?: BoardParams
@@ -201,14 +278,14 @@ export class BoardsService extends DrizzleService<Board, Partial<Board>, BoardPa
     const branchId = typeof data === 'string' ? branchIdOrParams : data.branchId;
     if (!boardId) throw new Error('Board ID required');
     if (!branchId || typeof branchId !== 'string') throw new Error('Branch ID required');
-    return this.boardRepo.setPrimaryAssistant(boardId, branchId);
+    return this.boardRepo.setPrimaryTeammate(boardId, branchId);
   }
 
   /**
-   * Custom method: Clear the board's primary assistant branch.
+   * Custom method: Clear the board's primary teammate branch.
    */
-  async clearPrimaryAssistant(boardId: string, _params?: BoardParams): Promise<Board> {
-    return this.boardRepo.clearPrimaryAssistant(boardId);
+  async clearPrimaryTeammate(boardId: string, _params?: BoardParams): Promise<Board> {
+    return this.boardRepo.clearPrimaryTeammate(boardId);
   }
 
   /**
@@ -220,6 +297,18 @@ export class BoardsService extends DrizzleService<Board, Partial<Board>, BoardPa
     _params?: BoardParams
   ): Promise<Board> {
     return this.boardRepo.batchUpsertBoardObjects(boardId, objects);
+  }
+
+  /**
+   * Custom method: Atomically shallow-merge field patches into existing board
+   * objects (used by z-order reorder to persist only the changed zIndex).
+   */
+  async mergeBoardObjectFields(
+    boardId: string,
+    patches: Record<string, Partial<BoardObject>>,
+    _params?: BoardParams
+  ): Promise<Board> {
+    return this.boardRepo.mergeBoardObjectFields(boardId, patches);
   }
 
   /**
@@ -350,7 +439,7 @@ export class BoardsService extends DrizzleService<Board, Partial<Board>, BoardPa
 
     // Hook chain enforces auth before we get here.
     const currentUserId = params!.user!.user_id;
-    const archivedBoard = await this.patch(
+    const archivedBoard = (await this.patch(
       id,
       {
         archived: true,
@@ -358,7 +447,15 @@ export class BoardsService extends DrizzleService<Board, Partial<Board>, BoardPa
         archived_by: currentUserId,
       } as Partial<Board>,
       params
-    );
+    )) as Board;
+    // Custom methods call the raw implementation, bypassing Feathers'
+    // standard patch event hook. Emit the transition for connected clients.
+    this.emitBoardEvent?.({
+      event: 'patched',
+      data: archivedBoard,
+      params,
+      id: archivedBoard.board_id,
+    });
 
     console.log(`✅ Archived board ${board.name}`);
     return archivedBoard as Board;
@@ -376,7 +473,7 @@ export class BoardsService extends DrizzleService<Board, Partial<Board>, BoardPa
 
     console.log(`📦 Unarchiving board: ${board.name}`);
 
-    const unarchivedBoard = await this.patch(
+    const unarchivedBoard = (await this.patch(
       id,
       {
         archived: false,
@@ -384,7 +481,13 @@ export class BoardsService extends DrizzleService<Board, Partial<Board>, BoardPa
         archived_by: undefined,
       } as Partial<Board>,
       params
-    );
+    )) as Board;
+    this.emitBoardEvent?.({
+      event: 'patched',
+      data: unarchivedBoard,
+      params,
+      id: unarchivedBoard.board_id,
+    });
 
     console.log(`✅ Unarchived board ${board.name}`);
     return unarchivedBoard as Board;
@@ -434,8 +537,12 @@ export class BoardsService extends DrizzleService<Board, Partial<Board>, BoardPa
  * Service factory function
  */
 export function createBoardsService(
-  db: Database,
-  emitBoardObjectPatched?: (boardObject: BoardObjectPatchedEventPayload) => void
+  db: TenantScopeAwareDatabase,
+  emitBoardObjectPatched?: (
+    boardObject: BoardObjectPatchedEventPayload,
+    params?: BoardParams
+  ) => void,
+  emitBoardEvent?: (event: Omit<ManualServiceEvent, 'path'>) => void
 ): BoardsService {
-  return new BoardsService(db, emitBoardObjectPatched);
+  return new BoardsService(db, emitBoardObjectPatched, emitBoardEvent);
 }

@@ -40,6 +40,7 @@ Step-by-step implementation guides referenced from code.
 
 ### `guidelines/` — house rules
 
+- [`frontend.md`](guidelines/frontend.md) — AntD-first components, theme tokens, accessibility, and exact-color exceptions.
 - [`testing.md`](guidelines/testing.md) — Vitest patterns and conventions.
 - [`toasts.md`](guidelines/toasts.md) — Toast/message pattern. Always `useThemedMessage()` — never static `message.x()`.
 
@@ -52,15 +53,16 @@ Designs that are referenced from code or in flight. Anything here is either stil
 - [`executor-implementation-plan.md`](explorations/executor-implementation-plan.md) — phased plan for executor work.
 - [`env-var-access.md`](explorations/env-var-access.md) — per-user / per-session env var access model (referenced from schemas, types, and migrations).
 - [`kb-agent-targeted-edits.md`](explorations/kb-agent-targeted-edits.md) — design proposal for small, version-checked agent edits to large Knowledge Base markdown documents.
-- [`kb-assistant-framework-integration.md`](explorations/kb-assistant-framework-integration.md) — options for backing Agor Assistant framework memory/docs/skills with Knowledge Base namespaces and tools.
-- [`assistant-kb-namespace-memory-plan.md`](explorations/assistant-kb-namespace-memory-plan.md) — implementation plan for Assistant primary KB namespaces, memory append tools, and branch-scoped namespace grants.
-- [`kb-namespace-rbac-v1.md`](explorations/kb-namespace-rbac-v1.md) — directed V1 plan for Knowledge namespace RBAC and Assistant home namespaces.
+- [`kb-teammate-framework-integration.md`](explorations/kb-teammate-framework-integration.md) — options for backing Agor teammate framework memory/docs/skills with Knowledge Base namespaces and tools.
+- [`teammate-kb-namespace-memory-plan.md`](explorations/teammate-kb-namespace-memory-plan.md) — implementation plan for teammate primary KB namespaces, memory append tools, and branch-scoped namespace grants.
+- [`kb-namespace-rbac-v1.md`](explorations/kb-namespace-rbac-v1.md) — directed V1 plan for Knowledge namespace RBAC and teammate home namespaces.
 - [`session-sharing.md`](explorations/session-sharing.md) — `dangerously_allow_session_sharing` security contract (referenced from `AGENTS.md` and `apps/agor-docs/pages/security.mdx`).
 - [`parent-session-callbacks.md`](explorations/parent-session-callbacks.md) — child-session completion notifications (referenced from `docs/never-lose-prompt-design.md`).
+- [`frontend-hardcoded-colors.md`](explorations/frontend-hardcoded-colors.md) — Biome/GritQL color audit, classification, and enforcement rollout.
 
-### `messaging-and-positioning.md`
+### Messaging & positioning (now in the Knowledge base)
 
-Internal source of truth for product copy (taglines, hero, package descriptions, blog voice). Read this before writing user-facing prose; do **not** paraphrase the codebase to invent new framing.
+The source of truth for product copy (taglines, hero, package descriptions, blog voice) lives in the Agor team Knowledge base, **not** this repo: [`marketing/messaging-and-positioning`](https://agor.sandbox.preset.zone/kb/agor-cloud-team/marketing/messaging-and-positioning.md). Read it before writing user-facing prose; do **not** paraphrase the codebase to invent new framing.
 
 ### `images/`
 

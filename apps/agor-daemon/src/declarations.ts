@@ -11,6 +11,7 @@ import type { ExpressApplication, Service } from '@agor/core/feathers';
 import type {
   Board,
   Branch,
+  BranchEnvironmentUpdate,
   BranchID,
   CloneRepositoryResult,
   AuthenticatedParams as CoreAuthenticatedParams,
@@ -23,7 +24,11 @@ import type {
   Session,
   Task,
 } from '@agor/core/types';
-import type { ExecuteTaskData } from './services/sessions.js';
+import type {
+  ExecuteTaskData,
+  SessionArchiveOptions,
+  SessionArchiveResult,
+} from './services/sessions.js';
 
 // Re-export core types for convenience
 export type AuthenticatedUser = CoreAuthenticatedUser;
@@ -59,6 +64,19 @@ export interface SessionsServiceImpl extends Service<Session, Partial<Session>, 
     ancestors: import('@agor/core/types').Session[];
     children: import('@agor/core/types').Session[];
   }>;
+  archive(
+    id: string,
+    options?: SessionArchiveOptions,
+    params?: FeathersParams
+  ): Promise<SessionArchiveResult>;
+  unarchive(
+    id: string,
+    options?: SessionArchiveOptions,
+    params?: FeathersParams
+  ): Promise<SessionArchiveResult>;
+  enrichRemoteRelationships(
+    sessionList: import('@agor/core/types').Session[]
+  ): Promise<import('@agor/core/types').Session[]>;
   // Callback queue processing
   setQueueProcessor(
     processor: (
@@ -90,6 +108,7 @@ export interface SessionsServiceImpl extends Service<Session, Partial<Session>, 
     status: string;
     streaming: boolean;
   }>;
+  materializeAgenticToolPreset(session: Session, params?: FeathersParams): Promise<Session>;
   // Event emitter methods (FeathersJS EventEmitter interface - any[] for event args flexibility)
   // biome-ignore lint/suspicious/noExplicitAny: FeathersJS event handlers accept variable arguments
   on(event: string, handler: (...args: any[]) => void): this;
@@ -184,6 +203,11 @@ export interface BoardsServiceImpl extends Service<Board, Partial<Board>, Feathe
     objects: unknown[],
     params?: FeathersParams
   ): Promise<Board>;
+  mergeBoardObjectFields(
+    boardId: string,
+    patches: Record<string, unknown>,
+    params?: FeathersParams
+  ): Promise<Board>;
   deleteZone(
     boardId: string,
     zoneId: string,
@@ -202,11 +226,11 @@ export interface BoardsServiceImpl extends Service<Board, Partial<Board>, Feathe
   toYaml(boardId: string, params?: FeathersParams): Promise<string>;
   fromYaml(yamlContent: string, params?: FeathersParams): Promise<Board>;
   clone(boardId: string, newName: string, params?: FeathersParams): Promise<Board>;
-  setPrimaryAssistant(
+  setPrimaryTeammate(
     data: { id?: string; boardId?: string; branchId: string },
     params?: FeathersParams
   ): Promise<Board>;
-  clearPrimaryAssistant(boardId: string, params?: FeathersParams): Promise<Board>;
+  clearPrimaryTeammate(boardId: string, params?: FeathersParams): Promise<Board>;
   archive(id: string, params?: FeathersParams): Promise<Board>;
   unarchive(id: string, params?: FeathersParams): Promise<Board>;
 }
@@ -222,6 +246,18 @@ export interface MessagesServiceImpl extends Service<Message, Partial<Message>, 
  * Branches service with custom methods (server-side implementation)
  */
 export interface BranchesServiceImpl extends Service<Branch, Partial<Branch>, FeathersParams> {
+  updateEnvironment(
+    id:
+      | BranchID
+      | {
+          branch_id?: BranchID;
+          branchId?: BranchID;
+          environment_update?: BranchEnvironmentUpdate;
+          environmentUpdate?: BranchEnvironmentUpdate;
+        },
+    environmentUpdate?: BranchEnvironmentUpdate | FeathersParams,
+    params?: FeathersParams
+  ): Promise<Branch>;
   startEnvironment(id: BranchID, params?: FeathersParams): Promise<Branch>;
   stopEnvironment(id: BranchID, params?: FeathersParams): Promise<Branch>;
   restartEnvironment(id: BranchID, params?: FeathersParams): Promise<Branch>;

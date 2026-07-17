@@ -4,7 +4,7 @@
  * Effort level controls how much reasoning Claude applies.
  * Maps to Claude API's output_config.effort and the Claude Code CLI's --effort flag.
  */
-export type EffortLevel = 'low' | 'medium' | 'high' | 'max';
+export type EffortLevel = 'low' | 'medium' | 'high' | 'xhigh' | 'max';
 
 import type {
   AgenticToolName,
@@ -17,7 +17,7 @@ import type {
   OpenCodePermissionMode,
 } from './agentic-tool';
 import type { ContextFilePath } from './context';
-import type { BoardID, BranchID, SessionID, TaskID } from './id';
+import type { BoardID, BranchID, SessionID, SessionRelationshipID, TaskID, UserID } from './id';
 import type { ScheduleID } from './schedule';
 
 export const SessionStatus = {
@@ -44,6 +44,7 @@ export type SessionStatus = (typeof SessionStatus)[keyof typeof SessionStatus];
  * - acceptEdits: Auto-accept file edits, ask for other tools (recommended)
  * - bypassPermissions: Allow all operations without prompting
  * - plan: Plan mode (generate plan without executing)
+ * - auto: Model classifier approves/denies prompts; unresolved ones fall through to Agor's UI
  * - dontAsk: Legacy mode for backward compatibility
  *
  * Gemini modes (Gemini CLI SDK - ApprovalMode):
@@ -88,13 +89,16 @@ export type {
  * Get the default permission mode for a given agentic tool
  *
  * Per tool:
- * - Claude Code: 'acceptEdits' — auto-accept file edits. Bash/shell tool
- *   prompts still flow through Agor's permission UI; MCP tool calls for
- *   the built-in `agor` server and any attached MCP servers are
- *   auto-approved by the executor's canUseTool hook (see
- *   sdk-handlers/claude/permissions/permission-hooks.ts), so MCP-heavy
- *   sessions don't death-by-modal. Users can flip a running session to
- *   `bypassPermissions` mid-flight from the session UI.
+ * - Claude Code: 'auto' — the SDK's model classifier approves/denies each
+ *   permission prompt; anything it doesn't confidently auto-resolve still
+ *   falls through to Agor's permission UI via the executor's canUseTool hook
+ *   (see sdk-handlers/claude/permissions/permission-hooks.ts). MCP tool calls
+ *   for the built-in `agor` server and any attached MCP servers are
+ *   auto-approved by that same hook, so MCP-heavy sessions don't
+ *   death-by-modal. Users can flip a running session to `acceptEdits` or
+ *   `bypassPermissions` mid-flight from the session UI. Applies to both the
+ *   Claude Agent SDK (`claude-code`) and interactive CLI (`claude-code-cli`)
+ *   paths, which share this default.
  * - Codex: 'allow-all' — maps to sandbox `workspace-write` + approval
  *   `never` + network-on. Codex's MCP auto-approve is wired through
  *   `default_tools_approval_mode = "approve"` on each server config
@@ -122,7 +126,7 @@ export function getDefaultPermissionMode(agenticTool: AgenticToolName): Permissi
     case 'cursor':
       return 'bypassPermissions'; // Cursor SDK is experimental/autonomous until permission callbacks exist
     default:
-      return 'acceptEdits'; // Claude Code
+      return 'auto'; // Claude Code (SDK + CLI): model-classifier permissions
   }
 }
 
@@ -132,6 +136,8 @@ export interface Session {
 
   /** Which agentic coding tool is running this session (Claude Code, Codex, Gemini) */
   agentic_tool: AgenticToolName;
+  /** Live tenant preset reference. When set, atomic runtime fields are read-only. */
+  agentic_tool_preset_id?: import('./agentic-tool-preset').AgenticToolPresetID | null;
   /** Agentic tool/CLI version */
   agentic_tool_version?: string;
   /** SDK session ID for maintaining conversation history (Claude Agent SDK, Codex SDK, etc.) */
@@ -238,7 +244,7 @@ export interface Session {
       /** Network access controls whether outbound HTTP/HTTPS requests are allowed (workspace-write only) */
       networkAccess?: boolean;
     };
-  };
+  } | null;
 
   // Model configuration (session-level model selection)
   model_config?: {
@@ -260,7 +266,7 @@ export interface Session {
      * Only applicable when agentic_tool='opencode'
      */
     provider?: string;
-  };
+  } | null;
 
   /**
    * Claude Code CLI adapter state. Only set when `agentic_tool === 'claude-code-cli'`.
@@ -474,9 +480,96 @@ export interface Session {
    *
    * - 'branch_archived': Cascaded from parent branch being archived
    * - 'manual': User manually archived this session
+   * - 'parent_archived': Cascaded from parent session being manually archived
    * - 'btw_completed': Ephemeral btw fork auto-archived after task completion
    */
-  archived_reason?: 'branch_archived' | 'manual' | 'btw_completed';
+  archived_reason?: 'branch_archived' | 'manual' | 'parent_archived' | 'btw_completed';
+
+  /**
+   * Durable non-genealogy relationships involving this session.
+   *
+   * These are separate from genealogy.parent_session_id/forked_from_session_id.
+   * For example, a session in branch A can create a remote session in branch B;
+   * branch B keeps its own genealogy shape, while branch A can still render a
+   * muted/surrogate child card for track-record and navigation purposes.
+   */
+  remote_relationships?: {
+    as_source?: SessionRelationship[];
+    as_target?: SessionRelationship[];
+  };
+
+  /**
+   * UI-only marker for a remote-created session rendered as a surrogate in the
+   * source branch tree. The canonical session still lives in `target_branch_id`;
+   * clicking the surrogate should navigate to/open that real session.
+   */
+  remote_surrogate?: {
+    relationship: SessionRelationship;
+    source_session_id: SessionID;
+    source_branch_id: BranchID;
+    target_branch_id: BranchID;
+  };
+}
+
+/**
+ * Minimal persisted session state needed to decide whether a new task can
+ * start immediately.
+ *
+ * `ready_for_prompt` is intentionally not equivalent to promptability: the UI
+ * also uses it as an attention/acknowledgement flag (for example timed-out
+ * permission requests can set it true). Use this helper instead of checking
+ * either field directly at task-execution boundaries.
+ */
+export type SessionPromptState = Pick<Session, 'status' | 'ready_for_prompt'>;
+
+export type PromptableSessionState =
+  | { status: typeof SessionStatus.IDLE; ready_for_prompt: boolean }
+  | { status: typeof SessionStatus.FAILED; ready_for_prompt: true };
+
+export function sessionCanStartTask(status: Session['status'], readyForPrompt?: boolean): boolean {
+  return (
+    status === SessionStatus.IDLE || (status === SessionStatus.FAILED && readyForPrompt === true)
+  );
+}
+
+export function isSessionPromptable<T extends SessionPromptState>(
+  session: T
+): session is T & PromptableSessionState {
+  return sessionCanStartTask(session.status, session.ready_for_prompt);
+}
+
+export const EXECUTING_SESSION_STATUSES: ReadonlySet<SessionStatus> = new Set<SessionStatus>([
+  SessionStatus.RUNNING,
+  SessionStatus.STOPPING,
+  SessionStatus.AWAITING_PERMISSION,
+  SessionStatus.AWAITING_INPUT,
+]);
+
+export type SessionExecutionState = Pick<Session, 'status'>;
+
+export function isSessionExecuting(session: SessionExecutionState): boolean {
+  return EXECUTING_SESSION_STATUSES.has(session.status);
+}
+
+export type SessionRelationshipType = 'remote_create';
+
+/**
+ * Durable links between sessions that are not necessarily canonical
+ * branch-local genealogy. Cross-branch delegation uses this instead of
+ * genealogy.parent_session_id so the local session tree, recursive delete,
+ * and fork/spawn semantics remain branch-local.
+ */
+export interface SessionRelationship {
+  relationship_id: SessionRelationshipID;
+  source_session_id: SessionID;
+  target_session_id: SessionID;
+  relationship_type: SessionRelationshipType;
+  created_by: UserID;
+  created_at: string;
+  updated_at?: string | null;
+  callback_enabled: boolean;
+  callback_session_id?: SessionID | null;
+  data?: Record<string, unknown> | null;
 }
 
 /**
@@ -496,6 +589,12 @@ export interface GatewaySource {
   github_issue_number?: number;
   /** GitHub-specific: only post last message */
   last_message_only?: boolean;
+  /** Slack-specific provenance */
+  slack_team_id?: string;
+  slack_channel_id?: string;
+  slack_channel_name?: string;
+  slack_root_ts?: string;
+  slack_trigger_ts?: string;
 }
 
 /**
@@ -609,6 +708,9 @@ export interface SpawnConfig {
 
   /** Agentic tool to use (defaults to parent's tool) */
   agent?: AgenticToolName;
+
+  /** Live tenant preset. Same-tool children inherit the parent's preset by default. */
+  presetId?: import('./agentic-tool-preset').AgenticToolPresetID;
 
   /** Permission mode override (defaults based on config preset) */
   permissionMode?: PermissionMode;

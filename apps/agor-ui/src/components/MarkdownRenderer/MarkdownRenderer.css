@@ -1,3 +1,4 @@
+/* biome-ignore-all lint/plugin/noFirstPartyCss: rendered markdown semantics and heading hover anchors require descendant and pseudo selectors */
 /**
  * Compact markdown styling for constrained contexts (cards, small containers)
  * Reduces heading sizes, margins, and ensures content doesn't blow up layout
@@ -72,4 +73,87 @@
 .markdown-compact .mermaid {
   max-width: 100%;
   max-height: 150px;
+}
+
+.markdown-content h1,
+.markdown-content h2,
+.markdown-content h3,
+.markdown-content h4,
+.markdown-content h5,
+.markdown-content h6 {
+  scroll-margin-top: 24px;
+}
+
+.markdown-heading-anchor {
+  margin-left: 0.35em;
+  color: inherit;
+  font-size: 0.82em;
+  opacity: 0;
+  text-decoration: none;
+  transition: opacity 120ms ease;
+}
+
+.markdown-content h1:hover .markdown-heading-anchor,
+.markdown-content h2:hover .markdown-heading-anchor,
+.markdown-content h3:hover .markdown-heading-anchor,
+.markdown-content h4:hover .markdown-heading-anchor,
+.markdown-content h5:hover .markdown-heading-anchor,
+.markdown-content h6:hover .markdown-heading-anchor,
+.markdown-heading-anchor:focus {
+  opacity: 0.55;
+}
+
+.markdown-content h1 .markdown-heading-anchor:hover,
+.markdown-content h2 .markdown-heading-anchor:hover,
+.markdown-content h3 .markdown-heading-anchor:hover,
+.markdown-content h4 .markdown-heading-anchor:hover,
+.markdown-content h5 .markdown-heading-anchor:hover,
+.markdown-content h6 .markdown-heading-anchor:hover {
+  opacity: 0.85;
+  text-decoration: none;
+}
+
+/* GitHub's blockquote-alert convention is portable Markdown. The remark
+   plugin only supplies semantic classes; Agor maps them to Ant tokens here. */
+.markdown-alert {
+  --markdown-alert-color: var(--ant-color-info);
+  margin-block: var(--ant-margin-md);
+  padding: var(--ant-padding-sm) var(--ant-padding);
+  border: 1px solid color-mix(in srgb, var(--markdown-alert-color) 35%, transparent);
+  border-left: 4px solid var(--markdown-alert-color);
+  border-radius: var(--ant-border-radius);
+  background: color-mix(in srgb, var(--markdown-alert-color) 8%, transparent);
+  color: var(--ant-color-text);
+  font-style: normal;
+}
+
+.markdown-alert-note,
+.markdown-alert-important {
+  --markdown-alert-color: var(--ant-color-info);
+}
+
+.markdown-alert-tip {
+  --markdown-alert-color: var(--ant-color-success);
+}
+
+.markdown-alert-warning {
+  --markdown-alert-color: var(--ant-color-warning);
+}
+
+.markdown-alert-caution {
+  --markdown-alert-color: var(--ant-color-error);
+}
+
+.markdown-alert-title,
+.markdown-alert > p:first-child[dir="auto"] {
+  display: flex;
+  align-items: center;
+  gap: var(--ant-margin-xs);
+  margin: 0 0 var(--ant-margin-xs);
+  color: var(--markdown-alert-color);
+  font-weight: var(--ant-font-weight-strong);
+}
+
+.markdown-alert > :last-child {
+  margin-bottom: 0;
 }

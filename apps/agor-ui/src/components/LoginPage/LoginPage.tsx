@@ -5,12 +5,36 @@
  */
 
 import { LockOutlined, MailOutlined } from '@ant-design/icons';
-import { Alert, Button, Card, Divider, Form, Input, Space, Typography } from 'antd';
+import { Alert, Button, Card, Divider, Form, Input, Space, Typography, theme } from 'antd';
 import { useState } from 'react';
+import { BRAND, brandMarkHref } from '../../branding/brand';
 import { BrandLogo } from '../BrandLogo';
 import { ParticleBackground } from './ParticleBackground';
 
 const { Text } = Typography;
+
+function currentReturnToPath(): string | null {
+  if (typeof window === 'undefined') return null;
+
+  // Send only a relative Agor route to the external launcher. Avoiding an
+  // absolute URL keeps this from becoming an open-redirect primitive if the
+  // launcher blindly follows `return_to`.
+  const pathname = window.location.pathname.startsWith('//') ? '/' : window.location.pathname;
+  return `${pathname}${window.location.search}${window.location.hash}`;
+}
+
+function addReturnToParam(loginRedirectUrl: string): string {
+  const returnTo = currentReturnToPath();
+  if (!returnTo) return loginRedirectUrl;
+
+  try {
+    const url = new URL(loginRedirectUrl);
+    url.searchParams.set('return_to', returnTo);
+    return url.toString();
+  } catch {
+    return loginRedirectUrl;
+  }
+}
 
 interface LoginPageProps {
   onLogin: (email: string, password: string) => Promise<boolean>;
@@ -28,7 +52,11 @@ export function LoginPage({
   const [form] = Form.useForm();
   const [submitting, setSubmitting] = useState(false);
   const [showLocalLogin, setShowLocalLogin] = useState(false);
+  const { token } = theme.useToken();
   const useExternalLaunch = !!externalLaunchLoginRedirectUrl;
+  const externalLaunchHref = externalLaunchLoginRedirectUrl
+    ? addReturnToParam(externalLaunchLoginRedirectUrl)
+    : undefined;
   const showLoginForm = !useExternalLaunch || showLocalLogin;
   const isLaunchError = error?.startsWith('Launch sign-in failed') ?? false;
 
@@ -49,7 +77,7 @@ export function LoginPage({
         display: 'flex',
         alignItems: 'center',
         justifyContent: 'center',
-        background: 'linear-gradient(135deg, #0a0a0a 0%, #1a1a1a 50%, #0f1f1e 100%)',
+        background: token.colorBgLayout,
         padding: '16px',
         position: 'relative',
         overflow: 'auto',
@@ -68,16 +96,10 @@ export function LoginPage({
           bottom: 16,
           right: 16,
           fontSize: 10,
-          color: 'rgba(46, 154, 146, 0.3)',
+          color: token.colorTextQuaternary,
           textDecoration: 'none',
           zIndex: 0,
           transition: 'color 0.3s',
-        }}
-        onMouseEnter={(e) => {
-          e.currentTarget.style.color = 'rgba(46, 154, 146, 0.6)';
-        }}
-        onMouseLeave={(e) => {
-          e.currentTarget.style.color = 'rgba(46, 154, 146, 0.3)';
         }}
       >
         🤍 tsparticles
@@ -87,8 +109,8 @@ export function LoginPage({
         style={{
           width: '100%',
           maxWidth: 420,
-          borderRadius: 12,
-          boxShadow: '0 8px 32px rgba(0, 0, 0, 0.4)',
+          borderRadius: token.borderRadiusLG,
+          boxShadow: token.boxShadowSecondary,
           position: 'relative',
           zIndex: 1,
           margin: 'auto',
@@ -99,8 +121,8 @@ export function LoginPage({
         <Space orientation="vertical" size="large" style={{ width: '100%', marginBottom: 24 }}>
           <div style={{ textAlign: 'center' }}>
             <img
-              src={`${import.meta.env.BASE_URL}favicon.png`}
-              alt="Agor Logo"
+              src={brandMarkHref()}
+              alt={BRAND.name}
               style={{
                 width: 72,
                 height: 72,
@@ -126,26 +148,7 @@ export function LoginPage({
           <Alert
             type="error"
             title={isLaunchError ? 'Launch sign-in failed' : 'Login Failed'}
-            description={
-              <Space orientation="vertical" size="small" style={{ width: '100%' }}>
-                <div>{error}</div>
-                {!isLaunchError && (
-                  <div
-                    style={{
-                      marginTop: 8,
-                      paddingTop: 8,
-                      borderTop: '1px solid rgba(255,255,255,0.1)',
-                    }}
-                  >
-                    <Text type="secondary" style={{ fontSize: 12 }}>
-                      💡 First time setting up? Create an admin user:
-                    </Text>
-                    <br />
-                    <code style={{ fontSize: 11 }}>agor user create-admin</code>
-                  </div>
-                )}
-              </Space>
-            }
+            description={error}
             showIcon
             closable
             style={{ marginBottom: 24 }}
@@ -164,7 +167,7 @@ export function LoginPage({
             )}
             <Button
               type="primary"
-              href={externalLaunchLoginRedirectUrl}
+              href={externalLaunchHref}
               block
               data-testid="external-launch-return"
             >
@@ -197,7 +200,7 @@ export function LoginPage({
                 ]}
               >
                 <Input
-                  prefix={<MailOutlined style={{ color: 'rgba(255, 255, 255, 0.45)' }} />}
+                  prefix={<MailOutlined style={{ color: token.colorTextQuaternary }} />}
                   placeholder="Email address"
                   autoComplete="email"
                 />
@@ -208,7 +211,7 @@ export function LoginPage({
                 rules={[{ required: true, message: 'Please enter your password' }]}
               >
                 <Input.Password
-                  prefix={<LockOutlined style={{ color: 'rgba(255, 255, 255, 0.45)' }} />}
+                  prefix={<LockOutlined style={{ color: token.colorTextQuaternary }} />}
                   placeholder="Password"
                   autoComplete="current-password"
                 />
@@ -221,17 +224,6 @@ export function LoginPage({
               </Form.Item>
             </Form>
           </>
-        )}
-
-        {/* Footer */}
-        {showLoginForm && (
-          <div style={{ textAlign: 'center', marginTop: 24 }}>
-            <Space orientation="vertical" size={4}>
-              <Text type="secondary" style={{ fontSize: 12 }}>
-                New user? <code>agor user create-admin</code>
-              </Text>
-            </Space>
-          </div>
         )}
       </Card>
     </div>

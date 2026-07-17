@@ -350,6 +350,32 @@ describe('createClient', () => {
       expect(authMock).toHaveBeenCalledWith({ storage: undefined });
     });
 
+    it('should prefer explicit auth storage over localStorage', () => {
+      const mockLocalStorage = {
+        getItem: vi.fn(),
+        setItem: vi.fn(),
+        removeItem: vi.fn(),
+        clear: vi.fn(),
+        length: 0,
+        key: vi.fn(),
+      };
+      const explicitStorage = {
+        getItem: vi.fn(),
+        setItem: vi.fn(),
+        removeItem: vi.fn(),
+      };
+
+      (globalThis as any).localStorage = mockLocalStorage;
+
+      const authMock = authClient as unknown as MockedFunction<any>;
+
+      createClient('http://localhost:3030', false, { authStorage: explicitStorage });
+
+      expect(authMock).toHaveBeenCalledWith({ storage: explicitStorage });
+
+      delete (globalThis as any).localStorage;
+    });
+
     it('should handle globalThis without localStorage gracefully', () => {
       const _globalThisBackup = globalThis;
 
@@ -562,7 +588,12 @@ describe('createClient', () => {
       const usersService = client.service('users') as unknown as {
         methods: MockedFunction<(...names: string[]) => unknown>;
       };
-      expect(usersService.methods).toHaveBeenCalledWith('getGitEnvironment');
+      expect(usersService.methods).toHaveBeenCalledWith(
+        'getGitEnvironment',
+        'getAvatarSettings',
+        'updateAvatarSettings',
+        'syncAvatars'
+      );
     });
 
     it('registers repos.initializeUnixGroup custom method on client', () => {
@@ -573,14 +604,15 @@ describe('createClient', () => {
       expect(reposService.methods).toHaveBeenCalledWith('initializeUnixGroup');
     });
 
-    it('registers branches.initializeUnixGroup custom method on client', () => {
+    it('registers branches custom methods on client', () => {
       const client = createClient();
       const branchesService = client.service('branches') as unknown as {
         methods: MockedFunction<(...names: string[]) => unknown>;
       };
       expect(branchesService.methods).toHaveBeenCalledWith(
+        'updateEnvironment',
         'initializeUnixGroup',
-        'ensureAssistantKnowledgeNamespace'
+        'ensureTeammateKnowledgeNamespace'
       );
     });
 

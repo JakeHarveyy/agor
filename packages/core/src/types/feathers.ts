@@ -43,6 +43,8 @@ export type { Id, NullableId, Paginated, Params, Service, ServiceMethods };
  * Available in hook context and service params after authentication.
  */
 export interface AuthenticatedUser {
+  /** Tenant associated with this authenticated identity when app-level multi-tenancy is enabled. */
+  tenant_id?: import('./tenant').TenantID | string;
   /** User ID (UUIDv7) */
   user_id: string;
   /** User email address */
@@ -51,6 +53,17 @@ export interface AuthenticatedUser {
   role: string;
   /** True for service accounts (executor) — bypasses RBAC checks */
   _isServiceAccount?: boolean;
+  /**
+   * True for terminal-executor tokens: a RESTRICTED identity that authenticates
+   * a web-terminal executor's socket for its own user's terminal channel only.
+   * Deliberately distinct from `_isServiceAccount` — a terminal token must NOT
+   * bypass RBAC on REST/Feathers paths (the terminal executor only streams PTY
+   * I/O over the socket). Enforced by the socket terminal handlers via
+   * `terminal_user_id`; carries no privilege anywhere else.
+   */
+  _isTerminalExecutor?: boolean;
+  /** The single user a terminal-executor identity may act for on its channel. */
+  terminal_user_id?: string;
 }
 
 /**
@@ -61,6 +74,10 @@ export interface AuthenticatedUser {
 export interface AuthenticatedParams extends Params {
   /** Authenticated user (undefined for anonymous requests) */
   user?: AuthenticatedUser;
+  /** Resolved app-level tenant context. Present in static mode and required in cloud mode. */
+  tenant?: import('./tenant').TenantContext;
+  /** Explicit tenant id for trusted internal/background jobs. */
+  tenant_id?: import('./tenant').TenantID | string;
 }
 
 /**

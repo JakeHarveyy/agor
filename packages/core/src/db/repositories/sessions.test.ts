@@ -7,10 +7,11 @@
 
 import type { Session, UUID } from '@agor/core/types';
 import { SessionStatus } from '@agor/core/types';
-import { describe, expect } from 'vitest';
+import { describe, expect, it } from 'vitest';
 import { generateId, shortId, toShortId } from '../../lib/ids';
+import type { SessionRow } from '../schema';
 import { dbTest } from '../test-helpers';
-import { AmbiguousIdError, EntityNotFoundError, RepositoryError } from './base';
+import { AmbiguousIdError, EntityNotFoundError, getHiddenTenantId, RepositoryError } from './base';
 import { BranchRepository } from './branches';
 import { RepoRepository } from './repos';
 import { ScheduleRepository } from './schedules';
@@ -74,6 +75,68 @@ async function createTestBranch(db: any, overrides?: { branch_id?: UUID; repo_id
 
   return branch;
 }
+
+type SessionRowMapper = {
+  rowToSession(row: SessionRow, branchBoardId?: UUID | null, baseUrl?: string): Session;
+};
+
+function createPostgresStyleSessionRow(overrides?: Partial<SessionRow> & { tenant_id?: string }) {
+  const now = new Date('2026-01-01T00:00:00.000Z');
+  return {
+    tenant_id: 'tenant-session-row',
+    session_id: generateId(),
+    created_at: now,
+    updated_at: now,
+    created_by: generateId(),
+    unix_username: null,
+    status: SessionStatus.IDLE,
+    agentic_tool: 'claude-code',
+    agentic_tool_preset_id: null,
+    board_id: null,
+    parent_session_id: null,
+    forked_from_session_id: null,
+    branch_id: generateId(),
+    scheduled_run_at: null,
+    scheduled_from_branch: false,
+    schedule_id: null,
+    ready_for_prompt: false,
+    archived: false,
+    archived_reason: null,
+    data: {
+      git_state: {
+        ref: 'main',
+        base_sha: 'abc123',
+        current_sha: 'def456',
+      },
+      genealogy: { children: [] },
+      contextFiles: [],
+      tasks: [],
+    },
+    ...overrides,
+  } satisfies SessionRow & { tenant_id: string };
+}
+
+function rowToSessionForTest(repo: SessionRepository, row: SessionRow): Session {
+  return (repo as unknown as SessionRowMapper).rowToSession(row);
+}
+
+// ============================================================================
+// Mapping
+// ============================================================================
+
+describe('SessionRepository row mapping', () => {
+  it('attaches Postgres tenant_id as hidden non-enumerable metadata', () => {
+    const repo = new SessionRepository({} as never);
+    const row = createPostgresStyleSessionRow();
+
+    const session = rowToSessionForTest(repo, row);
+
+    expect(getHiddenTenantId(session)).toBe('tenant-session-row');
+    expect((session as { tenant_id?: string }).tenant_id).toBe('tenant-session-row');
+    expect(Object.keys(session)).not.toContain('tenant_id');
+    expect(JSON.stringify(session)).not.toContain('tenant_id');
+  });
+});
 
 // ============================================================================
 // Create
@@ -449,6 +512,66 @@ describe('SessionRepository.findAll', () => {
     expect(found.status).toBe(SessionStatus.RUNNING);
     expect(found.branch_id).toBe(branch.branch_id);
   });
+
+  dbTest(
+    'should push visibleToUserId branch access filtering into findAll/findPage',
+    async ({ db }) => {
+      const repo = new SessionRepository(db);
+      const repoRepo = new RepoRepository(db);
+      const branchRepo = new BranchRepository(db);
+      const userId = generateId() as UUID;
+
+      const gitRepo = await repoRepo.create({
+        repo_id: generateId(),
+        slug: `session-rbac-repo-${Date.now()}`,
+        name: 'Session RBAC Repo',
+        repo_type: 'remote' as const,
+        remote_url: 'https://github.com/test/session-rbac.git',
+        local_path: '/tmp/session-rbac-repo',
+        default_branch: 'main',
+      });
+      const visibleBranch = await branchRepo.create({
+        branch_id: generateId(),
+        repo_id: gitRepo.repo_id,
+        name: 'visible',
+        ref: 'visible',
+        branch_unique_id: Math.floor(Math.random() * 1000000),
+        path: '/tmp/session-rbac-visible',
+        base_ref: 'main',
+        new_branch: false,
+        created_by: generateId() as UUID,
+        permission_source: 'override',
+        others_can: 'view',
+      });
+      const hiddenBranch = await branchRepo.create({
+        branch_id: generateId(),
+        repo_id: gitRepo.repo_id,
+        name: 'hidden',
+        ref: 'hidden',
+        branch_unique_id: Math.floor(Math.random() * 1000000),
+        path: '/tmp/session-rbac-hidden',
+        base_ref: 'main',
+        new_branch: false,
+        created_by: generateId() as UUID,
+        permission_source: 'override',
+        others_can: 'none',
+      });
+
+      const visibleSession = await repo.create(
+        createSessionData({ branch_id: visibleBranch.branch_id, title: 'Visible Session' })
+      );
+      await repo.create(
+        createSessionData({ branch_id: hiddenBranch.branch_id, title: 'Hidden Session' })
+      );
+
+      const visible = await repo.findAll({ visibleToUserId: userId });
+      expect(visible.map((session) => session.session_id)).toEqual([visibleSession.session_id]);
+
+      const page = await repo.findPage({ visibleToUserId: userId, limit: 10, skip: 0 });
+      expect(page.total).toBe(1);
+      expect(page.data.map((session) => session.session_id)).toEqual([visibleSession.session_id]);
+    }
+  );
 });
 
 // ============================================================================
@@ -1360,6 +1483,50 @@ describe('SessionRepository schedule-link queries', () => {
     // Caller passed [] — defensive contract: matches nothing.
     expect(await repo.existsInBranchWithStatuses(branch.branch_id, [])).toBe(false);
   });
+
+  dbTest('existsInScheduleWithStatuses is scoped per schedule', async ({ db }) => {
+    const repo = new SessionRepository(db);
+    const branch = await createTestBranch(db);
+    const scheduleA = await createTestSchedule(db, branch.branch_id);
+    const scheduleB = await createTestSchedule(db, branch.branch_id);
+    const ACTIVE = [SessionStatus.RUNNING] as const;
+
+    await repo.create(
+      createSessionData({
+        branch_id: branch.branch_id,
+        schedule_id: scheduleA,
+        scheduled_run_at: 1_700_000_000_000,
+        scheduled_from_branch: true,
+        status: SessionStatus.RUNNING,
+      })
+    );
+
+    expect(await repo.existsInScheduleWithStatuses(scheduleA, ACTIVE)).toBe(true);
+    expect(await repo.existsInScheduleWithStatuses(scheduleB, ACTIVE)).toBe(false);
+  });
+
+  dbTest(
+    'existsInScheduleWithStatuses ignores inactive runs and empty status lists',
+    async ({ db }) => {
+      const repo = new SessionRepository(db);
+      const branch = await createTestBranch(db);
+      const scheduleId = await createTestSchedule(db, branch.branch_id);
+      const ACTIVE = [SessionStatus.RUNNING] as const;
+
+      await repo.create(
+        createSessionData({
+          branch_id: branch.branch_id,
+          schedule_id: scheduleId,
+          scheduled_run_at: 1_700_000_000_000,
+          scheduled_from_branch: true,
+          status: SessionStatus.IDLE,
+        })
+      );
+
+      expect(await repo.existsInScheduleWithStatuses(scheduleId, ACTIVE)).toBe(false);
+      expect(await repo.existsInScheduleWithStatuses(scheduleId, [])).toBe(false);
+    }
+  );
 
   // The DB-level race guard. Two inserts with the same
   // (schedule_id, scheduled_run_at) must conflict; the second one

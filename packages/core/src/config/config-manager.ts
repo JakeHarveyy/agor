@@ -8,10 +8,11 @@ import { readFileSync, statSync } from 'node:fs';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
-import yaml from 'js-yaml';
+import * as yaml from 'js-yaml';
 import { getDefaultAnalyticsConfig } from './analytics-defaults.js';
 import { DAEMON, MCP_TOKEN } from './constants';
 import { resolveExecutorHeartbeatConfig } from './executor-heartbeat';
+import { assertValidMultiTenancyConfig } from './multitenancy';
 import {
   type AgorConfig,
   BRANCH_STORAGE_MODES,
@@ -20,6 +21,32 @@ import {
   type ResolvedBranchStorageConfig,
   type UnknownJson,
 } from './types';
+
+export const RETIRED_CONFIG_KEYS = {
+  defaults: ['board', 'agent'],
+  display: ['tableStyle', 'colorOutput', 'shortIdLength'],
+  onboarding: ['teammatePending', 'assistantPending', 'persistedAgentPending'],
+} as const;
+
+export const RETIRED_CONFIG_PATHS = new Set<string>(
+  Object.entries(RETIRED_CONFIG_KEYS).flatMap(([section, keys]) =>
+    keys.map((key) => `${section}.${key}`)
+  )
+);
+
+type LegacyConfig = AgorConfig & {
+  defaults?: Record<string, unknown>;
+  display?: Record<string, unknown>;
+  onboarding?: Record<string, unknown>;
+};
+
+/** Resolve the renamed operator setting while keeping old YAML loadable. */
+export function resolveTeammateFrameworkRepoUrl(config: AgorConfig): string | undefined {
+  const legacyUrl = (config as LegacyConfig).onboarding?.frameworkRepoUrl;
+  return (
+    config.teammates?.framework_repo_url ?? (typeof legacyUrl === 'string' ? legacyUrl : undefined)
+  );
+}
 
 // ---------------------------------------------------------------------------
 // In-memory cache for the default-path config
@@ -138,6 +165,10 @@ export function __resetConfigCacheForTests(): void {
  * the same invalid inputs (e.g. deprecated `unix_user_mode: opportunistic`).
  */
 function parseAndValidateConfig(content: string): AgorConfig {
+  if (content.trim() === '') {
+    return {};
+  }
+
   const parsed = yaml.load(content) as AgorConfig | undefined | null;
   const finalConfig = parsed || {};
   validateConfig(finalConfig);
@@ -174,6 +205,279 @@ async function ensureAgorHome(): Promise<void> {
  * Validate config and throw helpful errors for deprecated/invalid settings
  */
 function validateConfig(config: AgorConfig): void {
+  const removedConfig = config as AgorConfig & {
+    resources?: unknown;
+    services?: unknown;
+  };
+  if (removedConfig.resources !== undefined) {
+    throw new Error(
+      "Config error: 'resources' has been removed. Create users, repositories, and branches through their typed APIs instead."
+    );
+  }
+  if (removedConfig.services !== undefined) {
+    throw new Error(
+      "Config error: 'services' has been removed. Agor services are registered consistently for every tenant."
+    );
+  }
+  const removedProviderConfig = config as AgorConfig & {
+    credentials?: unknown;
+    opencode?: unknown;
+    codex?: unknown;
+    execution?: AgorConfig['execution'] & { cursor_sdk_enabled?: unknown };
+  };
+  if (removedProviderConfig.credentials !== undefined) {
+    throw new Error(
+      "Config error: 'credentials' has been removed. Configure workspace agentic tools in Settings."
+    );
+  }
+  if (removedProviderConfig.opencode !== undefined) {
+    throw new Error(
+      "Config error: 'opencode' has been removed. Configure OpenCode availability in workspace agentic-tool settings."
+    );
+  }
+  // Stale since #1136 (per-session CODEX_HOME removal); flagged here so
+  // upgrading installs get guidance instead of a generic unrecognized-key error.
+  if (removedProviderConfig.codex !== undefined) {
+    throw new Error(
+      "Config error: 'codex' has been removed. Codex home directories are managed per-session automatically."
+    );
+  }
+  if (removedProviderConfig.execution?.cursor_sdk_enabled !== undefined) {
+    throw new Error(
+      "Config error: 'execution.cursor_sdk_enabled' has been removed. Configure Cursor availability in workspace agentic-tool settings."
+    );
+  }
+
+  const knownTopLevelKeys = new Set([
+    'defaults',
+    'display',
+    'daemon',
+    'ui',
+    'database',
+    'external_launch',
+    'execution',
+    'security',
+    'branches',
+    'teammates',
+    'paths',
+    'analytics',
+    'telemetry',
+    'knowledge',
+    'onboarding',
+    'multi_tenancy',
+    'proxies',
+  ]);
+  const unknownTopLevelKeys = Object.keys(config).filter((key) => !knownTopLevelKeys.has(key));
+  if (unknownTopLevelKeys.length > 0) {
+    throw new Error(
+      `Config error: unrecognized top-level key${unknownTopLevelKeys.length === 1 ? '' : 's'}: ${unknownTopLevelKeys.join(', ')}`
+    );
+  }
+
+  const unknownPaths: string[] = [];
+  const only = (value: unknown, path: string, allowed: readonly string[]) => {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) return;
+    for (const key of Object.keys(value)) {
+      if (!allowed.includes(key)) unknownPaths.push(`${path}.${key}`);
+    }
+  };
+  const legacyConfig = config as LegacyConfig;
+  only(legacyConfig.defaults, 'defaults', RETIRED_CONFIG_KEYS.defaults);
+  // Known upgrade-only keys remain loadable so the daemon can print its
+  // dedicated deprecation guidance before ignoring them. `display` is not
+  // part of AgorConfig anymore: all three settings were retired.
+  only(legacyConfig.display, 'display', RETIRED_CONFIG_KEYS.display);
+  only(config.daemon, 'daemon', [
+    'port',
+    'host',
+    'host_ip_address',
+    'public_url',
+    'base_url',
+    'jwtSecret',
+    'masterSecret',
+    'mcpEnabled',
+    'mcpToolSearch',
+    'unix_user',
+    'instanceLabel',
+    'instanceDescription',
+    'impersonation_token_expiry_ms',
+    'cors_allow_sandpack',
+    'cors_origins',
+    'trust_proxy_hops',
+    'allowAnonymous',
+    'requireAuth',
+  ]);
+  only(config.ui, 'ui', ['base_url', 'port', 'host']);
+  only(config.external_launch, 'external_launch', [
+    'enabled',
+    'exchange_url',
+    'issuer',
+    'audience',
+    'instance_id',
+    'provider_id',
+    'jwks_url',
+    'public_key',
+    'dev_shared_secret',
+    'dev_shared_secret_env',
+    'service_credential',
+    'service_credential_env',
+    'request_timeout_ms',
+    'algorithms',
+    'allow_admin_roles',
+    'trust_verified_email_for_linking',
+    'login_redirect_url',
+  ]);
+  only(config.database, 'database', ['dialect', 'sqlite', 'postgresql']);
+  only(config.database?.sqlite, 'database.sqlite', ['path', 'walMode', 'busyTimeout']);
+  only(config.database?.postgresql, 'database.postgresql', [
+    'url',
+    'host',
+    'port',
+    'database',
+    'user',
+    'password',
+    'pool',
+    'ssl',
+    'schema',
+  ]);
+  only(config.database?.postgresql?.pool, 'database.postgresql.pool', [
+    'min',
+    'max',
+    'idleTimeout',
+  ]);
+  if (typeof config.database?.postgresql?.ssl === 'object') {
+    only(config.database.postgresql.ssl, 'database.postgresql.ssl', [
+      'rejectUnauthorized',
+      'ca',
+      'cert',
+      'key',
+    ]);
+  }
+  only(config.execution, 'execution', [
+    'executor_heartbeat',
+    'executor_unix_user',
+    'unix_user_mode',
+    'branch_rbac',
+    'allow_web_terminal',
+    'allow_superadmin',
+    'bootstrap_superadmin_users',
+    'session_token_expiration_ms',
+    'session_token_max_uses',
+    'mcp_token_expiration_ms',
+    'sync_unix_passwords',
+    'daemon_writes_user_message',
+    'permission_timeout_ms',
+    'stateless_fs_mode',
+    'executor_command_template',
+    'required_user_env_vars',
+    'managed_envs_minimum_role',
+    'managed_envs_execution_mode',
+    'branch_storage',
+  ]);
+  only(config.execution?.executor_heartbeat, 'execution.executor_heartbeat', [
+    'enabled',
+    'interval_ms',
+    'stale_after_ms',
+    'callback',
+  ]);
+  only(config.execution?.executor_heartbeat?.callback, 'execution.executor_heartbeat.callback', [
+    'command_template',
+    'timeout_ms',
+  ]);
+  only(config.execution?.branch_storage, 'execution.branch_storage', [
+    'default_mode',
+    'allowed_modes',
+  ]);
+  only(config.security, 'security', ['csp', 'cors', 'git_config_parameters']);
+  only(config.security?.csp, 'security.csp', [
+    'extras',
+    'override',
+    'report_uri',
+    'report_only',
+    'disabled',
+  ]);
+  only(config.security?.cors, 'security.cors', [
+    'mode',
+    'origins',
+    'credentials',
+    'methods',
+    'allowed_headers',
+    'max_age_seconds',
+    'allow_sandpack',
+  ]);
+  only(config.security?.git_config_parameters, 'security.git_config_parameters', [
+    'extras',
+    'override',
+  ]);
+  only(config.branches, 'branches', ['others_can_default', 'others_fs_access_default']);
+  only(config.teammates, 'teammates', ['framework_repo_url']);
+  only(config.paths, 'paths', ['data_home']);
+  only(config.analytics, 'analytics', ['enabled', 'client', 'filters', 'plugins']);
+  only(config.analytics?.client, 'analytics.client', ['app', 'version', 'debug']);
+  only(config.analytics?.filters, 'analytics.filters', ['exclude_events']);
+  for (const [index, plugin] of (config.analytics?.plugins ?? []).entries()) {
+    only(plugin, `analytics.plugins[${index}]`, ['type', 'enabled', 'options']);
+    const optionKeys =
+      plugin.type === 'stdout'
+        ? ['pretty']
+        : plugin.type === 'http_batch'
+          ? ['url', 'flush_interval_ms', 'max_batch_size', 'timeout_ms', 'headers']
+          : ['module_path', 'export_name', 'plugin_options'];
+    only(plugin.options, `analytics.plugins[${index}].options`, optionKeys);
+  }
+  only(config.telemetry, 'telemetry', [
+    'enabled',
+    'instance_id',
+    'endpoint',
+    'write_key',
+    'debug',
+    'timeout_ms',
+    'flush_interval_ms',
+    'max_batch_size',
+    'install_ping_sent_at',
+    'last_daemon_active_day',
+    'last_usage_summary_day',
+    'last_reported_version',
+  ]);
+  only(legacyConfig.onboarding, 'onboarding', [
+    ...RETIRED_CONFIG_KEYS.onboarding,
+    'frameworkRepoUrl',
+  ]);
+  only(config.knowledge, 'knowledge', ['semantic_search']);
+  only(config.knowledge?.semantic_search, 'knowledge.semantic_search', [
+    'enabled',
+    'provider',
+    'model',
+    'dimensions',
+    'chunking',
+    'indexing',
+  ]);
+  only(config.knowledge?.semantic_search?.chunking, 'knowledge.semantic_search.chunking', [
+    'target_tokens',
+    'max_tokens',
+    'overlap_tokens',
+    'min_tokens',
+  ]);
+  only(config.knowledge?.semantic_search?.indexing, 'knowledge.semantic_search.indexing', [
+    'paused',
+    'batch_size',
+    'concurrency',
+  ]);
+  only(config.multi_tenancy, 'multi_tenancy', [
+    'mode',
+    'static_tenant_id',
+    'auth_claim',
+    'trusted_header',
+  ]);
+  for (const [name, proxy] of Object.entries(config.proxies ?? {})) {
+    only(proxy, `proxies.${name}`, ['upstream', 'description', 'docs_url', 'allowed_methods']);
+  }
+  if (unknownPaths.length > 0) {
+    throw new Error(
+      `Config error: unrecognized ${unknownPaths.length === 1 ? 'key' : 'keys'}: ${unknownPaths.join(', ')}`
+    );
+  }
+
   // Check for deprecated 'opportunistic' unix_user_mode
   const mode = config.execution?.unix_user_mode;
   if (mode === ('opportunistic' as never)) {
@@ -197,6 +501,8 @@ function validateConfig(config: AgorConfig): void {
       `Config error: execution.managed_envs_execution_mode must be one of: hybrid, webhook-only`
     );
   }
+
+  assertValidMultiTenancyConfig(config);
 
   validateOptionalHttpUrl(
     config.external_launch as Record<string, unknown> | undefined,
@@ -338,14 +644,6 @@ export async function saveConfig(config: AgorConfig): Promise<void> {
  */
 export function getDefaultConfig(): AgorConfig {
   return {
-    defaults: {
-      board: 'main',
-      agent: 'claude-code',
-    },
-    display: {
-      tableStyle: 'unicode',
-      colorOutput: true,
-    },
     daemon: {
       port: DAEMON.DEFAULT_PORT,
       host: DAEMON.DEFAULT_HOST,
@@ -363,6 +661,11 @@ export function getDefaultConfig(): AgorConfig {
       executor_heartbeat: resolveExecutorHeartbeatConfig(),
     },
     analytics: getDefaultAnalyticsConfig(),
+    telemetry: {},
+    multi_tenancy: {
+      mode: 'static',
+      static_tenant_id: 'default',
+    },
   };
 }
 
@@ -399,24 +702,33 @@ export async function initConfig(): Promise<void> {
  *
  * Merges with default config to return effective values.
  *
- * @param key - Config key (e.g., "credentials.ANTHROPIC_API_KEY")
+ * @param key - Config key (e.g., "daemon.port")
  * @returns Value or undefined if not set
  */
 export async function getConfigValue(key: string): Promise<string | boolean | number | undefined> {
   const config = await loadConfig();
   const defaults = getDefaultConfig();
+  const {
+    defaults: _retiredDefaults,
+    display: _retiredDisplay,
+    onboarding: _retiredOnboarding,
+    ...activeConfig
+  } = config as AgorConfig & {
+    defaults?: unknown;
+    display?: unknown;
+    onboarding?: unknown;
+  };
 
   // Merge config with defaults (deep merge for sections)
   const merged = {
     ...defaults,
-    ...config,
-    defaults: { ...defaults.defaults, ...config.defaults },
-    display: { ...defaults.display, ...config.display },
+    ...activeConfig,
     daemon: { ...defaults.daemon, ...config.daemon },
     ui: { ...defaults.ui, ...config.ui },
     execution: { ...defaults.execution, ...config.execution },
     paths: { ...defaults.paths, ...config.paths },
     analytics: { ...defaults.analytics, ...config.analytics },
+    telemetry: { ...defaults.telemetry, ...config.telemetry },
   };
 
   const parts = key.split('.');
@@ -436,10 +748,18 @@ export async function getConfigValue(key: string): Promise<string | boolean | nu
 /**
  * Set a nested config value using dot notation
  *
- * @param key - Config key (e.g., "credentials.ANTHROPIC_API_KEY")
+ * @param key - Config key (e.g., "daemon.port")
  * @param value - Value to set
  */
 export async function setConfigValue(key: string, value: string | boolean | number): Promise<void> {
+  if (key === 'onboarding.frameworkRepoUrl') {
+    throw new Error(
+      'Configuration key onboarding.frameworkRepoUrl is deprecated; set teammates.framework_repo_url instead'
+    );
+  }
+  if (RETIRED_CONFIG_PATHS.has(key)) {
+    throw new Error(`Configuration key ${key} has been retired and no longer has any effect`);
+  }
   const config = await loadConfig();
   const parts = key.split('.');
 
@@ -450,7 +770,7 @@ export async function setConfigValue(key: string, value: string | boolean | numb
     );
   }
 
-  // Nested key (e.g., "credentials.ANTHROPIC_API_KEY")
+  // Nested key (e.g., "daemon.port")
   const section = parts[0];
 
   if (!(config as UnknownJson)[section]) {
@@ -562,7 +882,12 @@ export async function getBaseUrl(): Promise<string> {
     return validateBaseUrl(config.daemon.base_url);
   }
 
-  // 3. Default: construct from daemon port (no validation needed for default)
+  // 3. Backward-compatible UI public URL used by older configs.
+  if (config.ui?.base_url) {
+    return validateBaseUrl(config.ui.base_url);
+  }
+
+  // 4. Default: construct from daemon port (no validation needed for default)
   const defaults = getDefaultConfig();
   const envPort = process.env.PORT ? Number.parseInt(process.env.PORT, 10) : undefined;
   const port = envPort || config.daemon?.port || defaults.daemon?.port || DAEMON.DEFAULT_PORT;
@@ -617,9 +942,14 @@ export async function requirePublicBaseUrl(): Promise<string> {
     return validateBaseUrl(config.daemon.base_url);
   }
 
+  if (config.ui?.base_url) {
+    return validateBaseUrl(config.ui.base_url);
+  }
+
   throw new PublicBaseUrlNotConfiguredError(
     'No public base URL configured. Set the AGOR_BASE_URL environment variable ' +
-      "or `daemon.base_url` in ~/.agor/config.yaml to the daemon's " +
+      'or `daemon.base_url` (preferred) / `ui.base_url` (legacy) in ~/.agor/config.yaml ' +
+      "to the daemon's " +
       'browser-reachable URL (e.g. https://agor.example.com). This is required ' +
       'so OAuth providers can redirect users back to a URL their browser can reach — ' +
       'the localhost fallback only works for browsers on the daemon machine.'
@@ -682,54 +1012,6 @@ export function loadConfigSync(): AgorConfig {
 }
 
 /**
- * Credential keys that are valid in `config.yaml`'s `credentials` section
- * (i.e., keys that have a meaningful global / app-level value). User-only
- * tokens like `CLAUDE_CODE_OAUTH_TOKEN` (Pro/Max subscription) and
- * `COPILOT_GITHUB_TOKEN` are intentionally excluded — they don't make sense
- * as a global default.
- */
-export type ConfigCredentialKey =
-  | 'ANTHROPIC_API_KEY'
-  | 'ANTHROPIC_AUTH_TOKEN'
-  | 'ANTHROPIC_BASE_URL'
-  | 'OPENAI_API_KEY'
-  | 'GEMINI_API_KEY'
-  | 'CURSOR_API_KEY';
-
-const CONFIG_CREDENTIAL_KEYS: ReadonlySet<string> = new Set<ConfigCredentialKey>([
-  'ANTHROPIC_API_KEY',
-  'ANTHROPIC_AUTH_TOKEN',
-  'ANTHROPIC_BASE_URL',
-  'OPENAI_API_KEY',
-  'GEMINI_API_KEY',
-  'CURSOR_API_KEY',
-]);
-
-export function isConfigCredentialKey(key: string): key is ConfigCredentialKey {
-  return CONFIG_CREDENTIAL_KEYS.has(key);
-}
-
-/**
- * Get credential with precedence: config.yaml > process.env
- *
- * This implements the rule that UI-set credentials (in config.yaml) take precedence
- * over environment variables. This allows users to override env vars via Settings UI.
- *
- * @param key - Credential key from CredentialKey enum
- * @returns API key or undefined
- */
-export function getCredential(key: ConfigCredentialKey): string | undefined {
-  try {
-    const config = loadConfigSync();
-    // Precedence: config.yaml > process.env
-    return config.credentials?.[key] || process.env[key];
-  } catch {
-    // If config load fails, fall back to env var only
-    return process.env[key];
-  }
-}
-
-/**
  * Get the Unix user that the Agor daemon runs as
  *
  * Resolution order:
@@ -746,7 +1028,7 @@ export function getCredential(key: ConfigCredentialKey): string | undefined {
  * @example
  * ```ts
  * const daemonUser = getDaemonUser();
- * if (daemonUser && isBranchRbacEnabled()) {
+ * if (daemonUser && isUnixGroupRefreshNeeded()) {
  *   runAsUser('git status', { asUser: daemonUser });
  * }
  * ```
@@ -781,14 +1063,14 @@ export function requireDaemonUser(config: AgorConfig): string {
     return config.daemon.unix_user;
   }
 
-  // 2. Check if Unix isolation is enabled - if so, require explicit config
-  const unixIsolationEnabled =
-    config.execution?.branch_rbac === true ||
-    (config.execution?.unix_user_mode && config.execution.unix_user_mode !== 'simple');
+  // 2. Check if Unix impersonation/isolation is enabled - if so, require explicit config.
+  // Branch RBAC alone is logical app-level authorization and does not require
+  // Unix users/groups in Cloud simple mode.
+  const unixIsolationEnabled = resolveExecutionSecurityMode(config).requiresDaemonUnixUser;
 
   if (unixIsolationEnabled) {
     throw new Error(
-      'Unix isolation is enabled (branch_rbac or unix_user_mode) but daemon.unix_user is not configured.\n' +
+      'Unix isolation is enabled (execution.unix_user_mode is insulated or strict) but daemon.unix_user is not configured.\n' +
         'Please set daemon.unix_user in ~/.agor/config.yaml to the user running the daemon.\n' +
         'Example:\n' +
         '  daemon:\n' +
@@ -807,17 +1089,60 @@ export function requireDaemonUser(config: AgorConfig): string {
   return user;
 }
 
+export interface ResolvedExecutionSecurityMode {
+  /** App-layer branch ownership/visibility/action enforcement. */
+  appRbacEnabled: boolean;
+  /** Configured Unix execution mode with default applied. */
+  unixUserMode: import('./types').UnixUserMode;
+  /** Whether executors/terminals may run as non-daemon OS users. */
+  unixImpersonationEnabled: boolean;
+  /** Whether branch filesystem permissions/groups should be materialized. */
+  unixFsIsolationEnabled: boolean;
+  /** Whether git/executor spawns need fresh supplemental Unix groups. */
+  unixGroupRefreshNeeded: boolean;
+  /** Whether daemon.unix_user must be explicitly configured. */
+  requiresDaemonUnixUser: boolean;
+  /** Whether new repos/branches should initialize Unix groups. */
+  shouldInitUnixGroups: boolean;
+}
+
 /**
- * Check if branch RBAC is enabled
+ * Resolve the execution security posture from config.
  *
- * When RBAC is enabled, git operations need to run via sudo to get fresh group memberships.
+ * Keep this as the single semantic boundary between app-layer RBAC and
+ * OS/filesystem isolation:
+ * - `branch_rbac` controls Agor app permissions only.
+ * - non-`simple` `unix_user_mode` controls Unix impersonation/groups/FS ACLs.
+ */
+export function resolveExecutionSecurityMode(
+  config: AgorConfig = loadConfigSync()
+): ResolvedExecutionSecurityMode {
+  const unixUserMode = config.execution?.unix_user_mode ?? 'simple';
+  const unixIsolationEnabled = unixUserMode !== 'simple';
+
+  return {
+    appRbacEnabled: config.execution?.branch_rbac === true,
+    unixUserMode,
+    unixImpersonationEnabled: unixIsolationEnabled,
+    unixFsIsolationEnabled: unixIsolationEnabled,
+    unixGroupRefreshNeeded: unixIsolationEnabled,
+    requiresDaemonUnixUser: unixIsolationEnabled,
+    shouldInitUnixGroups: unixIsolationEnabled,
+  };
+}
+
+/**
+ * Check if logical branch RBAC is enabled.
+ *
+ * This controls app-level branch ownership/visibility. It does not necessarily
+ * imply Unix group/ACL setup; Cloud simple mode may enable branch RBAC while
+ * running all filesystem work as the daemon user.
  *
  * @returns true if branch_rbac is enabled in config
  */
 export function isBranchRbacEnabled(): boolean {
   try {
-    const config = loadConfigSync();
-    return config.execution?.branch_rbac === true;
+    return resolveExecutionSecurityMode().appRbacEnabled;
   } catch {
     return false;
   }
@@ -831,9 +1156,7 @@ export function isBranchRbacEnabled(): boolean {
  */
 export function isUnixImpersonationEnabled(): boolean {
   try {
-    const config = loadConfigSync();
-    const mode = config.execution?.unix_user_mode;
-    return mode !== undefined && mode !== 'simple';
+    return resolveExecutionSecurityMode().unixImpersonationEnabled;
   } catch {
     return false;
   }
@@ -896,20 +1219,13 @@ export function ensureBranchStorageModeAllowed(mode: import('./types').BranchSto
  * Whether the daemon needs to wrap git operations in `sudo -u` to pick up
  * supplemental Unix groups created after daemon startup.
  *
- * `sudo -u` is the only way to force a fresh `initgroups()` on a long-running
- * daemon process — without it, `agor_wt_*` groups added at runtime are
- * invisible and ACL-gated git operations fail with permission errors.
+ * Cloud simple mode can enable logical `branch_rbac` without Unix groups. Only
+ * non-simple Unix modes require group refresh / sudo wrapping.
  *
- * Why: Issue #1140 — in the open-access default (no RBAC, simple unix mode)
- * no supplemental groups are ever created, so wrapping in sudo is pure
- * overhead AND breaks for users who never configured passwordless sudoers.
- *
- * Returns true when:
- * - `branch_rbac` is enabled (RBAC creates `agor_wt_*` groups), OR
- * - `unix_user_mode` is `insulated` or `strict` (per-user impersonation)
+ * Returns true when `unix_user_mode` is `insulated` or `strict`.
  */
 export function isUnixGroupRefreshNeeded(): boolean {
-  return isBranchRbacEnabled() || isUnixImpersonationEnabled();
+  return resolveExecutionSecurityMode().unixGroupRefreshNeeded;
 }
 
 // =============================================================================

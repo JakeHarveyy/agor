@@ -20,6 +20,7 @@ import { CopilotClient } from '@github/copilot-sdk';
 import { getDaemonUrl } from '../../config.js';
 import type {
   BranchRepository,
+  MCPOAuthAuthHeadersRepository,
   MCPServerRepository,
   MessagesRepository,
   RepoRepository,
@@ -121,14 +122,15 @@ export class CopilotPromptService {
     private sessionsRepo: SessionRepository,
     private sessionMCPServerRepo?: SessionMCPServerRepository,
     private branchesRepo?: BranchRepository,
-    private reposRepo?: RepoRepository,
+    _reposRepo?: RepoRepository,
     apiKey?: string,
     private mcpServerRepo?: MCPServerRepository,
-    private usersRepo?: UsersRepository,
+    _usersRepo?: UsersRepository,
     permissionService?: PermissionService,
     messagesService?: MessagesService,
     tasksService?: TasksService,
-    sessionsService?: SessionsPatchClient
+    sessionsService?: SessionsPatchClient,
+    private mcpOAuthAuthHeadersRepo?: MCPOAuthAuthHeadersRepository
   ) {
     this.apiKey = apiKey;
     this.messagesRepo = messagesRepo;
@@ -154,6 +156,7 @@ export class CopilotPromptService {
     const serversWithSource = await getMcpServersForSession(sessionId, {
       sessionMCPRepo: this.sessionMCPServerRepo,
       mcpServerRepo: this.mcpServerRepo,
+      mcpOAuthAuthHeadersRepo: this.mcpOAuthAuthHeadersRepo,
     });
 
     const mcpServers = serversWithSource.map((s) => s.server);
@@ -205,15 +208,10 @@ export class CopilotPromptService {
   }
 
   /**
-   * Create Agor system prompt for Copilot session context
+   * Create static Agor system prompt for Copilot orientation
    */
-  private async buildSystemMessage(sessionId: SessionID): Promise<string> {
-    return renderAgorSystemPrompt(sessionId, {
-      sessions: this.sessionsRepo,
-      branches: this.branchesRepo,
-      repos: this.reposRepo,
-      users: this.usersRepo,
-    });
+  private async buildSystemMessage(_sessionId: SessionID): Promise<string> {
+    return renderAgorSystemPrompt();
   }
 
   /**
@@ -259,11 +257,7 @@ export class CopilotPromptService {
     // Create CopilotClient (spawns CLI process)
     this.client = new CopilotClient({
       useStdio: true,
-      githubToken:
-        this.apiKey ||
-        process.env.COPILOT_GITHUB_TOKEN ||
-        process.env.GH_TOKEN ||
-        process.env.GITHUB_TOKEN,
+      githubToken: this.apiKey || undefined,
       env: {
         HOME: process.env.HOME || '',
       },

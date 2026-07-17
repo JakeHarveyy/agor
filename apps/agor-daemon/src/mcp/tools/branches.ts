@@ -1,20 +1,34 @@
 import { existsSync } from 'node:fs';
-import { isBranchRbacEnabled } from '@agor/core/config';
+import { isBranchRbacEnabled, loadConfig } from '@agor/core/config';
 import { BranchRepository, shortId } from '@agor/core/db';
-import type { BoardID, Branch, BranchID, Repo, UUID, ZoneBoardObject } from '@agor/core/types';
-import { BRANCH_PERMISSION_LEVELS, getAssistantConfig, isAssistant } from '@agor/core/types';
+import type {
+  Board,
+  BoardID,
+  Branch,
+  BranchID,
+  Repo,
+  Session,
+  TeammateConfig,
+  UUID,
+  ZoneBoardObject,
+} from '@agor/core/types';
+import { BRANCH_PERMISSION_LEVELS, getTeammateConfig, isTeammate } from '@agor/core/types';
 import { computeZoneRelativePosition } from '@agor/core/utils/board-placement';
 import { normalizeOptionalHttpUrl } from '@agor/core/utils/url';
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
-import type { BranchesServiceImpl, ReposServiceImpl } from '../../declarations.js';
+import type {
+  BoardsServiceImpl,
+  BranchesServiceImpl,
+  ReposServiceImpl,
+} from '../../declarations.js';
 import type { BranchParams } from '../../services/branches.js';
+import { isSuperAdmin } from '../../utils/branch-authorization.js';
 import {
   resolveBoardId,
   resolveBranchId,
   resolveMcpServerId,
   resolveRepoId,
-  resolveSessionId,
 } from '../resolve-ids.js';
 import {
   mcpLimit,
@@ -27,6 +41,7 @@ import {
 } from '../schema.js';
 import type { McpContext } from '../server.js';
 import { coerceString, sessionContextRequiredResult, textResult } from '../server.js';
+import { runWithMcpTenantDatabaseScope } from '../tenant-scope.js';
 import { assertValidVariant } from './_environment-helpers.js';
 
 const BRANCH_NAME_PATTERN = /^[a-z0-9-]+$/;
@@ -49,12 +64,12 @@ const CLEANUP_CANDIDATE_FILESYSTEM_STATUSES = [
 ] as const satisfies readonly CleanupCandidateFilesystemStatus[];
 const CLEANUP_CANDIDATE_STORAGE_MODES = ['worktree', 'clone'] as const;
 
-function containsAssistantKnowledgeConfigMutation(customContext: unknown): boolean {
+function containsTeammateKnowledgeConfigMutation(customContext: unknown): boolean {
   if (!customContext || typeof customContext !== 'object' || Array.isArray(customContext)) {
     return false;
   }
   const record = customContext as Record<string, unknown>;
-  for (const key of ['assistant', 'agent']) {
+  for (const key of ['teammate', 'assistant', 'agent']) {
     const value = record[key];
     if (value && typeof value === 'object' && !Array.isArray(value)) {
       if (Object.hasOwn(value as Record<string, unknown>, 'kb')) return true;
@@ -100,6 +115,15 @@ function notesPreview(notes: string | undefined, maxLength = 200): string | null
   const singleLine = notes.replace(/\s+/g, ' ').trim();
   if (singleLine.length <= maxLength) return singleLine;
   return `${singleLine.slice(0, maxLength - 1)}…`;
+}
+
+async function shouldScopeTeammateDiscoveryToUser(ctx: McpContext): Promise<boolean> {
+  if (!isBranchRbacEnabled()) return false;
+  if (ctx.authenticatedUser?._isServiceAccount) return false;
+
+  const config = await loadConfig();
+  const allowSuperadmin = config.execution?.allow_superadmin === true;
+  return !isSuperAdmin(ctx.authenticatedUser?.role, allowSuperadmin);
 }
 
 async function findAllArchivedBranchesForCleanup(
@@ -222,7 +246,7 @@ export function registerBranchTools(server: McpServer, ctx: McpContext): void {
         'Safely inventory archived branch worktrees that may be candidates for disk cleanup. ' +
         'Read-only: never deletes or mutates anything. This tool ALWAYS restricts results to archived branches, ' +
         'defaults to branches archived more than 7 days ago, excludes filesystem_status="deleted", ' +
-        'and excludes assistant/private branches by default. It returns repo metadata, archive timestamps, ' +
+        'and excludes teammate/private branches by default. It returns repo metadata, archive timestamps, ' +
         'filesystem/storage status, path, and a path_exists boolean computed from the recorded branch path only.',
       annotations: { readOnlyHint: true },
       inputSchema: z.object({
@@ -251,10 +275,10 @@ export function registerBranchTools(server: McpServer, ctx: McpContext): void {
           .enum(CLEANUP_CANDIDATE_STORAGE_MODES)
           .optional()
           .describe('Filter by branch storage mode ("worktree" or "clone").'),
-        excludeAssistants: z
+        excludeTeammates: z
           .boolean()
           .optional()
-          .describe('Exclude long-lived assistant branches. Default: true.'),
+          .describe('Exclude long-lived teammate branches. Default: true.'),
         excludePrivate: z
           .boolean()
           .optional()
@@ -284,7 +308,7 @@ export function registerBranchTools(server: McpServer, ctx: McpContext): void {
             ? [args.filesystemStatus]
             : [...CLEANUP_CANDIDATE_DEFAULT_FILESYSTEM_STATUSES])
       );
-      const excludeAssistants = args.excludeAssistants ?? true;
+      const excludeTeammates = args.excludeTeammates ?? true;
       const excludePrivate = args.excludePrivate ?? true;
       const limit = args.limit ?? 50;
       const skip = args.skip ?? 0;
@@ -334,7 +358,7 @@ export function registerBranchTools(server: McpServer, ctx: McpContext): void {
           if (args.storageMode && (branch.storage_mode ?? 'worktree') !== args.storageMode) {
             return false;
           }
-          if (excludeAssistants && isAssistant(branch)) return false;
+          if (excludeTeammates && isTeammate(branch)) return false;
           if (excludePrivate && branch.others_can === 'none') return false;
           if (args.pathExists !== undefined && pathExists !== args.pathExists) return false;
           return true;
@@ -358,7 +382,7 @@ export function registerBranchTools(server: McpServer, ctx: McpContext): void {
         pull_request_url: branch.pull_request_url ?? null,
         issue_url: branch.issue_url ?? null,
         notes_preview: notesPreview(branch.notes),
-        is_assistant: isAssistant(branch),
+        is_teammate: isTeammate(branch),
         is_private: branch.others_can === 'none',
       }));
 
@@ -375,7 +399,7 @@ export function registerBranchTools(server: McpServer, ctx: McpContext): void {
           archived_older_than_days:
             cutoff.source === 'archivedOlderThanDays' ? cutoff.olderThanDays : null,
           filesystem_statuses: [...statuses],
-          exclude_assistants: excludeAssistants,
+          exclude_teammates: excludeTeammates,
           exclude_private: excludePrivate,
           path_exists_filter: args.pathExists ?? null,
         },
@@ -397,7 +421,15 @@ export function registerBranchTools(server: McpServer, ctx: McpContext): void {
         'To fork from an existing git branch under a unique name, set sourceBranch to the base git branch ' +
         'and branchName to your desired unique name (e.g., sourceBranch="issue-282", branchName="issue-282-review-1"). ' +
         'Use zoneId to place the branch in a specific zone (pin only, no trigger). ' +
-        'For zone trigger behavior (prompt templates), use agor_branches_set_zone after creation.',
+        'For zone trigger behavior (prompt templates), use agor_branches_set_zone after creation. ' +
+        'To create a long-lived Agor teammate (a persistent AI teammate that manages other branches ' +
+        'and maintains memory), pass the teammate object — this is the ONLY supported way to make a ' +
+        'teammate via MCP. Teammate status cannot be toggled later with agor_branches_update. ' +
+        'Agor follows a soft 1:1 teammate↔board convention: when creating a teammate, boardId is ' +
+        'optional — omit it (or pass createBoard=true) to spin up a dedicated board for the teammate ' +
+        'and wire it as that board primary teammate. If you pass a boardId that already has a ' +
+        'different primary teammate, the branch is still created but a warning is returned (the ' +
+        'convention is not hard-enforced).',
       inputSchema: z.object({
         repoId: mcpRequiredId(
           'repoId',
@@ -410,11 +442,20 @@ export function registerBranchTools(server: McpServer, ctx: McpContext): void {
             'If the name conflicts with an existing branch, a numeric suffix is auto-appended (e.g., "my-feature-2"). ' +
             'Set autoSuffix=false to get an error on conflict instead.'
         ),
-        boardId: mcpRequiredId(
+        boardId: mcpOptionalId(
           'boardId',
           'Board',
-          'Board ID to place the branch on (positions to default coordinates). Required to ensure branches are visible in the UI.'
+          'Board ID to place the branch on (positions to default coordinates). Required for normal branches to ensure they are visible in the UI. ' +
+            'Optional when the teammate object is provided: omit it (or pass createBoard=true) to auto-create a dedicated board for the teammate.'
         ),
+        createBoard: z
+          .boolean()
+          .optional()
+          .describe(
+            'Teammate branches only. When true, create a fresh board for this teammate and wire it as ' +
+              'the board primary teammate (soft 1:1 teammate↔board convention). Mutually exclusive with boardId. ' +
+              'For a teammate, omitting both boardId and createBoard also auto-creates a board.'
+          ),
         ref: mcpOptionalString(
           'ref',
           'Git ref name to create or checkout. Defaults to branchName when creating a new git branch. ' +
@@ -489,14 +530,54 @@ export function registerBranchTools(server: McpServer, ctx: McpContext): void {
             'Common shallow value: 100. Trade-off: smaller disk footprint, but ' +
             '`git log` past N commits is broken and some rebase operations fail.'
         ),
+        teammate: z
+          .object({
+            displayName: z
+              .string({ error: 'teammate.displayName must be a string.' })
+              .trim()
+              .min(1, 'teammate.displayName cannot be empty')
+              .describe('Human-friendly display name for the teammate (e.g., "Siebel CRM").'),
+            emoji: z.string().optional().describe('Emoji icon for this teammate (e.g., "🧑‍💻").'),
+            frameworkRepo: z
+              .string()
+              .optional()
+              .describe(
+                'Template/framework repo slug this teammate is based on. ' +
+                  "Defaults to the created branch's repo slug when omitted."
+              ),
+            frameworkVersion: z
+              .string()
+              .optional()
+              .describe('Framework version at creation time, for later upgrade detection.'),
+            createdViaOnboarding: z
+              .boolean()
+              .optional()
+              .describe(
+                'Whether this teammate was created via the onboarding wizard (defaults to false).'
+              ),
+          })
+          .optional()
+          .describe(
+            'When provided, create this branch as a long-lived Agor teammate. ' +
+              'The teammate metadata is written to custom_context.teammate on the initial branch row, ' +
+              'the board primary teammate pointer is wired automatically, and the teammate Knowledge ' +
+              'namespace is provisioned. Knowledge namespace/grant config (the "kb" field) is managed ' +
+              'separately and cannot be set here.'
+          ),
       }),
     },
     async (args) => {
       const repoId = await resolveRepoId(ctx, coerceString(args.repoId)!);
       let branchName = coerceString(args.branchName)!;
       const originalName = branchName;
-      const boardId = await resolveBoardId(ctx, coerceString(args.boardId)!);
-      if (!boardId) throw new Error('boardId is required');
+      const boardIdArg = coerceString(args.boardId);
+      // Resolve the board up front only when one was passed. For teammate
+      // branches the board is optional (we may auto-create one below), so the
+      // required-board check is deferred to the board-strategy block.
+      let boardId: BoardID | undefined = boardIdArg
+        ? await resolveBoardId(ctx, boardIdArg)
+        : undefined;
+      const createBoardArg = typeof args.createBoard === 'boolean' ? args.createBoard : undefined;
       const zoneId = coerceString(args.zoneId);
       const autoSuffix = typeof args.autoSuffix === 'boolean' ? args.autoSuffix : true;
 
@@ -516,11 +597,117 @@ export function registerBranchTools(server: McpServer, ctx: McpContext): void {
       const variant = coerceString(args.variant);
       if (variant) assertValidVariant(repo, variant);
 
+      // Optional: mark the new branch as a long-lived teammate in one shot.
+      // Writing the teammate config onto the initial branch row (rather than a
+      // follow-up patch) is what the UI does too — it lets BranchesService.create
+      // wire the board primary_teammate_id pointer and provision the teammate
+      // Knowledge namespace atomically, and sidesteps the assertTeammateKindIsStable
+      // guard that (deliberately) blocks flipping teammate status via patch.
+      const teammateInput = args.teammate as
+        | {
+            displayName?: unknown;
+            emoji?: unknown;
+            frameworkRepo?: unknown;
+            frameworkVersion?: unknown;
+            createdViaOnboarding?: unknown;
+          }
+        | undefined;
+      let teammateConfig: TeammateConfig | undefined;
+      if (teammateInput) {
+        const displayName = coerceString(teammateInput.displayName)?.trim();
+        if (!displayName) throw new Error('teammate.displayName is required');
+        const emoji = coerceString(teammateInput.emoji);
+        const frameworkRepo = coerceString(teammateInput.frameworkRepo) ?? repo.slug;
+        const frameworkVersion = coerceString(teammateInput.frameworkVersion);
+        teammateConfig = {
+          kind: 'teammate',
+          displayName,
+          ...(emoji ? { emoji } : {}),
+          ...(frameworkRepo ? { frameworkRepo } : {}),
+          ...(frameworkVersion ? { frameworkVersion } : {}),
+          createdViaOnboarding: teammateInput.createdViaOnboarding === true,
+        };
+      }
+
+      // Board strategy + soft 1:1 teammate<->board coupling.
+      //
+      // Convention (deliberately not hard-enforced): every teammate has a
+      // primary board and every board has a primary teammate. We reflect that
+      // on the tool surface without forcing it:
+      //   - teammate + no board  -> auto-create a dedicated board (becomes primary)
+      //   - teammate + createBoard=true -> same, explicit
+      //   - teammate + existing board that already has a *different* primary
+      //     teammate -> still create, but return a warning (do not block)
+      //   - normal branch -> boardId stays required (UI visibility invariant)
+      let createdBoard: Board | undefined;
+      let primaryTeammateWarning: string | undefined;
+
+      if (teammateConfig) {
+        if (boardId && createBoardArg === true) {
+          throw new Error(
+            'Pass either boardId (place the teammate on an existing board) or createBoard=true ' +
+              '(create a dedicated board), not both.'
+          );
+        }
+
+        if (!boardId) {
+          if (createBoardArg === false) {
+            throw new Error(
+              'boardId is required, or set createBoard=true (or omit createBoard) to auto-create ' +
+                'a dedicated board for this teammate.'
+            );
+          }
+
+          // No board given (or createBoard explicitly requested): spin up a
+          // dedicated board for this teammate. BranchesService.create then wires
+          // it as the board primary teammate via setPrimaryTeammateIfUnset.
+          const boardsService = ctx.app.service('boards') as unknown as BoardsServiceImpl;
+          createdBoard = (await boardsService.create(
+            {
+              name: teammateConfig.displayName,
+              created_by: ctx.userId,
+              ...(teammateConfig.emoji ? { icon: teammateConfig.emoji } : {}),
+            } as Partial<Board>,
+            ctx.baseServiceParams
+          )) as Board;
+          boardId = createdBoard.board_id;
+        } else {
+          // Existing board: honour the 1:1 convention softly. If the board
+          // already has a (different) primary teammate, warn — the new teammate
+          // will join the board but will NOT become its primary.
+          try {
+            const boardsService = ctx.app.service('boards') as unknown as BoardsServiceImpl;
+            const board = (await boardsService.get(boardId, ctx.baseServiceParams)) as Board;
+            if (board?.primary_teammate_id) {
+              primaryTeammateWarning =
+                `Board ${boardId} already has a primary teammate (${board.primary_teammate_id}). ` +
+                `Agor follows a soft 1:1 teammate↔board convention, so this teammate will be added ` +
+                `to the board but will NOT become its primary teammate. Omit boardId or pass ` +
+                `createBoard=true to give this teammate its own board.`;
+            }
+          } catch {
+            // resolveBoardId already validated the board exists; ignore any
+            // transient lookup failure here rather than block creation.
+          }
+        }
+      } else {
+        if (createBoardArg === true) {
+          throw new Error('createBoard is only supported when creating a teammate branch.');
+        }
+        if (!boardId) {
+          throw new Error('boardId is required');
+        }
+      }
+
+      // By here boardId is always resolved (passed, auto-created, or threw above).
+      if (!boardId) throw new Error('boardId is required');
+
       // Auto-suffix: resolve name conflicts by appending -2, -3, etc.
       // Uses direct DB query to bypass Feathers pagination limits
       if (autoSuffix) {
-        const branchRepo = new BranchRepository(ctx.db);
-        const activeNames = await branchRepo.getActiveNamesByRepo(repoId as UUID);
+        const activeNames = await runWithMcpTenantDatabaseScope(ctx, (db) =>
+          new BranchRepository(db).getActiveNamesByRepo(repoId as UUID)
+        );
         const existingNames = new Set(activeNames);
 
         if (existingNames.has(branchName)) {
@@ -585,6 +772,7 @@ export function registerBranchTools(server: McpServer, ctx: McpContext): void {
           ...(variant ? { environment_variant: variant } : {}),
           ...(storageMode ? { storage_mode: storageMode } : {}),
           ...(cloneDepth !== undefined ? { clone_depth: cloneDepth } : {}),
+          ...(teammateConfig ? { custom_context: { teammate: teammateConfig } } : {}),
         },
         ctx.baseServiceParams
       );
@@ -594,6 +782,35 @@ export function registerBranchTools(server: McpServer, ctx: McpContext): void {
 
       if (branchName !== originalName) {
         response._note = `Name '${originalName}' was already taken. Created as '${branchName}' instead (autoSuffix applied).`;
+      }
+
+      if (teammateConfig) {
+        // No warning => this teammate is the sole/first primary on its board
+        // (freshly auto-created board, or an existing board with no prior
+        // primary). A warning means the board already had a different primary.
+        const becamePrimary = !primaryTeammateWarning;
+        response._teammate = {
+          created: true,
+          display_name: teammateConfig.displayName,
+          primary_board_id: boardId,
+          is_board_primary_teammate: becamePrimary,
+          note: becamePrimary
+            ? 'Created as a long-lived Agor teammate and wired as the board primary teammate. The teammate Knowledge namespace was provisioned automatically.'
+            : 'Created as a long-lived Agor teammate. Its Knowledge namespace was provisioned, but the target board already had a primary teammate so this teammate is NOT the board primary.',
+        };
+
+        if (createdBoard) {
+          response._board = {
+            created: true,
+            board_id: createdBoard.board_id,
+            name: createdBoard.name,
+            note: 'A dedicated board was auto-created for this teammate (soft 1:1 teammate↔board convention).',
+          };
+        }
+
+        if (primaryTeammateWarning) {
+          response._warning = primaryTeammateWarning;
+        }
       }
 
       if (zoneId) {
@@ -612,7 +829,7 @@ export function registerBranchTools(server: McpServer, ctx: McpContext): void {
     'agor_branches_update',
     {
       description:
-        'Update metadata for an existing branch (issue/PR URLs, notes, board placement, custom context, RBAC permissions, owners)',
+        'Update metadata for an existing branch (issue/PR URLs, notes, board placement, attention state, custom context, RBAC permissions, owners)',
       annotations: { idempotentHint: true },
       inputSchema: z.object({
         branchId: mcpOptionalId(
@@ -649,7 +866,9 @@ export function registerBranchTools(server: McpServer, ctx: McpContext): void {
           .nullable()
           .optional()
           .describe(
-            'Custom context object for templates and automations. Pass null to clear existing context.'
+            'Custom context object for templates and automations. Pass null to clear existing context. ' +
+              'Note: this cannot toggle a branch between teammate and non-teammate status — that flip is ' +
+              'rejected. Create a teammate in one shot with the teammate param on agor_branches_create.'
           ),
         mcpServerIds: z
           .array(mcpRequiredId('mcpServerIds[]', 'MCP server', 'MCP server ID'))
@@ -657,6 +876,12 @@ export function registerBranchTools(server: McpServer, ctx: McpContext): void {
           .optional()
           .describe(
             'Default MCP server IDs for new sessions in this branch. Sessions inherit these unless they explicitly specify their own. Pass null to clear.'
+          ),
+        needsAttention: z
+          .boolean({ error: 'needsAttention must be a boolean when provided.' })
+          .optional()
+          .describe(
+            'Branch/card attention highlight state. Pass true to mark the branch as needing attention, or false to clear it.'
           ),
         // RBAC fields (optional, safe to ignore for single-user setups)
         othersCan: z
@@ -741,9 +966,9 @@ export function registerBranchTools(server: McpServer, ctx: McpContext): void {
         updates.board_id = boardIdStr ? await resolveBoardId(ctx, boardIdStr) : null;
       }
       if (args.customContext !== undefined) {
-        if (containsAssistantKnowledgeConfigMutation(args.customContext)) {
+        if (containsTeammateKnowledgeConfigMutation(args.customContext)) {
           throw new Error(
-            'Assistant Knowledge namespace configuration cannot be changed through MCP. Use the BranchModal Knowledge tab or API-only assistant Knowledge config endpoint.'
+            'Teammate Knowledge namespace configuration cannot be changed through MCP. Use the BranchModal Knowledge tab or API-only teammate Knowledge config endpoint.'
           );
         }
         fieldsProvided++;
@@ -755,6 +980,10 @@ export function registerBranchTools(server: McpServer, ctx: McpContext): void {
           args.mcpServerIds === null
             ? []
             : await Promise.all(args.mcpServerIds.map((id) => resolveMcpServerId(ctx, id)));
+      }
+      if (args.needsAttention !== undefined) {
+        fieldsProvided++;
+        updates.needs_attention = args.needsAttention;
       }
       if (args.othersCan !== undefined) {
         fieldsProvided++;
@@ -882,9 +1111,15 @@ export function registerBranchTools(server: McpServer, ctx: McpContext): void {
         );
       }
 
-      const targetSessionId = rawTargetSessionId
-        ? await resolveSessionId(ctx, rawTargetSessionId)
+      const targetSession = rawTargetSessionId
+        ? ((await ctx.app
+            .service('sessions')
+            .get(rawTargetSessionId, ctx.baseServiceParams)) as Pick<
+            Session,
+            'session_id' | 'branch_id' | 'description' | 'custom_context'
+          >)
         : undefined;
+      const targetSessionId = targetSession?.session_id;
 
       console.log(
         zoneId === null
@@ -894,6 +1129,16 @@ export function registerBranchTools(server: McpServer, ctx: McpContext): void {
 
       // Get branch to find its board
       const branch = await ctx.app.service('branches').get(branchId, ctx.baseServiceParams);
+
+      if (triggerTemplate && targetSession && targetSession.branch_id !== branch.branch_id) {
+        throw new Error(
+          `targetSessionId ${shortId(targetSession.session_id)} belongs to branch ${shortId(
+            targetSession.branch_id
+          )}, but agor_branches_set_zone is moving branch ${shortId(
+            branch.branch_id
+          )}. Use a session in the moved branch or create a branch-local session first.`
+        );
+      }
 
       // Find or create board object for this branch
       const boardObjectsService = ctx.app.service('board-objects') as unknown as {
@@ -1011,18 +1256,6 @@ export function registerBranchTools(server: McpServer, ctx: McpContext): void {
         // Pull the target session into the render context so templates can
         // reference `{{session.description}}` / `{{session.context.foo}}` —
         // matches what the UI's reuse-existing preview path does.
-        let targetSession:
-          | { description?: string; custom_context?: Record<string, unknown> }
-          | undefined;
-        try {
-          targetSession = await ctx.app
-            .service('sessions')
-            .get(targetSessionId, ctx.baseServiceParams);
-        } catch {
-          // Session lookup is best-effort; render context defaults are safe.
-          targetSession = undefined;
-        }
-
         const templateContext = buildZoneTriggerContext({
           branch,
           board,
@@ -1243,52 +1476,52 @@ export function registerBranchTools(server: McpServer, ctx: McpContext): void {
     }
   );
 
-  // Tool 9: agor_assistants_list
+  const listTeammatesHandler = async (args: { repoId?: string; limit?: number }) => {
+    const limit = args.limit || 200;
+    const repoId = args.repoId ? await resolveRepoId(ctx, args.repoId) : undefined;
+
+    const userScoped = await shouldScopeTeammateDiscoveryToUser(ctx);
+    const teammates = await runWithMcpTenantDatabaseScope(ctx, (db) =>
+      new BranchRepository(db).findTeammateBranches({
+        archived: false,
+        ...(repoId ? { repo_id: repoId as UUID } : {}),
+        ...(userScoped ? { userId: ctx.userId as UUID } : {}),
+        limit,
+      })
+    );
+
+    const shaped = teammates.map((w) => {
+      const config = getTeammateConfig(w);
+      return {
+        branch_id: w.branch_id,
+        name: w.name,
+        display_name: config?.displayName ?? w.name,
+        emoji: config?.emoji,
+        description: w.notes || null,
+        board_id: w.board_id || null,
+        repo_id: w.repo_id,
+        last_used: w.last_used,
+      };
+    });
+
+    return textResult({
+      total: shaped.length,
+      teammates: shaped,
+    });
+  };
+
+  // Tool 9: agor_teammates_list
   server.registerTool(
-    'agor_assistants_list',
+    'agor_teammates_list',
     {
       description:
-        "List all assistants (long-lived agents with schedules). Returns each assistant's name, description, schedule status, and last activity timestamp. Use this to discover other assistants on the platform.",
+        "List all teammates (long-lived AI teammates with schedules). Returns each teammate's name, description, schedule status, and last activity timestamp. Use this to discover other teammates on the platform.",
       annotations: { readOnlyHint: true },
       inputSchema: z.object({
-        repoId: mcpOptionalId('repoId', 'Repository', 'Filter assistants by repository ID'),
+        repoId: mcpOptionalId('repoId', 'Repository', 'Filter teammates by repository ID'),
         limit: mcpLimit(200),
       }),
     },
-    async (args) => {
-      const query: Record<string, unknown> = { archived: false, $limit: args.limit || 200 };
-      if (args.repoId) query.repo_id = await resolveRepoId(ctx, args.repoId);
-
-      const result = await ctx.app.service('branches').find({ query, ...ctx.baseServiceParams });
-
-      // Filter to assistants only and shape the response
-      const branches: Branch[] = Array.isArray(result)
-        ? result
-        : (result as { data: Branch[] }).data;
-      const assistants = branches.filter((w) => isAssistant(w));
-
-      // Per-branch schedule fields are now in the first-class `schedules`
-      // table; consumers should call `agor_schedules_list({branchId})`
-      // for that. This tool keeps the assistant-discovery shape lean and
-      // omits the (now-multiplexed) schedule summary.
-      const shaped = assistants.map((w) => {
-        const config = getAssistantConfig(w);
-        return {
-          branch_id: w.branch_id,
-          name: w.name,
-          display_name: config?.displayName ?? w.name,
-          emoji: config?.emoji,
-          description: w.notes || null,
-          board_id: w.board_id || null,
-          repo_id: w.repo_id,
-          last_used: w.last_used,
-        };
-      });
-
-      return textResult({
-        total: shaped.length,
-        assistants: shaped,
-      });
-    }
+    listTeammatesHandler
   );
 }

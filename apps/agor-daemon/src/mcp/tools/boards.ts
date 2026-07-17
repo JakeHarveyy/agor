@@ -8,6 +8,7 @@ import type {
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
 import type { BoardsServiceImpl } from '../../declarations.js';
+import { emitServiceEvent } from '../../utils/emit-service-event.js';
 import {
   mcpLimit,
   mcpOptionalNonNegativeInt,
@@ -18,6 +19,7 @@ import {
 } from '../schema.js';
 import type { McpContext } from '../server.js';
 import { coerceString, textResult } from '../server.js';
+import { runWithMcpTenantDatabaseScope } from '../tenant-scope.js';
 
 const BOARD_OBJECT_TYPES = [
   'zone',
@@ -218,13 +220,16 @@ export function registerBoardTools(server: McpServer, ctx: McpContext): void {
     'agor_boards_update',
     {
       description:
-        'Update board metadata and manage zones/objects. Can update name, icon, background, and create/update zones for organizing branches. Zone objects have: type="zone", x, y, width, height, label, borderColor, backgroundColor, borderStyle (optional), trigger (optional: "always_new" auto-creates sessions, "show_picker" shows agent selection). Text objects have: type="text", x, y, text, fontSize, color. Markdown objects have: type="markdown", x, y, width, height, content.',
+        'Update board metadata and manage zones/objects. Can update name, icon, background, and create/update zones for organizing branches. Unicode emoji is preferred for icons; common exact shortcodes like ":compass:" are accepted and normalized. Zone objects have: type="zone", x, y, width, height, label, borderColor, backgroundColor, borderStyle (optional), trigger (optional: "always_new" auto-creates sessions, "show_picker" shows agent selection). Text objects have: type="text", x, y, text, fontSize, color. Markdown objects have: type="markdown", x, y, width, height, content.',
       annotations: { idempotentHint: true },
       inputSchema: z.object({
         boardId: mcpRequiredId('boardId', 'Board'),
         name: mcpOptionalString('name', 'Board name (optional)'),
         description: mcpOptionalString('description', 'Board description (optional)'),
-        icon: mcpOptionalString('icon', 'Board icon/emoji (optional)'),
+        icon: mcpOptionalString(
+          'icon',
+          'Board icon/emoji (optional). Unicode emoji is preferred; common exact shortcodes like ":compass:" are accepted and normalized.'
+        ),
         color: mcpOptionalString('color', 'Board color (hex format, optional)'),
         backgroundColor: mcpOptionalString(
           'backgroundColor',
@@ -278,24 +283,35 @@ export function registerBoardTools(server: McpServer, ctx: McpContext): void {
         typeof args.upsertObjects === 'object' &&
         !Array.isArray(args.upsertObjects)
       ) {
-        const updatedBoard = await boardsService.batchUpsertBoardObjects(
-          boardId,
-          args.upsertObjects as unknown as unknown[],
-          ctx.baseServiceParams
+        const updatedBoard = await runWithMcpTenantDatabaseScope(ctx, () =>
+          boardsService.batchUpsertBoardObjects(
+            boardId,
+            args.upsertObjects as unknown as unknown[],
+            ctx.baseServiceParams
+          )
         );
-        ctx.app.service('boards').emit('patched', updatedBoard);
+        emitServiceEvent(ctx.app, {
+          path: 'boards',
+          event: 'patched',
+          data: updatedBoard,
+          id: boardId,
+        });
       }
 
       if (args.removeObjects && Array.isArray(args.removeObjects)) {
         let finalBoard: Board | undefined;
         for (const objectId of args.removeObjects) {
-          finalBoard = await boardsService.removeBoardObject(
-            boardId,
-            objectId,
-            ctx.baseServiceParams
+          finalBoard = await runWithMcpTenantDatabaseScope(ctx, () =>
+            boardsService.removeBoardObject(boardId, objectId, ctx.baseServiceParams)
           );
         }
-        if (finalBoard) ctx.app.service('boards').emit('patched', finalBoard);
+        if (finalBoard)
+          emitServiceEvent(ctx.app, {
+            path: 'boards',
+            event: 'patched',
+            data: finalBoard,
+            id: boardId,
+          });
       }
 
       const board = await ctx.app.service('boards').get(boardId, ctx.baseServiceParams);
@@ -315,7 +331,10 @@ export function registerBoardTools(server: McpServer, ctx: McpContext): void {
           'URL-friendly slug (optional, auto-derived from name if not provided)'
         ),
         description: mcpOptionalString('description', 'Board description (optional)'),
-        icon: mcpOptionalString('icon', 'Board icon/emoji (optional, e.g. "📋")'),
+        icon: mcpOptionalString(
+          'icon',
+          'Board icon/emoji (optional, e.g. "📋"). Unicode emoji is preferred; common exact shortcodes like ":compass:" are accepted and normalized.'
+        ),
         color: mcpOptionalString('color', 'Board color in hex format (optional)'),
         backgroundColor: mcpOptionalString(
           'backgroundColor',

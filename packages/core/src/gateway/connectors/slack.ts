@@ -12,9 +12,11 @@
  *     enable_channels?: boolean,                    // Listen in public channels
  *     enable_groups?: boolean,                      // Listen in private channels
  *     enable_mpim?: boolean,                        // Listen in group DMs
- *     require_mention?: boolean,                    // Require @mention in channels
- *     allow_thread_replies_without_mention?: boolean, // Allow thread replies without @mention (default: true)
- *     allowed_channel_ids?: string[]                // Channel ID whitelist
+ *     require_mention?: boolean,                    // Legacy; Slack channel-like prompts now always require @mention
+ *     allow_thread_replies_without_mention?: boolean, // Legacy; ignored for Slack channel-like prompts
+ *     allowed_channel_ids?: string[],               // Channel ID whitelist
+ *     ingest_files?: boolean,                       // Forward message attachments (requires files:read)
+ *     agent_tools?: SlackAgentToolsConfig           // Agent-callable MCP tool toggles (gated in the daemon tool layer)
  *   }
  *
  * Thread ID format: "{channel_id}-{thread_ts}"
@@ -26,8 +28,14 @@ import type { KnownBlock, RawTextElement, SectionBlock, TableBlock } from '@slac
 import { WebClient } from '@slack/web-api';
 import { slackifyMarkdown } from 'slackify-markdown';
 
-import type { ChannelType } from '../../types/gateway';
-import type { GatewayConnector, InboundMessage, OutboundPayload } from '../connector';
+import type {
+  ChannelType,
+  SlackAgentToolsConfig,
+  SlackAppInfo,
+  SlackTestFailure,
+  SlackTestResult,
+} from '../../types/gateway';
+import type { GatewayConnector, InboundFile, InboundMessage, OutboundPayload } from '../connector';
 
 // Block Kit table block limits (Slack docs, native block introduced Aug 2025).
 const TABLE_MAX_ROWS = 100;
@@ -37,6 +45,8 @@ const TABLE_MAX_COLS = 20;
 // either path. Beyond this we drop to monospace, then text-only.
 const TABLE_MAX_CELL_CHARS = 3000;
 const SECTION_MAX_CHARS = 3000;
+// Slack's native markdown block currently caps cumulative markdown text at 12k chars.
+const MARKDOWN_BLOCK_MAX_CHARS = 12000;
 // Slack rejects messages with more than one `table` block.
 const MAX_TABLES_PER_MESSAGE = 1;
 // Slack rejects `chat.postMessage` with more than 50 blocks; if we'd exceed
@@ -47,7 +57,10 @@ const MAX_BLOCKS_PER_MESSAGE = 50;
 const BLOCK_PAYLOAD_ERRORS = new Set([
   'invalid_blocks',
   'invalid_blocks_format',
+  'invalid_block_type',
   'message_blocks_too_long',
+  'unknown_block_type',
+  'unsupported_block_type',
 ]);
 
 // GFM scanner regexes — hoisted so both `segmentMarkdown` and helpers share
@@ -56,6 +69,11 @@ const FENCE_LINE_RE = /^(`{3,}|~{3,})/;
 const PIPE_LINE_RE = /^\s*\|/;
 const TABLE_SEPARATOR_LINE_RE = /^\s*\|[\s:]*-[\s:-]*\|/;
 const TABLE_SEPARATOR_BLOCK_RE = /^\|[\s:]*-[\s:-]*\|/m;
+
+interface SlackMarkdownBlock {
+  type: 'markdown';
+  text: string;
+}
 
 interface SlackConfig {
   bot_token: string;
@@ -72,6 +90,90 @@ interface SlackConfig {
 
   // User alignment: resolve Slack user email → Agor user
   align_slack_users?: boolean;
+
+  // Ingest files attached to inbound messages (requires files:read scope)
+  ingest_files?: boolean;
+
+  // Agent-callable MCP tool toggles (gated in the daemon tool layer)
+  agent_tools?: SlackAgentToolsConfig;
+}
+
+export interface SlackUserAvatarProfile {
+  slackUserId: string;
+  email: string | null;
+  displayName: string | null;
+  avatarUrl: string | null;
+}
+
+/**
+ * Agent-facing metadata for a file attached to a Slack history message.
+ * Deliberately excludes `url_private_download` (and every other Slack file
+ * URL): agents reference a file by `id` and fetch it on demand through the
+ * capability-gated download tool, so bot-token-authenticated URLs never
+ * appear in agent-visible output.
+ */
+export interface SlackHistoryFile {
+  id: string;
+  name: string;
+  mimetype: string;
+  size: number;
+}
+
+/**
+ * Result of {@link SlackConnector.getFileInfo}. Server-side only: `file`
+ * carries the bot-token-authenticated download URL, and
+ * `sourceConversationIds` (the conversations the file is shared into) exists
+ * solely for the gateway's whitelist check — neither may reach agent output.
+ */
+export interface SlackFileInfo {
+  file: InboundFile;
+  sourceConversationIds: string[];
+}
+
+export interface SlackThreadHistoryMessage {
+  ts: string;
+  iso_time: string;
+  user_id?: string;
+  user_name?: string;
+  actor_label: string;
+  text: string;
+  is_bot: boolean;
+  is_trigger: boolean;
+  is_mention: boolean;
+  files?: SlackHistoryFile[];
+}
+
+export interface SlackThreadHistoryRequest {
+  threadId: string;
+  oldestTs?: string;
+  latestTs?: string;
+  inclusive?: boolean;
+  limit?: number;
+  includeBotMessages?: boolean;
+  triggerTs?: string;
+}
+
+export interface SlackThreadHistoryResult {
+  threadId: string;
+  channel: string;
+  thread_ts: string;
+  messages: SlackThreadHistoryMessage[];
+  has_more?: boolean;
+}
+
+export interface SlackChannelHistoryRequest {
+  channelId: string;
+  oldestTs?: string;
+  latestTs?: string;
+  inclusive?: boolean;
+  limit?: number;
+  includeBotMessages?: boolean;
+}
+
+export interface SlackChannelHistoryResult {
+  channel: string;
+  messages: SlackThreadHistoryMessage[];
+  has_more?: boolean;
 }
 
 /**
@@ -117,6 +219,12 @@ function hasActiveMention(text: string, mentionPattern: RegExp): boolean {
   // Reset lastIndex in case the pattern has global/sticky flags (defensive)
   mentionPattern.lastIndex = 0;
   return mentionPattern.test(stripped);
+}
+
+function slackTsToIso(ts: string): string {
+  const seconds = Number(ts.split('.')[0]);
+  if (!Number.isFinite(seconds)) return new Date().toISOString();
+  return new Date(seconds * 1000).toISOString();
 }
 
 interface Segment {
@@ -368,10 +476,32 @@ function monospaceFallbackBlock(tableLines: string[]): SectionBlock | null {
   };
 }
 
+function buildMarkdownBlock(markdown: string): SlackMarkdownBlock | null {
+  const trimmed = markdown.trim();
+  if (trimmed.length === 0 || trimmed.length > MARKDOWN_BLOCK_MAX_CHARS) return null;
+  return { type: 'markdown', text: markdown };
+}
+
+function tableHasRichMarkdown(tableLines: string[]): boolean {
+  return tableLines.some((line) =>
+    /(\*\*|__|~~|`|\[[^\]]+\]\([^)]*\)|<br\s*\/?\s*>|_[^_|]+_|(^|\|)\s*[-*+]\s+)/i.test(line)
+  );
+}
+
+function shouldUseNativeMarkdownBlock(markdown: string, segments: Segment[]): boolean {
+  if (!buildMarkdownBlock(markdown)) return false;
+
+  const tableSegments = segments.filter((segment) => segment.kind === 'table');
+  if (tableSegments.length > 1) return true;
+  return tableSegments.some((segment) => tableHasRichMarkdown(segment.lines));
+}
+
 /**
  * Build a Slack outbound payload from GitHub-flavored markdown.
  *
- * If the message contains GFM tables, emits a `blocks` array that uses
+ * If the message contains rich or multiple GFM tables and fits Slack's native
+ * markdown block budget, emits a `markdown` block so Slack can preserve richer
+ * table Markdown. Otherwise emits a `blocks` array that uses
  * Block Kit's native `table` block (Aug 2025) for the first qualifying
  * table and falls back to a monospace code block for any table that
  * exceeds Slack's caps (>{@link TABLE_MAX_ROWS} rows, >{@link TABLE_MAX_COLS}
@@ -391,8 +521,16 @@ export function markdownToSlackPayload(markdown: string): OutboundPayload {
   const text = markdownToMrkdwn(markdown);
 
   const segments = segmentMarkdown(markdown);
-  if (!segments.some((s) => s.kind === 'table')) {
+  const hasTable = segments.some((s) => s.kind === 'table');
+  if (!hasTable) {
     return { text };
+  }
+
+  if (shouldUseNativeMarkdownBlock(markdown, segments)) {
+    const markdownBlock = buildMarkdownBlock(markdown);
+    if (markdownBlock) {
+      return { text, blocks: [markdownBlock] };
+    }
   }
 
   const blocks: KnownBlock[] = [];
@@ -439,6 +577,217 @@ function extractSlackErrorCode(resultOrError: unknown): string | undefined {
   return candidate.data?.error ?? candidate.error;
 }
 
+interface SlackErrorDetail {
+  code?: string;
+  needed?: string;
+  provided?: string;
+  retryAfter?: number;
+}
+
+/**
+ * Normalize either a non-OK Slack response (`{ error, needed, provided }`) or a
+ * thrown Slack SDK error (`WebAPIPlatformError` / `WebAPIRateLimitedError`) into
+ * the fields the connection probe reports. `needed`/`provided` carry the
+ * verbatim `missing_scope` detail; `retryAfter` is set for rate-limit errors.
+ */
+function extractSlackErrorDetail(resultOrError: unknown): SlackErrorDetail {
+  if (typeof resultOrError !== 'object' || resultOrError === null) return {};
+  const candidate = resultOrError as {
+    error?: string;
+    needed?: string;
+    provided?: string;
+    code?: string;
+    retryAfter?: number;
+    data?: { error?: string; needed?: string; provided?: string };
+  };
+  return {
+    code: candidate.data?.error ?? candidate.error ?? candidate.code,
+    needed: candidate.data?.needed ?? candidate.needed,
+    provided: candidate.data?.provided ?? candidate.provided,
+    retryAfter: candidate.retryAfter,
+  };
+}
+
+/** Human-readable reasons for the bot-token (`auth.test`) probe failure codes. */
+const BOT_TOKEN_ERROR_REASONS: Record<string, string> = {
+  invalid_auth: 'The bot token is invalid.',
+  account_inactive: 'The bot token belongs to a deleted or deactivated account or workspace.',
+  token_revoked: 'The bot token has been revoked.',
+  token_expired: 'The bot token has expired.',
+  not_authed: 'No bot token was provided.',
+  no_permission: 'The bot token lacks permission to call auth.test.',
+};
+
+/** Human-readable reasons for the channel-access (`conversations.info`) probe failure codes. */
+const CHANNEL_ACCESS_ERROR_REASONS: Record<string, string> = {
+  not_in_channel: 'The bot is not a member of this channel; invite it so it can read messages.',
+  channel_not_found: 'The channel ID was not found, or the bot cannot see it.',
+  is_archived: 'The channel is archived.',
+};
+
+/**
+ * Build a {@link SlackTestFailure} from an error detail, surfacing Slack's
+ * verbatim `missing_scope` needed/provided and rate-limit `Retry-After` rather
+ * than collapsing them into a generic message.
+ */
+function buildTestFailure(
+  capability: string,
+  detail: SlackErrorDetail,
+  reasons: Record<string, string>
+): SlackTestFailure {
+  const { code, needed, provided, retryAfter } = detail;
+  let reason: string;
+  if (code === 'missing_scope') {
+    reason = needed
+      ? `Slack reports a missing OAuth scope; add "${needed}".`
+      : 'Slack reports a missing OAuth scope.';
+  } else if (code === 'ratelimited' || retryAfter != null) {
+    reason =
+      retryAfter != null
+        ? `Slack rate-limited the probe; retry after ${retryAfter}s. The probe did not retry.`
+        : 'Slack rate-limited the probe. The probe did not retry.';
+  } else if (code && reasons[code]) {
+    reason = reasons[code];
+  } else if (code) {
+    reason = `Slack returned error "${code}".`;
+  } else {
+    reason = 'A network or unexpected error occurred while contacting Slack.';
+  }
+
+  const failure: SlackTestFailure = { capability, reason };
+  if (code) failure.slackError = code;
+  if (needed) failure.needed = needed;
+  if (provided) failure.provided = provided;
+  return failure;
+}
+
+/**
+ * Normalize an `allowed_channel_ids` config value (which may be a string,
+ * array, or malformed) into a clean `string[]`.
+ */
+function normalizeAllowedChannelIds(raw: unknown): string[] {
+  if (Array.isArray(raw)) return raw.filter((id): id is string => typeof id === 'string');
+  if (typeof raw === 'string' && raw) return [raw];
+  return [];
+}
+
+/**
+ * The things a connection probe fundamentally cannot prove. Surfaced verbatim
+ * in {@link SlackTestResult.notVerifiable} so a green result is never read as
+ * "fully verified".
+ */
+const SLACK_NOT_VERIFIABLE = [
+  'Whether the bot token and app-level token belong to the same Slack app.',
+  'Whether the required Slack event subscriptions are installed and delivering events.',
+  'Whether the full set of required OAuth scopes is granted — only scopes exercised by the probed API calls are checked.',
+];
+
+/**
+ * Decide whether the `allowed_channel_ids` whitelist permits an inbound event.
+ *
+ * DMs (`im`) always pass: a DM conversation id is never present in a
+ * channel-id whitelist, so applying the filter there would silently disable
+ * direct messages the moment any whitelist is configured. The whitelist only
+ * governs channel-like surfaces (`channel`/`group`/`mpim`).
+ */
+/**
+ * Normalize a Slack event's `files` array into provider-neutral
+ * {@link InboundFile} entries, dropping malformed items. Slack file objects
+ * carry many more fields; only the ones the gateway needs survive — notably
+ * `url_private_download`, which requires the bot token to fetch.
+ */
+export function extractSlackInboundFiles(raw: unknown): InboundFile[] {
+  if (!Array.isArray(raw)) return [];
+  const files: InboundFile[] = [];
+  for (const item of raw) {
+    if (typeof item !== 'object' || item === null) continue;
+    const candidate = item as Record<string, unknown>;
+    if (
+      typeof candidate.id === 'string' &&
+      typeof candidate.name === 'string' &&
+      typeof candidate.mimetype === 'string' &&
+      typeof candidate.size === 'number' &&
+      typeof candidate.url_private_download === 'string'
+    ) {
+      files.push({
+        id: candidate.id,
+        name: candidate.name,
+        mimetype: candidate.mimetype,
+        size: candidate.size,
+        url_private_download: candidate.url_private_download,
+      });
+    }
+  }
+  return files;
+}
+
+export function isChannelAllowedByWhitelist(
+  channelType: string,
+  channelId: string | undefined,
+  allowedChannelIds: string[] | undefined
+): boolean {
+  if (channelType === 'im') return true;
+  if (!allowedChannelIds || allowedChannelIds.length === 0) return true;
+  return !!channelId && allowedChannelIds.includes(channelId);
+}
+
+/**
+ * Whether a Slack conversation ID is a direct message (IM).
+ *
+ * DM conversation IDs reliably start with "D" — unlike the "C" prefix (which
+ * is ambiguous between public and private channels, see the prefix-inference
+ * notes in {@link SlackConnector.startListening}), "D" is never used for a
+ * channel-like surface, so this is safe to use without an API round trip.
+ */
+export function isSlackDirectMessageId(channelId: string): boolean {
+  return channelId.startsWith('D');
+}
+
+/**
+ * Whether an agent-callable Slack WRITE tool (reactions, file upload) may
+ * target `channelId` given this gateway channel's `allowed_channel_ids`
+ * config.
+ *
+ * Mirrors the inbound listening whitelist ({@link isChannelAllowedByWhitelist}):
+ * `allowed_channel_ids` is a channel-like-surface concept, so DMs are always
+ * allowed regardless of the configured whitelist. These write tools default
+ * to the calling session's own conversation (via `gateway_source`), which is
+ * frequently a DM — applying the whitelist there would silently block the
+ * agent from reacting to/uploading into the very conversation that summoned
+ * it, the primary use case.
+ */
+export function isSlackWriteTargetAllowed(
+  config: Record<string, unknown>,
+  channelId: string
+): boolean {
+  const allowedChannelIds = normalizeAllowedChannelIds(config.allowed_channel_ids);
+  const channelType = isSlackDirectMessageId(channelId) ? 'im' : 'channel';
+  return isChannelAllowedByWhitelist(channelType, channelId, allowedChannelIds);
+}
+
+/**
+ * Whether a Slack file may be downloaded through this gateway channel, given
+ * the conversations the file is shared into and the channel's
+ * `allowed_channel_ids` config.
+ *
+ * `files.info` resolves ANY file the bot can see workspace-wide, so without
+ * this check a file id (from a permalink or prompt injection) would bypass the
+ * whitelist that bounds every other gateway tool. Policy mirrors
+ * {@link isSlackWriteTargetAllowed} per source conversation — DMs are always
+ * exempt, an empty/absent whitelist allows everything — and requires at least
+ * one source conversation to pass. A file with no visible source conversations
+ * is only allowed when no whitelist is configured, so the whitelist fails
+ * closed rather than open.
+ */
+export function isSlackFileSourceAllowed(
+  config: Record<string, unknown>,
+  sourceConversationIds: string[]
+): boolean {
+  const allowedChannelIds = normalizeAllowedChannelIds(config.allowed_channel_ids);
+  if (allowedChannelIds.length === 0) return true;
+  return sourceConversationIds.some((id) => isSlackWriteTargetAllowed(config, id));
+}
+
 export class SlackConnector implements GatewayConnector {
   readonly channelType: ChannelType = 'slack';
 
@@ -452,11 +801,13 @@ export class SlackConnector implements GatewayConnector {
     string,
     { email: string | null; displayName: string | null; expiresAt: number }
   >();
+  private inboundEventDedup = new Map<string, number>();
 
   /** Cache: Slack channel ID → channel name */
   private channelNameCache = new Map<string, { name: string | null; expiresAt: number }>();
   private static USER_CACHE_TTL_MS = 15 * 60 * 1000; // 15 min for successful lookups
   private static USER_CACHE_ERROR_TTL_MS = 60 * 1000; // 1 min for errors (transient recovery)
+  private static INBOUND_EVENT_DEDUP_TTL_MS = 5 * 60 * 1000; // Slack may send message + app_mention for one user action
 
   /**
    * Cache: Slack channel ID → channel type string (channel/group/mpim/im).
@@ -483,6 +834,153 @@ export class SlackConnector implements GatewayConnector {
     // Initialization - tokens validated during startListening
 
     this.web = new WebClient(this.config.bot_token);
+  }
+
+  /**
+   * Build a Slack WebClient for an arbitrary token. Isolated so connection
+   * probes can construct a client for the app-level (`xapp-`) token, and so
+   * tests can stub the app-token client independently of `this.web`.
+   */
+  protected createWebClient(token: string): WebClient {
+    return new WebClient(token);
+  }
+
+  /**
+   * Best-effort probe of the configured Slack credentials and reachability.
+   *
+   * Probes capabilities directly rather than diffing scope-header strings:
+   *   - `auth.test()` with the bot token → team + bot identity.
+   *   - `apps.connections.open()` with the app-level token → Socket Mode /
+   *     `connections:write` validity.
+   *   - `conversations.info` on the first whitelisted channel (when any) →
+   *     channel reachability.
+   *
+   * Slack's `missing_scope` needed/provided detail and rate-limit `Retry-After`
+   * are surfaced verbatim. Never logs or returns token values.
+   */
+  async testConnection(): Promise<SlackTestResult> {
+    const failures: SlackTestFailure[] = [];
+    const notVerifiable = [...SLACK_NOT_VERIFIABLE];
+
+    let team: SlackTestResult['team'];
+    let bot: SlackTestResult['bot'];
+    let botTokenValid = false;
+
+    try {
+      const authTest = await this.web.auth.test();
+      if (authTest.ok) {
+        botTokenValid = true;
+        team = { id: authTest.team_id ?? '', name: authTest.team ?? '' };
+        bot = { userId: authTest.user_id ?? '', name: authTest.user ?? '' };
+      } else {
+        failures.push(
+          buildTestFailure('bot_token', extractSlackErrorDetail(authTest), BOT_TOKEN_ERROR_REASONS)
+        );
+      }
+    } catch (error) {
+      failures.push(
+        buildTestFailure('bot_token', extractSlackErrorDetail(error), BOT_TOKEN_ERROR_REASONS)
+      );
+    }
+
+    let appTokenValid: boolean;
+    const appToken = this.config.app_token;
+    if (!appToken) {
+      appTokenValid = false;
+      failures.push({
+        capability: 'app_token',
+        reason: 'No app-level token is configured; Socket Mode cannot connect to receive messages.',
+      });
+    } else {
+      try {
+        const appClient = this.createWebClient(appToken);
+        const res = await appClient.apps.connections.open();
+        if (res.ok) {
+          appTokenValid = true;
+        } else {
+          appTokenValid = false;
+          failures.push(buildTestFailure('app_token', extractSlackErrorDetail(res), {}));
+        }
+      } catch (error) {
+        appTokenValid = false;
+        failures.push(buildTestFailure('app_token', extractSlackErrorDetail(error), {}));
+      }
+    }
+
+    let channelAccess: SlackTestResult['channelAccess'];
+    const allowedChannelIds = normalizeAllowedChannelIds(this.config.allowed_channel_ids);
+    if (allowedChannelIds.length > 0) {
+      const channelId = allowedChannelIds[0];
+      let channelOk = false;
+      try {
+        const info = await this.web.conversations.info({ channel: channelId });
+        if (info.ok) {
+          channelOk = true;
+        } else {
+          failures.push(
+            buildTestFailure(
+              'channel_access',
+              extractSlackErrorDetail(info),
+              CHANNEL_ACCESS_ERROR_REASONS
+            )
+          );
+        }
+      } catch (error) {
+        failures.push(
+          buildTestFailure(
+            'channel_access',
+            extractSlackErrorDetail(error),
+            CHANNEL_ACCESS_ERROR_REASONS
+          )
+        );
+      }
+      channelAccess = [{ channelId, ok: channelOk }];
+      if (allowedChannelIds.length > 1) {
+        notVerifiable.push(
+          `Only the first of ${allowedChannelIds.length} configured channels was probed; the rest were not checked.`
+        );
+      }
+    } else {
+      notVerifiable.push(
+        'No channel whitelist is configured, so no specific channel reachability was verified.'
+      );
+    }
+
+    const channelsOk = !channelAccess || channelAccess.some((c) => c.ok);
+    const ok = botTokenValid && appTokenValid && channelsOk && failures.length === 0;
+
+    return {
+      ok,
+      ...(team ? { team } : {}),
+      ...(bot ? { bot } : {}),
+      appTokenValid,
+      ...(channelAccess ? { channelAccess } : {}),
+      failures,
+      notVerifiable,
+    };
+  }
+
+  /**
+   * Resolve the Slack app behind the configured bot token: `auth.test` yields
+   * the bot id + team id, then `bots.info` (baseline `users:read` scope — no
+   * scope beyond what every gateway channel already holds) yields the app id.
+   *
+   * Best-effort: any failure returns nulls rather than throwing, so the UI can
+   * fall back to a generic Slack link. The result never carries token values.
+   */
+  async getAppInfo(): Promise<SlackAppInfo> {
+    let teamId: string | null = null;
+    try {
+      const authTest = await this.web.auth.test();
+      if (!authTest.ok) return { appId: null, teamId: null };
+      teamId = authTest.team_id ?? null;
+      if (!authTest.bot_id) return { appId: null, teamId };
+      const botsInfo = await this.web.bots.info({ bot: authTest.bot_id });
+      if (!botsInfo.ok) return { appId: null, teamId };
+      return { appId: botsInfo.bot?.app_id ?? null, teamId };
+    } catch {
+      return { appId: null, teamId };
+    }
   }
 
   /**
@@ -534,11 +1032,7 @@ export class SlackConnector implements GatewayConnector {
         expiresAt: now + SlackConnector.USER_CACHE_TTL_MS,
       });
 
-      if (email) {
-        console.log(
-          `[slack] Resolved user ${slackUserId} → ${displayName ?? '(no name)'} <${email}>`
-        );
-      } else {
+      if (!email) {
         console.log(
           `[slack] User ${slackUserId} has no email (missing users:read.email scope or restricted account)`
         );
@@ -555,6 +1049,64 @@ export class SlackConnector implements GatewayConnector {
       });
       return { email: null, displayName: null };
     }
+  }
+
+  /**
+   * Look up a Slack user by email and return display metadata including a
+   * high-resolution avatar URL. Used by Agor's admin-triggered user avatar
+   * sync. Prefer image_512 for crisp large/retina rendering, falling back to
+   * smaller Slack-provided variants.
+   */
+  async lookupUserAvatarByEmail(email: string): Promise<SlackUserAvatarProfile | null> {
+    const normalized = email.trim().toLowerCase();
+    if (!normalized) throw new Error('Slack user email is required');
+
+    const result = await this.web.users
+      .lookupByEmail({ email: normalized })
+      .catch((error: unknown) => {
+        if (extractSlackErrorCode(error) === 'users_not_found') {
+          return null;
+        }
+        throw error;
+      });
+    if (!result?.ok || !result.user?.id) {
+      return null;
+    }
+
+    const profile = result.user.profile as
+      | {
+          email?: string;
+          display_name?: string;
+          real_name?: string;
+          image_original?: string;
+          image_1024?: string;
+          image_512?: string;
+          image_192?: string;
+          image_72?: string;
+          image_48?: string;
+        }
+      | undefined;
+
+    const avatarUrl =
+      profile?.image_512 ||
+      profile?.image_original ||
+      profile?.image_1024 ||
+      profile?.image_192 ||
+      profile?.image_72 ||
+      profile?.image_48 ||
+      null;
+
+    return {
+      slackUserId: result.user.id,
+      email: profile?.email ?? normalized,
+      displayName:
+        profile?.display_name ||
+        profile?.real_name ||
+        result.user.real_name ||
+        result.user.name ||
+        null,
+      avatarUrl,
+    };
   }
 
   /**
@@ -595,6 +1147,75 @@ export class SlackConnector implements GatewayConnector {
       });
       return null;
     }
+  }
+
+  private async lookupLatestThreadReply(
+    event: Record<string, unknown>
+  ): Promise<Record<string, unknown> | null> {
+    const channel = typeof event.channel === 'string' ? event.channel : undefined;
+    const message =
+      typeof event.message === 'object' && event.message !== null
+        ? (event.message as Record<string, unknown>)
+        : undefined;
+    const threadTs =
+      (typeof message?.thread_ts === 'string' ? message.thread_ts : undefined) ??
+      (typeof message?.ts === 'string' ? message.ts : undefined) ??
+      (typeof event.thread_ts === 'string' ? event.thread_ts : undefined);
+    const replies = Array.isArray(message?.replies)
+      ? message.replies.filter((reply): reply is Record<string, unknown> => {
+          return typeof reply === 'object' && reply !== null;
+        })
+      : [];
+    const latestReplyTs =
+      (typeof message?.latest_reply === 'string' ? message.latest_reply : undefined) ??
+      (typeof event.latest_reply === 'string' ? event.latest_reply : undefined) ??
+      [...replies]
+        .reverse()
+        .map((reply) => (typeof reply.ts === 'string' ? reply.ts : undefined))
+        .find(Boolean);
+
+    if (!channel || !threadTs || !latestReplyTs) return null;
+
+    try {
+      const result = await this.web.conversations.replies({
+        channel,
+        ts: threadTs,
+        oldest: latestReplyTs,
+        inclusive: true,
+        limit: 1,
+      });
+      const reply =
+        result.messages?.find((candidate) => candidate.ts === latestReplyTs) ??
+        result.messages?.[0] ??
+        null;
+      if (!reply) return null;
+      return {
+        ...reply,
+        channel,
+        thread_ts: typeof reply.thread_ts === 'string' ? reply.thread_ts : threadTs,
+        team: event.team,
+      };
+    } catch (error) {
+      console.warn('[slack] Failed to fetch latest thread reply for message_replied event:', error);
+      return null;
+    }
+  }
+
+  private shouldProcessInboundEventOnce(
+    channel: string | undefined,
+    ts: string | undefined
+  ): boolean {
+    if (!channel || !ts) return true;
+
+    const now = Date.now();
+    for (const [key, expiresAt] of this.inboundEventDedup) {
+      if (expiresAt <= now) this.inboundEventDedup.delete(key);
+    }
+
+    const key = `${channel}:${ts}`;
+    if (this.inboundEventDedup.has(key)) return false;
+    this.inboundEventDedup.set(key, now + SlackConnector.INBOUND_EVENT_DEDUP_TTL_MS);
+    return true;
   }
 
   /**
@@ -654,7 +1275,6 @@ export class SlackConnector implements GatewayConnector {
         } else {
           resolvedType = 'channel';
         }
-        console.log(`[slack] conversations.info resolved channel ${channelId} → ${resolvedType}`);
         this.cacheChannelType(channelId, resolvedType);
 
         // Also cache channel name to avoid a second conversations.info call
@@ -718,25 +1338,39 @@ export class SlackConnector implements GatewayConnector {
   }): Promise<string> {
     const { channel, thread_ts } = parseThreadId(req.threadId);
     const blocks = req.blocks && req.blocks.length > 0 ? (req.blocks as KnownBlock[]) : undefined;
+    const updateTs =
+      typeof req.metadata?.slack_update_ts === 'string' ? req.metadata.slack_update_ts : undefined;
 
-    const post = (withBlocks: boolean) =>
-      this.web.chat.postMessage({
+    const send = (withBlocks: boolean) => {
+      const base = {
         channel,
-        thread_ts,
         text: req.text,
         ...(withBlocks && blocks ? { blocks } : {}),
         unfurl_links: false,
         unfurl_media: false,
-      });
+      };
 
-    let result: Awaited<ReturnType<typeof post>>;
+      if (updateTs) {
+        return this.web.chat.update({
+          ...base,
+          ts: updateTs,
+        });
+      }
+
+      return this.web.chat.postMessage({
+        ...base,
+        thread_ts,
+      });
+    };
+
+    let result: Awaited<ReturnType<typeof send>>;
     try {
-      result = await post(true);
+      result = await send(true);
     } catch (err) {
       const code = extractSlackErrorCode(err);
       if (blocks && code && BLOCK_PAYLOAD_ERRORS.has(code)) {
         console.warn(`[slack] Block payload rejected (${code}); retrying as text-only`);
-        result = await post(false);
+        result = await send(false);
       } else {
         throw err;
       }
@@ -746,7 +1380,7 @@ export class SlackConnector implements GatewayConnector {
       const code = extractSlackErrorCode(result);
       if (blocks && code && BLOCK_PAYLOAD_ERRORS.has(code)) {
         console.warn(`[slack] Block payload rejected (${code}); retrying as text-only`);
-        const retry = await post(false);
+        const retry = await send(false);
         if (!retry.ok || !retry.ts) {
           throw new Error(`Slack API error: ${retry.error ?? 'unknown error'}`);
         }
@@ -760,6 +1394,474 @@ export class SlackConnector implements GatewayConnector {
   }
 
   /**
+   * Send directly to a Slack channel or thread. Used for proactive outbound
+   * emits where no gateway thread_session_map exists yet.
+   */
+  async sendSlackMessage(req: {
+    channel: string;
+    text: string;
+    blocks?: unknown[];
+    thread_ts?: string;
+    metadata?: Record<string, unknown>;
+  }): Promise<{ ts: string; channel: string; thread_ts: string; permalink?: string | null }> {
+    const blocks = req.blocks && req.blocks.length > 0 ? (req.blocks as KnownBlock[]) : undefined;
+    const send = (withBlocks: boolean) =>
+      this.web.chat.postMessage({
+        channel: req.channel,
+        text: req.text,
+        ...(withBlocks && blocks ? { blocks } : {}),
+        ...(req.thread_ts ? { thread_ts: req.thread_ts } : {}),
+        unfurl_links: false,
+        unfurl_media: false,
+      });
+
+    let result: Awaited<ReturnType<typeof send>>;
+    try {
+      result = await send(true);
+    } catch (err) {
+      const code = extractSlackErrorCode(err);
+      if (blocks && code && BLOCK_PAYLOAD_ERRORS.has(code)) {
+        console.warn(`[slack] Block payload rejected (${code}); retrying direct send as text-only`);
+        result = await send(false);
+      } else {
+        throw err;
+      }
+    }
+
+    if (!result.ok || !result.ts) {
+      const code = extractSlackErrorCode(result);
+      if (blocks && code && BLOCK_PAYLOAD_ERRORS.has(code)) {
+        const retry = await send(false);
+        if (!retry.ok || !retry.ts) {
+          throw new Error(`Slack API error: ${retry.error ?? 'unknown error'}`);
+        }
+        result = retry;
+      } else {
+        throw new Error(`Slack API error: ${result.error ?? 'unknown error'}`);
+      }
+    }
+
+    const sentTs = result.ts;
+    if (!sentTs) {
+      throw new Error('Slack API error: missing message timestamp');
+    }
+    let permalink: string | null = null;
+    try {
+      const link = await this.web.chat.getPermalink({ channel: req.channel, message_ts: sentTs });
+      permalink = link.ok ? (link.permalink ?? null) : null;
+    } catch {
+      permalink = null;
+    }
+
+    return {
+      ts: sentTs,
+      channel: req.channel,
+      thread_ts: req.thread_ts ?? sentTs,
+      permalink,
+    };
+  }
+
+  /** Add an emoji reaction to a Slack message. */
+  async addReaction(req: { channel: string; timestamp: string; name: string }): Promise<void> {
+    const result = await this.web.reactions.add({
+      channel: req.channel,
+      timestamp: req.timestamp,
+      name: req.name,
+    });
+    if (!result.ok) {
+      throw new Error(`Slack API error: ${result.error ?? 'unknown error'}`);
+    }
+  }
+
+  /** Remove an emoji reaction from a Slack message. */
+  async removeReaction(req: { channel: string; timestamp: string; name: string }): Promise<void> {
+    const result = await this.web.reactions.remove({
+      channel: req.channel,
+      timestamp: req.timestamp,
+      name: req.name,
+    });
+    if (!result.ok) {
+      throw new Error(`Slack API error: ${result.error ?? 'unknown error'}`);
+    }
+  }
+
+  /**
+   * Upload a file to a Slack channel or thread via `files.uploadV2`.
+   *
+   * Cast to a minimal local shape because `@slack/web-api`'s `uploadV2`
+   * argument type is a discriminated union that doesn't narrow cleanly over
+   * a conditionally-spread object; the runtime response carries `files[0]`
+   * with the uploaded file's id/permalink/name.
+   */
+  async uploadFile(req: {
+    channel: string;
+    threadTs?: string;
+    file: Buffer;
+    filename: string;
+    comment?: string;
+  }): Promise<{ id: string; permalink: string | null; name: string }> {
+    const files = this.web.files as unknown as {
+      uploadV2: (args: Record<string, unknown>) => Promise<{
+        ok?: boolean;
+        error?: string;
+        files?: Array<{ id?: string; permalink?: string; name?: string }>;
+      }>;
+    };
+    const result = await files.uploadV2({
+      channel_id: req.channel,
+      file: req.file,
+      filename: req.filename,
+      ...(req.threadTs ? { thread_ts: req.threadTs } : {}),
+      ...(req.comment ? { initial_comment: req.comment } : {}),
+    });
+    if (!result.ok) {
+      throw new Error(`Slack API error: ${result.error ?? 'unknown error'}`);
+    }
+    const uploaded = result.files?.[0];
+    if (!uploaded?.id) {
+      throw new Error('Slack API error: upload response missing file id');
+    }
+    return {
+      id: uploaded.id,
+      permalink: uploaded.permalink ?? null,
+      name: uploaded.name ?? req.filename,
+    };
+  }
+
+  /**
+   * Fetch a Slack file's metadata (including its bot-token-authenticated
+   * `url_private_download`) via `files.info`. The returned {@link InboundFile}
+   * is for server-side download plumbing only — callers exposing file data to
+   * agents must strip the URL (see {@link SlackHistoryFile}).
+   * `sourceConversationIds` preserves where the file is shared
+   * (channels + groups + ims) so the gateway can enforce its
+   * `allowed_channel_ids` whitelist ({@link isSlackFileSourceAllowed});
+   * it must not be exposed to agents either.
+   */
+  async getFileInfo(fileId: string): Promise<SlackFileInfo> {
+    const result = await this.web.files.info({ file: fileId });
+    if (!result.ok) {
+      throw new Error(`Slack API error: ${result.error ?? 'unknown error'}`);
+    }
+    const [file] = extractSlackInboundFiles([result.file]);
+    if (!file) {
+      throw new Error(`Slack files.info returned no downloadable file for ${fileId}`);
+    }
+    const raw = result.file as { channels?: unknown; groups?: unknown; ims?: unknown };
+    const sourceConversationIds = [raw.channels, raw.groups, raw.ims].flatMap((ids) =>
+      Array.isArray(ids) ? ids.filter((id): id is string => typeof id === 'string') : []
+    );
+    return { file, sourceConversationIds };
+  }
+
+  /** Resolve a Slack channel by its human name (with or without #). */
+  async resolveChannelByName(name: string): Promise<{ channel: string; name: string }> {
+    const normalized = name.replace(/^#/, '').trim().toLowerCase();
+    if (!normalized) throw new Error('Slack channel name is required');
+
+    let cursor: string | undefined;
+    do {
+      const result = await this.web.conversations.list({
+        types: 'public_channel,private_channel',
+        limit: 1000,
+        ...(cursor ? { cursor } : {}),
+      });
+
+      if (!result.ok) {
+        throw new Error(`Slack API error: ${result.error ?? 'unknown error'}`);
+      }
+
+      const channels = (result.channels ?? []) as Array<{
+        id?: string;
+        name?: string;
+        name_normalized?: string;
+        is_archived?: boolean;
+      }>;
+      const match = channels.find((channel) => {
+        if (channel.is_archived) return false;
+        return (channel.name_normalized ?? channel.name ?? '').toLowerCase() === normalized;
+      });
+      if (match?.id) {
+        return { channel: match.id, name: match.name ?? normalized };
+      }
+
+      cursor = result.response_metadata?.next_cursor || undefined;
+    } while (cursor);
+
+    throw new Error(`Slack channel not found: #${normalized}`);
+  }
+
+  /** Resolve a Slack user email to a DM channel with that user. */
+  async openDmByEmail(email: string): Promise<{ channel: string; user_id: string }> {
+    const normalized = email.trim().toLowerCase();
+    if (!normalized) throw new Error('Slack user email is required');
+
+    const userResult = await this.web.users.lookupByEmail({ email: normalized });
+    if (!userResult.ok || !userResult.user?.id) {
+      throw new Error(`Slack user lookup failed: ${userResult.error ?? 'user_not_found'}`);
+    }
+
+    const dmResult = await this.web.conversations.open({ users: userResult.user.id });
+    if (!dmResult.ok || !dmResult.channel?.id) {
+      throw new Error(`Slack DM open failed: ${dmResult.error ?? 'unknown error'}`);
+    }
+
+    return { channel: dmResult.channel.id, user_id: userResult.user.id };
+  }
+
+  /**
+   * Shared pagination + normalization loop behind {@link fetchThreadHistory}
+   * and {@link fetchChannelHistory}. Collects up to `req.limit` normalized
+   * messages in the order the Slack API returns pages, over-fetching raw pages
+   * when bot messages are filtered out.
+   */
+  private async collectHistoryMessages(
+    fetchPage: (page: { limit: number; cursor?: string }) => Promise<{
+      ok?: boolean;
+      error?: string;
+      messages?: unknown[];
+      has_more?: boolean;
+      response_metadata?: { next_cursor?: string };
+    }>,
+    req: Pick<SlackThreadHistoryRequest, 'limit' | 'includeBotMessages' | 'triggerTs'>,
+    errorLabel: string
+  ): Promise<{ messages: SlackThreadHistoryMessage[]; hasMore: boolean }> {
+    const requestedLimit = Math.min(Math.max(req.limit ?? 50, 1), 200);
+    const messages: SlackThreadHistoryMessage[] = [];
+    let cursor: string | undefined;
+    let hasMore = false;
+
+    do {
+      const rawLimit = req.includeBotMessages
+        ? requestedLimit
+        : Math.min(Math.max(requestedLimit * 4, requestedLimit), 200);
+      const result = await fetchPage({ limit: rawLimit, ...(cursor ? { cursor } : {}) });
+
+      if (!result.ok) {
+        throw new Error(`${errorLabel}: ${result.error ?? 'unknown error'}`);
+      }
+
+      const rawMessages = (result.messages ?? []) as Array<Record<string, unknown>>;
+      let stoppedAtRequestedLimitWithMoreRaw = false;
+      for (let i = 0; i < rawMessages.length; i++) {
+        const raw = rawMessages[i];
+        if (!raw) continue;
+        const ts = typeof raw.ts === 'string' ? raw.ts : undefined;
+        if (!ts) continue;
+        const botId = typeof raw.bot_id === 'string' ? raw.bot_id : undefined;
+        const subtype = typeof raw.subtype === 'string' ? raw.subtype : undefined;
+        const isBot = !!botId || subtype === 'bot_message';
+        if (isBot && !req.includeBotMessages) continue;
+
+        const userId = typeof raw.user === 'string' ? raw.user : undefined;
+        let userName: string | undefined;
+        if (userId) {
+          const profile = await this.lookupUserProfile(userId);
+          userName = profile.displayName ?? undefined;
+        }
+        const botProfile = raw.bot_profile as Record<string, unknown> | undefined;
+        const botName =
+          typeof botProfile?.name === 'string'
+            ? botProfile.name
+            : typeof raw.username === 'string'
+              ? raw.username
+              : undefined;
+        const actorLabel = userName ?? botName ?? userId ?? botId ?? 'unknown';
+        const text = typeof raw.text === 'string' ? raw.text : '';
+        const files = extractSlackInboundFiles(raw.files).map(({ id, name, mimetype, size }) => ({
+          id,
+          name,
+          mimetype,
+          size,
+        }));
+        messages.push({
+          ts,
+          iso_time: slackTsToIso(ts),
+          ...(userId ? { user_id: userId } : {}),
+          ...(userName ? { user_name: userName } : {}),
+          actor_label: actorLabel,
+          text,
+          is_bot: isBot,
+          is_trigger: req.triggerTs === ts,
+          is_mention: this.botUserId ? text.includes(`<@${this.botUserId}>`) : false,
+          ...(files.length > 0 ? { files } : {}),
+        });
+        if (messages.length >= requestedLimit) {
+          stoppedAtRequestedLimitWithMoreRaw = i < rawMessages.length - 1;
+          break;
+        }
+      }
+
+      cursor = result.response_metadata?.next_cursor || undefined;
+      hasMore = result.has_more === true || !!cursor || stoppedAtRequestedLimitWithMoreRaw;
+    } while (!req.includeBotMessages && messages.length < requestedLimit && cursor);
+
+    return { messages: messages.slice(0, requestedLimit), hasMore };
+  }
+
+  async fetchThreadHistory(req: SlackThreadHistoryRequest): Promise<SlackThreadHistoryResult> {
+    const { channel, thread_ts } = parseThreadId(req.threadId);
+    const { messages, hasMore } = await this.collectHistoryMessages(
+      (page) =>
+        this.web.conversations.replies({
+          channel,
+          ts: thread_ts,
+          limit: page.limit,
+          ...(page.cursor ? { cursor: page.cursor } : {}),
+          ...(req.oldestTs ? { oldest: req.oldestTs } : {}),
+          ...(req.latestTs ? { latest: req.latestTs } : {}),
+          ...(req.inclusive !== undefined ? { inclusive: req.inclusive } : {}),
+        }),
+      req,
+      'Slack thread history error'
+    );
+
+    return {
+      threadId: req.threadId,
+      channel,
+      thread_ts,
+      messages,
+      has_more: hasMore,
+    };
+  }
+
+  /**
+   * Fetch recent messages from a whole Slack conversation (not just one
+   * thread). Enforces the channel's `allowed_channel_ids` whitelist when one
+   * is configured. Slack returns newest-first pages, so `limit` selects the
+   * most recent matching messages; the result is reversed into chronological
+   * order for transcript-style consumption.
+   */
+  async fetchChannelHistory(req: SlackChannelHistoryRequest): Promise<SlackChannelHistoryResult> {
+    const allowedChannelIds = normalizeAllowedChannelIds(this.config.allowed_channel_ids);
+    if (allowedChannelIds.length > 0 && !allowedChannelIds.includes(req.channelId)) {
+      throw new Error(
+        `Slack channel ${req.channelId} is not in this gateway channel's allowed_channel_ids whitelist.`
+      );
+    }
+
+    const { messages, hasMore } = await this.collectHistoryMessages(
+      (page) =>
+        this.web.conversations.history({
+          channel: req.channelId,
+          limit: page.limit,
+          ...(page.cursor ? { cursor: page.cursor } : {}),
+          ...(req.oldestTs ? { oldest: req.oldestTs } : {}),
+          ...(req.latestTs ? { latest: req.latestTs } : {}),
+          ...(req.inclusive !== undefined ? { inclusive: req.inclusive } : {}),
+        }),
+      req,
+      'Slack channel history error'
+    );
+    messages.reverse();
+
+    return {
+      channel: req.channelId,
+      messages,
+      has_more: hasMore,
+    };
+  }
+
+  async startStream(req: {
+    threadId: string;
+    text?: string;
+    recipientUserId?: string;
+    recipientTeamId?: string;
+  }): Promise<string> {
+    const { channel, thread_ts } = parseThreadId(req.threadId);
+    const chat = this.web.chat as unknown as {
+      startStream: (
+        args: Record<string, unknown>
+      ) => Promise<{ ok?: boolean; ts?: string; error?: string }>;
+    };
+    const result = await chat.startStream({
+      channel,
+      thread_ts,
+      markdown_text: req.text?.trim() ? req.text : ' ',
+      ...(req.recipientUserId ? { recipient_user_id: req.recipientUserId } : {}),
+      ...(req.recipientTeamId ? { recipient_team_id: req.recipientTeamId } : {}),
+    });
+    if (!result.ok || !result.ts) {
+      throw new Error(`Slack stream start error: ${result.error ?? 'unknown error'}`);
+    }
+    return result.ts;
+  }
+
+  async appendStream(req: { threadId: string; ts: string; text: string }): Promise<void> {
+    const { channel } = parseThreadId(req.threadId);
+    const chat = this.web.chat as unknown as {
+      appendStream: (args: Record<string, unknown>) => Promise<{ ok?: boolean; error?: string }>;
+    };
+    const result = await chat.appendStream({
+      channel,
+      ts: req.ts,
+      markdown_text: req.text,
+    });
+    if (!result.ok) {
+      throw new Error(`Slack stream append error: ${result.error ?? 'unknown error'}`);
+    }
+  }
+
+  async stopStream(req: { threadId: string; ts: string; text?: string }): Promise<void> {
+    const { channel } = parseThreadId(req.threadId);
+    const chat = this.web.chat as unknown as {
+      stopStream: (args: Record<string, unknown>) => Promise<{ ok?: boolean; error?: string }>;
+    };
+    const result = await chat.stopStream({
+      channel,
+      ts: req.ts,
+      ...(req.text ? { markdown_text: req.text } : {}),
+    });
+    if (!result.ok) {
+      throw new Error(`Slack stream stop error: ${result.error ?? 'unknown error'}`);
+    }
+  }
+
+  async deleteMessage(req: { threadId: string; messageId: string }): Promise<void> {
+    const { channel } = parseThreadId(req.threadId);
+    const result = await this.web.chat.delete({
+      channel,
+      ts: req.messageId,
+    });
+    if (!result.ok) {
+      throw new Error(`Slack delete error: ${result.error ?? 'unknown error'}`);
+    }
+  }
+
+  async setThreadStatus(req: {
+    threadId: string;
+    status: string;
+    loadingMessages?: string[];
+    iconEmoji?: string;
+  }): Promise<void> {
+    const { channel, thread_ts } = parseThreadId(req.threadId);
+    const web = this.web as unknown as {
+      assistant?: {
+        threads?: {
+          setStatus?: (args: Record<string, unknown>) => Promise<{ ok?: boolean; error?: string }>;
+        };
+      };
+      apiCall?: (
+        method: string,
+        args: Record<string, unknown>
+      ) => Promise<{ ok?: boolean; error?: string }>;
+    };
+    const args = {
+      channel_id: channel,
+      thread_ts,
+      status: req.status,
+      ...(req.loadingMessages?.length ? { loading_messages: req.loadingMessages } : {}),
+      ...(req.iconEmoji ? { icon_emoji: req.iconEmoji } : {}),
+    };
+    const result = web.assistant?.threads?.setStatus
+      ? await web.assistant.threads.setStatus(args)
+      : await web.apiCall?.('assistant.threads.setStatus', args);
+    if (!result?.ok) {
+      throw new Error(`Slack assistant status error: ${result?.error ?? 'unknown error'}`);
+    }
+  }
+
+  /**
    * Start listening for inbound messages via Socket Mode
    *
    * Requires app_token in config. Filters messages based on config:
@@ -767,18 +1869,15 @@ export class SlackConnector implements GatewayConnector {
    * - Public channels (if enable_channels = true)
    * - Private channels (if enable_groups = true)
    * - Group DMs (if enable_mpim = true)
-   * - Mention requirement (if require_mention = true)
+   * - Explicit mention requirement for channel-like conversations
    * - Channel whitelist (if allowed_channel_ids is set)
    */
   async startListening(callback: (msg: InboundMessage) => void): Promise<void> {
-    console.log('[slack] startListening called');
-
     if (!this.config.app_token) {
       console.error('[slack] ERROR: app_token is missing from config');
       throw new Error('Slack Socket Mode requires app_token in config');
     }
 
-    console.log('[slack] Creating SocketModeClient...');
     this.socketMode = new SocketModeClient({
       appToken: this.config.app_token,
     });
@@ -787,16 +1886,11 @@ export class SlackConnector implements GatewayConnector {
     let botMentionPattern: RegExp | null = null;
     let botMentionReplacePattern: RegExp | null = null;
     try {
-      console.log('[slack] Testing bot token with auth.test()...');
       const authTest = await this.web.auth.test();
       this.botUserId = authTest.user_id as string;
       // Precompile regex patterns for performance
       botMentionPattern = new RegExp(`<@${this.botUserId}>`);
       botMentionReplacePattern = new RegExp(`<@${this.botUserId}>\\s*`, 'g');
-      console.log(`[slack] Bot user ID: ${this.botUserId}`);
-      console.log(
-        `[slack] Bot auth test successful - team: ${authTest.team}, user: ${authTest.user}`
-      );
     } catch (error) {
       console.error('[slack] Failed to fetch bot user ID:', error);
       console.error('[slack] This usually means the bot_token is invalid or expired');
@@ -807,12 +1901,11 @@ export class SlackConnector implements GatewayConnector {
     const enableChannels = this.config.enable_channels ?? false;
     const enableGroups = this.config.enable_groups ?? false;
     const enableMpim = this.config.enable_mpim ?? false;
-    const requireMention = this.config.require_mention ?? true;
-    // Default to true: once a user @mentions the bot to start a thread,
-    // they can continue the conversation without re-tagging. The gateway
-    // service's mapping verification prevents abuse in unmapped threads.
-    const allowThreadRepliesWithoutMention =
-      this.config.allow_thread_replies_without_mention ?? true;
+    // Slack gateway now treats channel/group/MPIM mentions as the only trigger.
+    // The legacy require_mention=false and allow_thread_replies_without_mention
+    // knobs are intentionally ignored for channel-like conversations; ordinary
+    // thread replies are picked up via catch-up the next time the bot is mentioned.
+    const requireMention = true;
 
     // Normalize allowed_channel_ids to string[] (handle malformed config)
     let allowedChannelIds: string[] | undefined;
@@ -832,14 +1925,6 @@ export class SlackConnector implements GatewayConnector {
       }
     }
 
-    console.log('[slack] Message source config:', {
-      enableChannels,
-      enableGroups,
-      enableMpim,
-      requireMention,
-      allowedChannelIds: allowedChannelIds?.length || 0,
-    });
-
     // Handle incoming Slack events
     this.socketMode.on('slack_event', async ({ type, body, ack }) => {
       // Event received - process based on type
@@ -857,20 +1942,62 @@ export class SlackConnector implements GatewayConnector {
       }
 
       await ack();
-      const event = body.event;
+      let event = body.event;
+      const slackTeamId =
+        typeof event.team === 'string'
+          ? event.team
+          : typeof body.team_id === 'string'
+            ? body.team_id
+            : Array.isArray(body.authorizations) &&
+                typeof body.authorizations[0]?.team_id === 'string'
+              ? body.authorizations[0].team_id
+              : undefined;
       console.log(
         `[slack] Processing ${eventType} event - channel: ${event.channel}, channel_type: ${event.channel_type}`
       );
 
       // Skip bot messages to avoid loops
       if (event.bot_id || event.subtype === 'bot_message') {
-        console.log('[slack] Skipping bot message');
         return;
       }
 
       // Skip message edits, deletes, and other subtypes — only handle new messages
       // Note: app_mention events don't have subtypes
       if (eventType === 'message' && event.subtype) {
+        if (event.subtype === 'message_replied') {
+          const replyEvent = await this.lookupLatestThreadReply(event);
+          if (!replyEvent) {
+            console.log(
+              `[slack] Skipping message_replied event without fetchable latest reply channel=${event.channel ?? '(none)'} ts=${event.ts ?? '(none)'}`
+            );
+            return;
+          }
+          event = {
+            ...replyEvent,
+            type: 'message',
+            channel_type: event.channel_type,
+          };
+          console.log(
+            `[slack] Resolved message_replied event to latest reply thread_ts=${event.thread_ts ?? '(none)'} ts=${event.ts ?? '(none)'}`
+          );
+        } else if (event.subtype === 'file_share' && this.config.ingest_files === true) {
+          // Messages with uploaded files arrive as subtype `file_share` rather
+          // than a plain message. When file ingestion is enabled, treat them
+          // as normal new messages so the attachments (and any accompanying
+          // text) reach the gateway.
+        } else {
+          console.debug(
+            `[slack] Skipping message subtype=${event.subtype} user=${event.user ?? '(none)'} thread_ts=${event.thread_ts ?? '(none)'} ts=${event.ts ?? '(none)'}`
+          );
+          return;
+        }
+      }
+
+      // Skip bot replies resolved from message_replied events to avoid loops.
+      if (event.bot_id || event.subtype === 'bot_message') {
+        console.debug(
+          `[slack] Skipping resolved bot message subtype=${event.subtype ?? '(none)'} thread_ts=${event.thread_ts ?? '(none)'} ts=${event.ts ?? '(none)'}`
+        );
         return;
       }
 
@@ -887,54 +2014,52 @@ export class SlackConnector implements GatewayConnector {
       // This happens for top-level messages AND thread replies.
       //
       // Strategy:
-      // - Use 'app_mention' for active mentions outside code blocks
-      // - Use 'message' for DMs, non-mention messages, and code-block-only mentions
-      // - Skip 'message' events that have active mentions (to avoid duplicates)
-      // - Skip 'app_mention' events where the mention is only inside code blocks
-      //   (those are not "real" mentions and should be handled as plain messages)
+      // - Use `app_mention` as the only trigger for channel-like Slack surfaces.
+      //   Slack `message` events include thread bookkeeping (`message_replied`) and
+      //   can carry root-message text from the originally mentioned message.
+      // - Use `message` events for direct messages, where Slack does not dispatch
+      //   app_mention events.
+      // - Skip `app_mention` events where the mention is only inside code blocks.
       const isThreadReply = !!event.thread_ts;
-      const isChannelMessage = channelType === 'channel' || channelType === 'group';
+      const isChannelLikeMessage =
+        channelType === 'channel' || channelType === 'group' || channelType === 'mpim';
 
-      // CRITICAL: Prevent duplicates in channels/groups when bot ID unavailable
-      // Strategy depends on require_mention setting:
-      // - If require_mention=true: prefer app_mention (Slack guarantees mention), skip message
-      // - If require_mention=false: prefer message (app_mention won't fire for non-mentions), skip app_mention
-      if (isChannelMessage && !botMentionPattern) {
+      if (isChannelLikeMessage && eventType !== 'app_mention') {
+        console.debug(
+          `[slack] Skipping non-app_mention event in channel-like conversation type=${eventType} channel=${event.channel} ts=${event.ts}`
+        );
+        return;
+      }
+
+      // CRITICAL: Prevent duplicates in channel-like conversations when bot ID unavailable.
+      // Since channel-like conversations always require mentions, prefer app_mention
+      // when we cannot verify mentions in raw message events.
+      if (isChannelLikeMessage && !botMentionPattern) {
         if (eventType === 'message' && requireMention) {
           // Can't detect mentions - let app_mention handle (which Slack guarantees is a mention)
-          console.warn(
-            '[slack] Bot ID unavailable, require_mention=true - skipping message event (will use app_mention)'
-          );
-          return;
-        }
-        if (eventType === 'app_mention' && !requireMention) {
-          // Avoid duplicates - prefer message events when mentions not required
-          console.warn(
-            '[slack] Bot ID unavailable, require_mention=false - skipping app_mention (will use message)'
-          );
           return;
         }
       }
 
-      if (isChannelMessage && botMentionPattern) {
+      if (isChannelLikeMessage && botMentionPattern) {
         const mentionOutsideCodeBlock = hasActiveMention(event.text ?? '', botMentionPattern);
-
-        if (eventType === 'message' && mentionOutsideCodeBlock) {
-          // Active (non-code-block) mention detected in a message event.
-          // Skip — the parallel app_mention event will handle it.
-          return;
-        }
 
         if (eventType === 'app_mention' && !mentionOutsideCodeBlock) {
           // app_mention fired but the mention is only inside a code block.
           // Skip — the parallel message event will handle it as a non-mention
-          // (correctly rejected or routed via thread reply exception).
+          // (correctly rejected).
           return;
         }
       }
 
-      // Channel type filtering based on config
-      if (!channelType || channelType === 'im') {
+      // Channel type filtering based on config. Fail closed when channel type
+      // cannot be resolved; otherwise unknown channel-like messages could be
+      // mistaken for DMs and bypass mention enforcement.
+      if (!channelType) {
+        console.warn(`[slack] Cannot determine channel_type for channel=${event.channel}`);
+        return;
+      }
+      if (channelType === 'im') {
         // Direct messages are always allowed
       } else if (channelType === 'channel' && !enableChannels) {
         return; // Public channels not enabled
@@ -952,61 +2077,47 @@ export class SlackConnector implements GatewayConnector {
         return;
       }
 
-      // Channel whitelist check (applies to all channel types)
-      if (allowedChannelIds && allowedChannelIds.length > 0) {
-        if (!allowedChannelIds.includes(event.channel)) {
-          return; // Not in whitelist
-        }
+      // Channel whitelist governs channel-like surfaces only; DMs always pass.
+      if (!isChannelAllowedByWhitelist(channelType, event.channel, allowedChannelIds)) {
+        return;
       }
 
       // Mention requirement handling
       let messageText = event.text ?? '';
       let hasMention = false;
-      let allowedViaThreadReplyException = false;
+      const allowedViaThreadReplyException = false;
 
-      if (requireMention) {
+      const requiresExplicitMention = channelType !== 'im';
+      if (requireMention && requiresExplicitMention) {
         if (!botMentionPattern || !botMentionReplacePattern) {
-          // app_mention events are inherently mentions (Slack guarantees this)
-          // Allow them even without bot ID pattern
+          // app_mention events are inherently mentions (Slack guarantees this).
           if (eventType === 'app_mention') {
-            // Mention is implied by event type - allow without pattern validation
-            // We can't strip the mention without the pattern, but that's acceptable
-            // (messageText stays as-is since we don't have botMentionReplacePattern)
             hasMention = true;
           } else {
-            // SECURITY: Fail closed - if we can't verify mentions on message events, reject
             console.warn(
               '[slack] Cannot enforce mention requirement (bot user ID not available). Rejecting message event.'
             );
             return;
           }
         } else {
-          // Bot ID available - perform normal mention validation.
-          // Only count mentions outside code blocks as active mentions.
-          // Code-block mentions (e.g. `@bot`) are not "real" mentions and
-          // should not trigger a response.
           hasMention = hasActiveMention(messageText, botMentionPattern);
-
           if (!hasMention) {
-            // Check if this is a thread reply that's allowed without mention
-            if (isThreadReply && allowThreadRepliesWithoutMention) {
-              // Thread reply without mention - allow for conversation flow
-              // SECURITY: Gateway service verifies a mapping exists before creating sessions.
-              // Unmapped threads (where bot was never mentioned) will be rejected.
-              // Set allow_thread_replies_without_mention: true only if you want to allow
-              // continuing conversations in existing threads without requiring @mentions.
-              allowedViaThreadReplyException = true;
-            } else {
-              // Reject: top-level message or thread reply not allowed without mention
-              return;
-            }
+            return;
           }
-
-          // Strip mention if present
-          if (hasMention) {
-            messageText = messageText.replace(botMentionReplacePattern, '').trim();
-          }
+          messageText = messageText.replace(botMentionReplacePattern, '').trim();
         }
+      } else if (botMentionPattern && botMentionReplacePattern) {
+        hasMention = hasActiveMention(messageText, botMentionPattern);
+        if (hasMention) {
+          messageText = messageText.replace(botMentionReplacePattern, '').trim();
+        }
+      }
+
+      if (!this.shouldProcessInboundEventOnce(event.channel, event.ts)) {
+        console.log(
+          `[slack] Skipping duplicate inbound event type=${eventType} channel=${event.channel} ts=${event.ts}`
+        );
+        return;
       }
 
       const threadId = event.thread_ts
@@ -1014,7 +2125,7 @@ export class SlackConnector implements GatewayConnector {
         : `${event.channel}-${event.ts}`;
 
       console.log(
-        `[slack] Inbound message: thread=${threadId} channel_type=${channelType} user=${event.user}`
+        `[slack] Accepted inbound message: thread=${threadId} channel_type=${channelType} user=${event.user}`
       );
 
       // Resolve Slack user profile (email + display name)
@@ -1034,15 +2145,31 @@ export class SlackConnector implements GatewayConnector {
         slackChannelName = await this.lookupChannelName(event.channel);
       }
 
+      const inboundFiles =
+        this.config.ingest_files === true ? extractSlackInboundFiles(event.files) : [];
+
       callback({
         threadId,
         text: messageText,
         userId: event.user ?? 'unknown',
         timestamp: event.ts ?? new Date().toISOString(),
+        ...(inboundFiles.length > 0 ? { files: inboundFiles } : {}),
         metadata: {
           channel: event.channel,
           channel_type: channelType,
+          ...(event.user ? { slack_user_id: event.user } : {}),
+          ...(slackTeamId ? { slack_team_id: slackTeamId } : {}),
           requires_mapping_verification: allowedViaThreadReplyException,
+          ...(this.botUserId ? { slack_bot_user_id: this.botUserId } : {}),
+          ...(typeof event.ts === 'string' ? { slack_message_ts: event.ts } : {}),
+          ...(typeof event.thread_ts === 'string'
+            ? { slack_thread_ts: event.thread_ts }
+            : typeof event.ts === 'string'
+              ? { slack_thread_ts: event.ts }
+              : {}),
+          slack_is_thread_reply: isThreadReply,
+          slack_has_mention: hasMention,
+          slack_event_type: eventType,
           ...(slackUserEmail ? { slack_user_email: slackUserEmail } : {}),
           ...(slackUserDisplayName ? { slack_user_name: slackUserDisplayName } : {}),
           ...(slackChannelName ? { slack_channel_name: slackChannelName } : {}),
@@ -1054,9 +2181,7 @@ export class SlackConnector implements GatewayConnector {
       });
     });
 
-    console.log('[slack] Starting Socket Mode client...');
     await this.socketMode.start();
-    console.log('[slack] Socket Mode client connected successfully!');
   }
 
   /**
@@ -1074,8 +2199,8 @@ export class SlackConnector implements GatewayConnector {
    *
    * Returns `{ text, blocks? }`. `text` is the mrkdwn fallback used for
    * notifications and clients that don't render Block Kit; `blocks` is set
-   * when the message contains a GFM table that we can emit as a native
-   * Block Kit `table` block (or a monospace section fallback alongside one).
+   * when the message contains tables that can benefit from Slack's native
+   * markdown/table blocks.
    */
   formatMessage(markdown: string): OutboundPayload {
     return markdownToSlackPayload(markdown);

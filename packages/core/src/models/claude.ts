@@ -13,28 +13,21 @@ export interface ClaudeModel {
 }
 
 /**
- * Available Claude model aliases (API-provided, auto-update to latest versions)
+ * Static fallback list of Claude model aliases.
+ *
+ * The primary source is the Anthropic Models API (fetched live by the
+ * /claude-models daemon service). This list is used when no API key is
+ * configured or the API call fails.
  *
  * Models are listed with newest first in each family.
  * For details, see: https://docs.anthropic.com/en/docs/about-claude/models
- *
- * Note: Anthropic's naming is inconsistent:
- * - Newer models (Claude 4.x) use version-based aliases: claude-sonnet-4-5, claude-opus-4-5
- * - Older models (Claude 3.x) use -latest suffix: claude-3-7-sonnet-latest
  */
 export const AVAILABLE_CLAUDE_MODEL_ALIASES: ClaudeModel[] = [
   {
     id: 'claude-fable-5',
     displayName: 'Claude Fable 5',
     family: 'claude-5',
-    description:
-      'Claude 5 model for agentic work with adaptive thinking and built-in safety classifiers',
-  },
-  {
-    id: 'claude-fable-5[1m]',
-    displayName: 'Claude Fable 5 (1M context)',
-    family: 'claude-5',
-    description: 'Fable 5 with extended 1M token context window',
+    description: 'Frontier model for complex reasoning, creative work, and agentic coding',
   },
   {
     id: 'claude-opus-4-8',
@@ -42,6 +35,12 @@ export const AVAILABLE_CLAUDE_MODEL_ALIASES: ClaudeModel[] = [
     family: 'claude-4',
     description:
       'Most capable model for complex reasoning, long-horizon agentic coding, and high-autonomy work',
+  },
+  {
+    id: 'claude-sonnet-5',
+    displayName: 'Claude Sonnet 5',
+    family: 'claude-5',
+    description: 'Best combination of speed and intelligence',
   },
   {
     id: 'claude-opus-4-7',
@@ -118,6 +117,6 @@ export const AVAILABLE_CLAUDE_MODEL_ALIASES: ClaudeModel[] = [
 ];
 
 /**
- * Default Claude model for new sessions (uses Sonnet 4.6 for best speed/intelligence balance)
+ * Default Claude model for new sessions (uses Sonnet 5 for best speed/intelligence balance)
  */
-export const DEFAULT_CLAUDE_MODEL = 'claude-sonnet-4-6';
+export const DEFAULT_CLAUDE_MODEL = 'claude-sonnet-5';

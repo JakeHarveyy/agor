@@ -8,10 +8,9 @@
  */
 
 import type { ActiveUser, Board, BoardID } from '@agor-live/client';
-import { Tooltip } from 'antd';
+import { Avatar, Flex, Tooltip, theme } from 'antd';
 import type { CSSProperties } from 'react';
-import { AgorAvatar } from '../AgorAvatar';
-import './Facepile.css';
+import { slackAvatarRadius, UserIdentityAvatar } from '../UserIdentityAvatar';
 
 export interface FacepileProps {
   activeUsers: ActiveUser[];
@@ -27,7 +26,7 @@ export interface FacepileProps {
 }
 
 /**
- * Facepile component showing active users with emoji avatars
+ * Facepile component showing active users with Slack-style user avatars
  */
 export const Facepile: React.FC<FacepileProps> = ({
   activeUsers,
@@ -36,6 +35,8 @@ export const Facepile: React.FC<FacepileProps> = ({
   boardById,
   style,
 }) => {
+  const { token } = theme.useToken();
+
   // Show first N users, with overflow count
   const visibleUsers = activeUsers.slice(0, maxVisible);
   const overflowUsers = activeUsers.slice(maxVisible);
@@ -46,7 +47,12 @@ export const Facepile: React.FC<FacepileProps> = ({
   }
 
   return (
-    <div className="facepile" style={style}>
+    <Flex
+      component="span"
+      align="center"
+      gap={8}
+      style={{ display: 'inline-flex', lineHeight: 1, verticalAlign: 'middle', ...style }}
+    >
       {visibleUsers.map(({ user, cursor, boardId }) => {
         const board = boardId && boardById ? boardById.get(boardId) : null;
         const boardName = board?.name || 'Unknown Board';
@@ -72,8 +78,9 @@ export const Facepile: React.FC<FacepileProps> = ({
               </div>
             }
           >
-            <span>
-              <AgorAvatar
+            <Flex component="span" style={{ lineHeight: 1 }}>
+              <UserIdentityAvatar
+                user={user}
                 style={{
                   cursor: canClick ? 'pointer' : 'default',
                 }}
@@ -82,10 +89,8 @@ export const Facepile: React.FC<FacepileProps> = ({
                     onUserClick(user.user_id, boardId, cursor);
                   }
                 }}
-              >
-                {user.emoji || '👤'}
-              </AgorAvatar>
-            </span>
+              />
+            </Flex>
           </Tooltip>
         );
       })}
@@ -93,23 +98,33 @@ export const Facepile: React.FC<FacepileProps> = ({
       {overflowCount > 0 && (
         <Tooltip
           title={
-            <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+            <Flex vertical gap={6}>
               {overflowUsers.map(({ user }) => (
-                <div key={user.user_id} style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-                  <span style={{ fontSize: 16 }}>{user.emoji || '👤'}</span>
+                <Flex key={user.user_id} align="center" gap={6}>
+                  <UserIdentityAvatar user={user} size={20} fontSize="16px" />
                   <span>{user.name || user.email}</span>
-                </div>
+                </Flex>
               ))}
-            </div>
+            </Flex>
           }
         >
-          <span>
-            <AgorAvatar fontSize="12px" style={{ fontWeight: 'bold' }}>
+          <Flex component="span" style={{ lineHeight: 1 }}>
+            <Avatar
+              shape="square"
+              size={40}
+              style={{
+                borderRadius: slackAvatarRadius(40),
+                backgroundColor: token.colorPrimaryBg,
+                color: token.colorText,
+                fontSize: 12,
+                fontWeight: 'bold',
+              }}
+            >
               +{overflowCount}
-            </AgorAvatar>
-          </span>
+            </Avatar>
+          </Flex>
         </Tooltip>
       )}
-    </div>
+    </Flex>
   );
 };

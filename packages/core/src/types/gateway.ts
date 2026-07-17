@@ -6,7 +6,8 @@
  */
 
 import type { AgenticToolName, CodexApprovalPolicy, CodexSandboxMode } from './agentic-tool';
-import type { BranchID, SessionID, UserID, UUID } from './id';
+import type { BranchID, SessionID, TaskID, UserID, UUID } from './id';
+import type { ScheduleID } from './schedule';
 import type { PermissionMode } from './session';
 import type { DefaultModelConfig } from './user';
 
@@ -20,15 +21,206 @@ export type GatewayChannelID = UUID;
 /** Thread-session mapping identifier */
 export type ThreadSessionMapID = UUID;
 
+/** Gateway outbound seed/audit message identifier */
+export type GatewayOutboundMessageID = UUID;
+
 // ============================================================================
 // Enums
 // ============================================================================
 
 /** Supported messaging platform types */
-export type ChannelType = 'slack' | 'discord' | 'whatsapp' | 'telegram' | 'github' | 'teams';
+export type ChannelType =
+  | 'slack'
+  | 'discord'
+  | 'whatsapp'
+  | 'telegram'
+  | 'github'
+  | 'teams'
+  | 'shortcut';
 
 /** Thread lifecycle status */
 export type ThreadStatus = 'active' | 'archived' | 'paused';
+
+/** Sensitive gateway config fields that must be encrypted at rest and redacted in responses. */
+export const GATEWAY_SENSITIVE_CONFIG_FIELDS = [
+  'bot_token',
+  'app_token',
+  'signing_secret',
+  'private_key',
+  'webhook_secret',
+  'app_password',
+  'api_token',
+] as const;
+
+/** Sentinel value used by gateway APIs/tools to represent a redacted secret. */
+export const GATEWAY_REDACTED_SENTINEL = '••••••••';
+
+/**
+ * Secrets that MUST be present for a channel of the given type to function.
+ *
+ * This is the single source of truth for the "enabled requires secrets"
+ * invariant: an enabled channel can never exist without these values. It is
+ * consumed by the create schema (reject enabled creates that omit them), the
+ * repository enable-time guard (assert on every write path), and the token
+ * widget. Browser-safe and dependency-free so both the UI and the daemon can
+ * import it.
+ *
+ * A disabled ("draft") channel may legally omit all of these — the guard only
+ * fires once the channel becomes enabled.
+ */
+export function getRequiredSecretFields(
+  channelType: ChannelType,
+  config: Record<string, unknown>
+): string[] {
+  switch (channelType) {
+    case 'slack': {
+      // Slack needs an app_token whenever the channel LISTENS (Socket Mode):
+      // an explicit socket connection, or any inbound surface flag. Only a
+      // purely outbound channel (sends, never listens) may omit it.
+      const wantsInbound =
+        config.connection_mode === 'socket' ||
+        config.enable_channels === true ||
+        config.enable_groups === true ||
+        config.enable_mpim === true;
+      const outboundOnly = config.outbound_enabled === true && !wantsInbound;
+      return outboundOnly ? ['bot_token'] : ['bot_token', 'app_token'];
+    }
+    case 'github':
+      return ['private_key'];
+    case 'teams':
+      return ['app_password'];
+    case 'shortcut':
+      // Shortcut is poll-based over the REST API — the API token is always
+      // required for an enabled channel (there is no outbound-only mode).
+      return ['api_token'];
+    default:
+      return [];
+  }
+}
+
+// ============================================================================
+// Agent Tool Capabilities
+// ============================================================================
+
+/**
+ * Per-channel toggles for agent-callable gateway MCP tools, stored at
+ * `config.agent_tools` on Slack gateway channels.
+ *
+ * Each key is one capability that maps 1:1 to an MCP tool: the toggle gates
+ * the tool at call time AND drives the Slack OAuth scopes the manifest
+ * requests (see `SLACK_AGENT_TOOL_SCOPES` in the manifest generator), so
+ * tool-gating and scopes can never drift. Extending the model is one seam:
+ * add a key here, a default below, and its scope list in the manifest map.
+ *
+ * Browser-safe and dependency-free so both the UI and the daemon can import it.
+ */
+export interface SlackAgentToolsConfig {
+  /** Read mapped Slack thread history (agor_gateway_slack_thread_history_get). */
+  thread_history?: boolean;
+  /** Read whole-channel Slack history (agor_gateway_slack_channel_history_get). */
+  channel_history?: boolean;
+  /** Add/remove emoji reactions (agor_gateway_slack_reaction_add / _remove). */
+  reactions?: boolean;
+  /** Upload a file/image to a channel or thread (agor_gateway_slack_file_upload). */
+  file_upload?: boolean;
+  /** Download a Slack file into the upload area by id (agor_gateway_slack_file_download). */
+  file_download?: boolean;
+}
+
+export type SlackAgentToolCapability = keyof SlackAgentToolsConfig;
+
+/**
+ * Defaults applied when a capability is absent from `config.agent_tools`
+ * (including channels created before the capability model existed):
+ *
+ * - `thread_history` defaults ON — the thread-history tool shipped ungated,
+ *   so absent config must keep it working on existing channels.
+ * - `channel_history` defaults OFF — reading arbitrary channel history is a
+ *   broader data surface than the mapped thread and needs Slack scopes the
+ *   installed app may not hold, so it requires explicit opt-in.
+ * - `reactions` and `file_upload` default OFF — both add write scopes
+ *   (`reactions:write`, `files:write`) the installed app may not hold, so
+ *   they require explicit opt-in.
+ * - `file_download` defaults OFF — it lets agents pull workspace file content
+ *   on demand and adds the `files:read` scope the installed app may not hold,
+ *   so it requires explicit opt-in.
+ */
+export const SLACK_AGENT_TOOL_DEFAULTS: Record<SlackAgentToolCapability, boolean> = {
+  thread_history: true,
+  channel_history: false,
+  reactions: false,
+  file_upload: false,
+  file_download: false,
+};
+
+/**
+ * Resolve a channel's `config.agent_tools` value (possibly absent or
+ * malformed) into a fully-populated capability map with defaults applied.
+ */
+export function resolveSlackAgentTools(raw: unknown): Record<SlackAgentToolCapability, boolean> {
+  const config =
+    raw && typeof raw === 'object' && !Array.isArray(raw) ? (raw as Record<string, unknown>) : {};
+  const resolved = { ...SLACK_AGENT_TOOL_DEFAULTS };
+  for (const capability of Object.keys(resolved) as SlackAgentToolCapability[]) {
+    if (typeof config[capability] === 'boolean') {
+      resolved[capability] = config[capability] as boolean;
+    }
+  }
+  return resolved;
+}
+
+// ============================================================================
+// Connection Probe Results
+// ============================================================================
+
+/**
+ * A single capability that a connection probe could not establish.
+ *
+ * `capability` names the thing that failed (e.g. `api_token`, `bot_token`, or
+ * `channel_access`). The optional Slack fields preserve verbatim
+ * `missing_scope` detail when that connector can provide it.
+ */
+export interface GatewayConnectionTestFailure {
+  capability: string;
+  reason: string;
+  slackError?: string;
+  needed?: string;
+  provided?: string;
+}
+
+/**
+ * Result of a best-effort gateway connector connection probe.
+ *
+ * Probes exercise real platform calls but cannot prove everything about a
+ * working installation. `notVerifiable` enumerates what green does NOT
+ * guarantee; connector-specific optional fields carry richer details.
+ */
+export interface GatewayConnectionTestResult {
+  ok: boolean;
+  team?: { id: string; name: string };
+  bot?: { userId: string; name: string };
+  appTokenValid?: boolean;
+  channelAccess?: { channelId: string; ok: boolean }[];
+  failures: GatewayConnectionTestFailure[];
+  notVerifiable: string[];
+}
+
+/** @deprecated Use {@link GatewayConnectionTestFailure}. */
+export type SlackTestFailure = GatewayConnectionTestFailure;
+
+/** @deprecated Use {@link GatewayConnectionTestResult}. */
+export type SlackTestResult = GatewayConnectionTestResult;
+
+/**
+ * Identity of the Slack app behind a channel's bot token, resolved server-side
+ * via `auth.test` → `bots.info` (which only needs the baseline `users:read`
+ * scope). Fields are null when resolution fails — never an error — so callers
+ * can degrade to a generic Slack link. Never carries token material.
+ */
+export interface SlackAppInfo {
+  appId: string | null;
+  teamId: string | null;
+}
 
 // ============================================================================
 // Agentic Tool Configuration
@@ -56,9 +248,10 @@ export interface GatewayEnvVar {
 
 export interface GatewayAgenticConfig {
   agent: AgenticToolName;
+  /** Live preset reference. Remaining runtime fields are ignored when present. */
+  presetId?: import('./agentic-tool-preset').AgenticToolPresetID;
   modelConfig?: DefaultModelConfig;
   permissionMode?: PermissionMode;
-  mcpServerIds?: string[];
   codexSandboxMode?: CodexSandboxMode;
   codexApprovalPolicy?: CodexApprovalPolicy;
   codexNetworkAccess?: boolean;
@@ -95,6 +288,8 @@ export interface GatewayChannel {
   channel_key: string; // UUID — the auth secret for inbound webhooks
   config: Record<string, unknown>; // Platform credentials (encrypted at rest)
   agentic_config: GatewayAgenticConfig | null; // Session creation settings
+  /** MCP servers attached independently of the agentic-tool configuration. */
+  mcp_server_ids?: string[];
   enabled: boolean;
   created_at: string; // ISO 8601
   updated_at: string; // ISO 8601
@@ -117,4 +312,36 @@ export interface ThreadSessionMap {
   last_message_at: string;
   status: ThreadStatus;
   metadata: Record<string, unknown> | null;
+}
+
+/**
+ * Gateway outbound message - durable seed/audit record for proactive emits.
+ *
+ * These rows intentionally do not imply a thread-session mapping. The mapping is
+ * created only when a human replies to the seeded external thread.
+ */
+export interface GatewayOutboundMessage {
+  id: GatewayOutboundMessageID;
+  gateway_channel_id: GatewayChannelID;
+  channel_type: ChannelType;
+
+  platform_channel_id: string;
+  platform_message_id: string;
+  platform_thread_id: string;
+  platform_permalink: string | null;
+
+  target_branch_id: BranchID;
+  emitted_by_user_id: UserID;
+  emitted_by_session_id: SessionID | null;
+  emitted_by_task_id: TaskID | null;
+  emitted_by_schedule_id: ScheduleID | null;
+
+  message_text: string;
+  message_preview: string;
+  metadata: Record<string, unknown> | null;
+  consumed_by_session_id: SessionID | null;
+  consumed_at: string | null;
+
+  created_at: string;
+  updated_at: string;
 }

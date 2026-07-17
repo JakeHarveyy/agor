@@ -4,7 +4,6 @@
 
 import type { ManagedEnvExecutionMode } from '../environment/webhook';
 import type { BranchPermissionLevel } from '../types/branch';
-import type { DaemonResourcesConfig } from '../types/config-resources';
 import type { UserRole } from '../types/user';
 
 export type { ManagedEnvExecutionMode };
@@ -23,28 +22,6 @@ export type ManagedEnvsMinimumRole = 'none' | UserRole;
  */
 // biome-ignore lint/suspicious/noExplicitAny: Escape hatch for user-provided JSON data
 export type UnknownJson = any;
-
-/**
- * Global default values
- */
-export interface AgorDefaults {
-  /** Default board for new sessions */
-  board?: string;
-
-  /** Default agent for new sessions */
-  agent?: string;
-}
-
-/**
- * Display settings
- */
-export interface AgorDisplaySettings {
-  /** Table style: unicode, ascii, or minimal */
-  tableStyle?: 'unicode' | 'ascii' | 'minimal';
-
-  /** Enable color output */
-  colorOutput?: boolean;
-}
 
 /**
  * Daemon settings
@@ -115,9 +92,11 @@ export interface AgorDaemonSettings {
    *  agents discover others via agor_search_tools (default: true) */
   mcpToolSearch?: boolean;
 
-  /** Unix user the daemon runs as. Used to ensure daemon has access to all Unix groups.
-   * Required when Unix isolation is enabled (branch_rbac or unix_user_mode).
-   * In dev mode without isolation, falls back to current process user. */
+  /** Unix user the daemon runs as. Used to refresh supplemental Unix groups.
+   * Required when Unix impersonation/isolation is enabled (`unix_user_mode`
+   * is `insulated` or `strict`). App-level `branch_rbac` alone does not
+   * require Unix impersonation. In dev mode without isolation, falls back to
+   * current process user. */
   unix_user?: string;
 
   /** Instance label for deployment identification (e.g., "staging", "prod-us-east").
@@ -166,6 +145,15 @@ export interface AgorDaemonSettings {
  * UI settings
  */
 export interface AgorUISettings {
+  /**
+   * Public user-facing base URL for the UI.
+   *
+   * Legacy/compatibility alias for daemon.base_url in older configs. New
+   * installs should prefer daemon.base_url so all external link builders share
+   * one setting.
+   */
+  base_url?: string;
+
   /** UI dev server port (default: 5173) */
   port?: number;
 
@@ -228,21 +216,16 @@ export interface AgorExternalLaunchSettings {
   allow_admin_roles?: boolean;
 
   /**
+   * Trust a verified assertion email when linking launch auth to an existing
+   * local user that does not yet have this provider identity recorded.
+   */
+  trust_verified_email_for_linking?: boolean;
+
+  /**
    * Optional HTTP(S) URL shown in the unauthenticated UI when external launch
    * sign-in is unavailable, missing, expired, or invalid.
    */
   login_redirect_url?: string;
-}
-
-/**
- * OpenCode.ai integration settings
- */
-export interface AgorOpenCodeSettings {
-  /** Enable OpenCode integration (default: false) */
-  enabled?: boolean;
-
-  /** URL where OpenCode server is running (default: http://localhost:4096) */
-  serverUrl?: string;
 }
 
 /**
@@ -369,9 +352,6 @@ export interface AgorExecutionSettings {
    * branch requires at least `session` permission on that branch.
    */
   allow_web_terminal?: boolean;
-
-  /** Enable experimental Cursor SDK provider surfaces (default: false). */
-  cursor_sdk_enabled?: boolean;
 
   /** Allow superadmin role (default: false). When true, superadmin role gets branch RBAC bypass. Opt-in for self-hosted deployments. */
   allow_superadmin?: boolean;
@@ -815,6 +795,51 @@ export interface AgorPathSettings {
 }
 
 /**
+ * Public open-source telemetry settings.
+ *
+ * This is intentionally separate from `analytics`: `analytics` is for
+ * operator-configured instance analytics, while `telemetry` is Agor's
+ * lightweight opt-in/open-source install and aggregate usage telemetry.
+ */
+export interface AgorTelemetrySettings {
+  /** Ongoing telemetry opt-in. Undefined means the user has not answered yet. */
+  enabled?: boolean;
+
+  /** Random anonymous install identifier. Never derived from host/user data. */
+  instance_id?: string;
+
+  /** Advanced override for the Segment-compatible batch endpoint. Usually omitted. */
+  endpoint?: string | null;
+
+  /** Advanced override for direct Segment/RudderStack delivery. Usually omitted. */
+  write_key?: string | null;
+
+  /** Debug delivery without dumping payloads by default. */
+  debug?: boolean;
+
+  /** Delivery timeout. Defaults to 3000ms. */
+  timeout_ms?: number;
+
+  /** Batch flush interval. Defaults to 1000ms. */
+  flush_interval_ms?: number;
+
+  /** Maximum events per batch. Defaults to 10. */
+  max_batch_size?: number;
+
+  /** Last one-time install/result telemetry event sent by agor init. */
+  install_ping_sent_at?: string;
+
+  /** Last daemon active heartbeat day (YYYY-MM-DD). */
+  last_daemon_active_day?: string;
+
+  /** Last aggregate usage summary day (YYYY-MM-DD). */
+  last_usage_summary_day?: string;
+
+  /** Last daemon version that emitted daemon.upgraded. */
+  last_reported_version?: string;
+}
+
+/**
  * Backend analytics settings.
  *
  * Disabled by default. When enabled, daemon/server code sends curated
@@ -884,59 +909,6 @@ export interface AgorAnalyticsModulePluginSettings {
 }
 
 /**
- * Supported credential keys (enum for type safety)
- */
-export enum CredentialKey {
-  ANTHROPIC_API_KEY = 'ANTHROPIC_API_KEY',
-  ANTHROPIC_AUTH_TOKEN = 'ANTHROPIC_AUTH_TOKEN',
-  ANTHROPIC_BASE_URL = 'ANTHROPIC_BASE_URL',
-  OPENAI_API_KEY = 'OPENAI_API_KEY',
-  GEMINI_API_KEY = 'GEMINI_API_KEY',
-  COPILOT_GITHUB_TOKEN = 'COPILOT_GITHUB_TOKEN',
-  CURSOR_API_KEY = 'CURSOR_API_KEY',
-}
-
-/**
- * Tool credentials (API keys, tokens, etc.)
- */
-export interface AgorCredentials {
-  /** Anthropic API key for Claude Code */
-  ANTHROPIC_API_KEY?: string;
-
-  /** Anthropic auth token for proxy/enterprise setups (alternative to API key)
-   * Used by Claude Code SDK for token-based authentication (e.g., AWS Bedrock, OAuth proxies) */
-  ANTHROPIC_AUTH_TOKEN?: string;
-
-  /** Custom Anthropic API base URL (default: https://api.anthropic.com)
-   * Useful for proxies, Claude Enterprise deployments, or third-party compatible APIs */
-  ANTHROPIC_BASE_URL?: string;
-
-  /** OpenAI API key for Codex */
-  OPENAI_API_KEY?: string;
-
-  /** Google Gemini API key */
-  GEMINI_API_KEY?: string;
-
-  /** GitHub token for Copilot */
-  COPILOT_GITHUB_TOKEN?: string;
-
-  /** Cursor API key for the experimental Cursor SDK provider */
-  CURSOR_API_KEY?: string;
-}
-
-/**
- * Onboarding settings (consumed by UI wizard; may be set by existing installs)
- */
-export interface AgorOnboardingSettings {
-  /** Whether assistant setup is pending (set by existing installs, consumed by UI wizard) */
-  assistantPending?: boolean;
-  /** @deprecated Use assistantPending instead */
-  persistedAgentPending?: boolean;
-  /** Clone URL for the framework repo */
-  frameworkRepoUrl?: string;
-}
-
-/**
  * Branch-level defaults.
  *
  * Top-level `branches:` section (not under `execution:`) because these
@@ -968,6 +940,12 @@ export interface AgorBranchesSettings {
    * - `'write'` — full write access via branch group
    */
   others_fs_access_default?: 'none' | 'read' | 'write';
+}
+
+/** Operator-owned defaults for creating AI teammates. */
+export interface AgorTeammateSettings {
+  /** Repository cloned by the onboarding wizard when creating the first teammate. */
+  framework_repo_url?: string;
 }
 
 /**
@@ -1031,15 +1009,32 @@ export interface AgorKnowledgeSettings {
 }
 
 /**
+ * App-level multi-tenancy settings.
+ *
+ * `static` preserves today's single-tenant behavior: every request belongs to
+ * one configured tenant id. `required_from_auth` is Postgres-only hosted/cloud
+ * mode and must resolve a tenant from trusted authentication or request
+ * context; missing tenant context should fail closed before tenant-owned data is
+ * accessed.
+ */
+export interface AgorMultiTenancySettings {
+  /** Multi-tenancy mode. Defaults to `static`. */
+  mode?: 'static' | 'required_from_auth';
+
+  /** Static tenant id for self-hosted/single-instance mode. Defaults to `default`. */
+  static_tenant_id?: string;
+
+  /** JWT/user claim name to read in `required_from_auth` mode, e.g. `tenant_id`. */
+  auth_claim?: string;
+
+  /** Optional trusted HTTP header set by an auth/edge layer, e.g. `x-agor-tenant-id`. */
+  trusted_header?: string;
+}
+
+/**
  * Complete Agor configuration
  */
 export interface AgorConfig {
-  /** Global defaults */
-  defaults?: AgorDefaults;
-
-  /** Display settings */
-  display?: AgorDisplaySettings;
-
   /** Daemon settings */
   daemon?: AgorDaemonSettings;
 
@@ -1048,9 +1043,6 @@ export interface AgorConfig {
 
   /** Database configuration */
   database?: AgorDatabaseSettings;
-
-  /** OpenCode.ai integration settings */
-  opencode?: AgorOpenCodeSettings;
 
   /** Generic external one-time launch-code authentication. */
   external_launch?: AgorExternalLaunchSettings;
@@ -1064,20 +1056,23 @@ export interface AgorConfig {
   /** Branch-level defaults (others_can_default, others_fs_access_default) */
   branches?: AgorBranchesSettings;
 
+  /** Operator-owned teammate bootstrap settings. */
+  teammates?: AgorTeammateSettings;
+
   /** Path configuration (data_home for repos/branches separation) */
   paths?: AgorPathSettings;
 
   /** Backend analytics settings. Disabled by default. */
   analytics?: AgorAnalyticsSettings;
 
+  /** Public open-source telemetry settings. */
+  telemetry?: AgorTelemetrySettings;
+
   /** Knowledge Base semantic search settings. */
   knowledge?: AgorKnowledgeSettings;
 
-  /** Tool credentials (API keys, tokens) */
-  credentials?: AgorCredentials;
-
-  /** Onboarding settings (CLI init → UI wizard) */
-  onboarding?: AgorOnboardingSettings;
+  /** App-level multi-tenancy settings. Defaults to static/default tenant. */
+  multi_tenancy?: AgorMultiTenancySettings;
 
   /**
    * HTTP proxy passthroughs for third-party APIs that don't return CORS
@@ -1088,47 +1083,21 @@ export interface AgorConfig {
    * See `apps/agor-docs/pages/guide/api-proxies.mdx`.
    */
   proxies?: Record<string, AgorProxyConfig>;
-
-  /** Declarative resource definitions for headless/k8s deployments */
-  resources?: DaemonResourcesConfig;
-
-  /**
-   * Service tier configuration for lean daemon mode.
-   *
-   * Controls which FeathersJS service groups are registered and how they're exposed.
-   * Each group can be: 'off' | 'internal' | 'readonly' | 'on' (default: 'on').
-   *
-   * @example Executor pod config
-   * ```yaml
-   * services:
-   *   core: on
-   *   branches: on
-   *   repos: readonly
-   *   users: internal
-   *   boards: off
-   *   cards: off
-   * ```
-   */
-  services?: import('../types/config-services').DaemonServicesConfig;
 }
 
 /**
  * Valid config keys (includes nested keys with dot notation)
  */
 export type ConfigKey =
-  | `defaults.${keyof AgorDefaults}`
-  | `display.${keyof AgorDisplaySettings}`
   | `daemon.${keyof AgorDaemonSettings}`
   | `ui.${keyof AgorUISettings}`
   | `database.${keyof AgorDatabaseSettings}`
-  | `opencode.${keyof AgorOpenCodeSettings}`
   | `external_launch.${keyof AgorExternalLaunchSettings}`
   | `execution.${keyof AgorExecutionSettings}`
   | `security.${keyof AgorSecuritySettings}`
   | `branches.${keyof AgorBranchesSettings}`
+  | `teammates.${keyof AgorTeammateSettings}`
   | `paths.${keyof AgorPathSettings}`
   | `analytics.${keyof AgorAnalyticsSettings}`
-  | `knowledge.${keyof AgorKnowledgeSettings}`
-  | `credentials.${keyof AgorCredentials}`
-  | `onboarding.${keyof AgorOnboardingSettings}`
-  | `services.${keyof import('../types/config-services').DaemonServicesConfig}`;
+  | `telemetry.${keyof AgorTelemetrySettings}`
+  | `knowledge.${keyof AgorKnowledgeSettings}`;

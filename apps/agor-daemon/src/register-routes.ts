@@ -2,23 +2,33 @@
  * Authentication & Custom REST Routes Registration
  *
  * Registers authentication configuration, token refresh, custom REST
- * endpoints (prompt, stop, fork, spawn, upload, etc.), and service-tier hooks.
+ * endpoints (prompt, stop, fork, spawn, upload, etc.), and the error handler.
  * Extracted from index.ts for maintainability.
  */
 
-import { type AgorConfig, loadConfig, resolveBranchStorageConfig } from '@agor/core/config';
+import {
+  type AgorConfig,
+  isTenantAgenticToolEnabled,
+  resolveBranchStorageConfig,
+  resolveMultiTenancyConfig,
+  resolveTeammateFrameworkRepoUrl,
+  resolveTenantContext,
+} from '@agor/core/config';
 import {
   BranchRepository,
-  type Database,
+  bindRepositoryToTenantUnitOfWork,
   generateId,
+  getCurrentTenantId,
   MCPServerRepository,
   MessagesRepository,
   RepoRepository,
+  runWithTenantDatabaseScope,
   ScheduleRepository,
   SessionMCPServerRepository,
   SessionRepository,
   shortId,
   TaskRepository,
+  type TenantScopeAwareDatabase,
   UsersRepository,
 } from '@agor/core/db';
 import { MANAGED_ENV_EXECUTION_MODE_DEFAULT } from '@agor/core/environment/webhook';
@@ -36,7 +46,6 @@ import {
 import { type PermissionDecision, PermissionService } from '@agor/core/permissions';
 import type {
   AuthenticatedParams,
-  DaemonServicesConfig,
   HookContext,
   Message,
   MessageSource,
@@ -44,8 +53,7 @@ import type {
   Params,
   PermissionRequestContent,
   ScheduleID,
-  ServiceGroupName,
-  ServiceTier,
+  Session,
   SessionID,
   SessionMCPServer,
   StreamingEventType,
@@ -59,21 +67,21 @@ import {
   hasMinimumRole,
   MessageRole,
   ROLES,
-  SERVICE_GROUP_NAMES,
   SessionStatus,
   TaskStatus,
 } from '@agor/core/types';
 import { NotFoundError } from '@agor/core/utils/errors';
 import type { Request } from 'express';
 import { rateLimit } from 'express-rate-limit';
-import jwt from 'jsonwebtoken';
+import { createIssueBrowserTokensHook } from './auth/issue-browser-tokens-hook.js';
 import { createLaunchAuthService, resolvePublicLaunchAuthSettings } from './auth/launch-auth.js';
+import { createRefreshTokenService } from './auth/refresh-token-service.js';
 import {
   issueRuntimeToken,
-  issueRuntimeTokenPair,
   RUNTIME_JWT_AUDIENCE,
   RUNTIME_JWT_ISSUER,
 } from './auth/runtime-tokens.js';
+import { authTokenIssuedAtClaim } from './auth/token-invalidation.js';
 import type {
   BoardsServiceImpl,
   BranchesServiceImpl,
@@ -83,6 +91,16 @@ import type {
   TasksServiceImpl,
 } from './declarations.js';
 import { killExecutorProcess } from './executor-tracking.js';
+import { probeDatabase, probePendingMigrations } from './health/db-probe.js';
+import {
+  authenticatedHealthDb,
+  healthMigrations,
+  healthStatus,
+  publicHealthDb,
+} from './health/payload.js';
+import { registerHealthProbeRoutes } from './health/routes.js';
+import { resolveForUserIdWithGate } from './oauth-auth-helpers.js';
+import type { GatewayService } from './services/gateway.js';
 import {
   ScheduleBusyError,
   ScheduleNotReadyError,
@@ -90,14 +108,13 @@ import {
 } from './services/scheduler.js';
 import type { TerminalsService } from './services/terminals.js';
 import { createUserApiKeysService } from './services/user-api-keys.js';
-import { markLocalAuthenticationLookup } from './services/users.js';
+import { markAuthenticationUserLookup, markLocalAuthenticationLookup } from './services/users.js';
 import { registerProxies } from './setup/proxies.js';
-import { applyTierHooks } from './setup/service-tiers.js';
 import { appendSystemMessage } from './utils/append-system-message.js';
 import { buildAuthRateLimitKey } from './utils/auth-rate-limit-key.js';
 import {
   ensureMinimumRole,
-  registerAuthenticatedRoute,
+  registerAuthenticatedRoute as registerAuthenticatedRouteBase,
   requireMinimumRole,
 } from './utils/authorization.js';
 import {
@@ -110,15 +127,28 @@ import {
 } from './utils/branch-authorization.js';
 import { buildInitialUserMessage } from './utils/build-initial-user-message.js';
 import { buildPrompterPrefixedPrompt } from './utils/build-prompter-prefix.js';
+import { emitServiceEvent } from './utils/emit-service-event.js';
 import {
   redactMCPServerSecrets,
   shouldExposeMCPServerSecrets,
 } from './utils/mcp-header-secrets.js';
 import { canControlCliSession } from './utils/mcp-token-authorization.js';
 import { ensureScheduleRunsAsCaller } from './utils/schedule-hooks.js';
-import { findActiveTasksForSession } from './utils/session-tasks.js';
+import {
+  deferWithSessionQueueTenantScope,
+  runWithSessionQueueTenantScope,
+} from './utils/session-queue-tenant-scope.js';
+import { stopSessionPreserveQueue } from './utils/session-stop.js';
+import {
+  sessionCanStartTask,
+  shouldReconcileSessionPromptState,
+} from './utils/session-task-state.js';
 import { type SessionTurnLocks, withSessionTurnLock } from './utils/session-turn-lock.js';
 import { normalizeMessageSource, runExistingTask } from './utils/task-runner.js';
+import {
+  createTenantDatabaseScopeAroundHook,
+  deferWithTenantContext,
+} from './utils/tenant-db-scope.js';
 import {
   createUploadMiddleware,
   enforceParsedTotalUploadSize,
@@ -149,6 +179,14 @@ export class AgorLocalStrategy extends LocalStrategy {
     markLocalAuthenticationLookup(params);
     return super.findEntity(username, params);
   }
+
+  async getEntity(result: unknown, params: Params) {
+    // Local login's final entity lookup also needs backend-only auth metadata
+    // so freshly issued tokens can be bumped past a just-written invalidation
+    // marker. The authentication hook redacts the metadata before returning.
+    markAuthenticationUserLookup(params);
+    return super.getEntity(result, params);
+  }
 }
 
 /**
@@ -164,6 +202,10 @@ interface RouteParams extends Params {
   user?: User;
 }
 
+function isServiceAccountRoute(params: RouteParams): boolean {
+  return (params.user as { _isServiceAccount?: boolean } | undefined)?._isServiceAccount === true;
+}
+
 /**
  * Type guard to check if result is paginated
  */
@@ -175,11 +217,9 @@ function isPaginated<T>(result: T[] | Paginated<T>): result is Paginated<T> {
  * Interface for dependencies needed by route registration.
  */
 export interface RegisterRoutesContext {
-  db: Database;
+  db: TenantScopeAwareDatabase;
   app: Application & { io?: import('socket.io').Server };
   config: AgorConfig;
-  svcEnabled: (group: string) => boolean;
-  svcTier: (group: string) => ServiceTier;
   jwtSecret: string;
   branchRbacEnabled: boolean;
   requireAuth: (context: HookContext) => Promise<HookContext>;
@@ -194,7 +234,6 @@ export interface RegisterRoutesContext {
    * signal for the version-sync banner — see setup/build-info.ts.
    */
   DAEMON_BUILD_INFO: import('./setup/build-info.js').BuildInfo;
-  servicesConfig: DaemonServicesConfig;
   /**
    * Resolved security config (CSP/CORS after defaults+extras+override merge).
    * Used by /health to surface the effective policy to admin users.
@@ -218,15 +257,13 @@ export interface RegisterRoutesContext {
 }
 
 /**
- * Register authentication configuration, custom REST routes, and tier hooks.
+ * Register authentication configuration and custom REST routes.
  */
 export async function registerRoutes(ctx: RegisterRoutesContext): Promise<void> {
   const {
     db,
     app,
     config,
-    svcEnabled,
-    svcTier,
     jwtSecret,
     branchRbacEnabled,
     requireAuth,
@@ -236,7 +273,6 @@ export async function registerRoutes(ctx: RegisterRoutesContext): Promise<void> 
     DAEMON_PORT: _DAEMON_PORT,
     DAEMON_VERSION,
     DAEMON_BUILD_INFO,
-    servicesConfig,
     resolvedSecurity,
     sessionsService,
     messagesService,
@@ -252,6 +288,50 @@ export async function registerRoutes(ctx: RegisterRoutesContext): Promise<void> 
   const usersService = app.service('users');
   const tasksService = app.service('tasks') as unknown as TasksServiceImpl;
   const reposService = app.service('repos') as unknown as ReposServiceImpl;
+  const tenantDatabaseScopeAround = createTenantDatabaseScopeAroundHook({ db, config, jwtSecret });
+  const tenantIdentityAround = createTenantDatabaseScopeAroundHook({
+    db,
+    config,
+    jwtSecret,
+    transaction: false,
+  });
+  const inTenantDatabaseScope = <T>(hook: (context: HookContext) => T) =>
+    async function scopedHook(context: HookContext): Promise<Awaited<T>> {
+      return runWithTenantDatabaseScope(db, context.params.tenant?.tenant_id, async () =>
+        hook(context)
+      ) as Promise<Awaited<T>>;
+    };
+
+  /** Schedule orchestration after commit with tenant identity but no open transaction. */
+  function deferInFreshTenantScope(params: RouteParams, fn: () => Promise<void>): void {
+    deferWithTenantContext(params, fn);
+  }
+
+  const registerAuthenticatedRoute: typeof registerAuthenticatedRouteBase = (
+    routeApp,
+    path,
+    service,
+    authConfig,
+    routeRequireAuth,
+    options = {}
+  ) =>
+    registerAuthenticatedRouteBase(routeApp, path, service, authConfig, routeRequireAuth, {
+      ...options,
+      around: [tenantDatabaseScopeAround, ...(options.around ?? [])],
+    });
+
+  const registerLongAuthenticatedRoute: typeof registerAuthenticatedRouteBase = (
+    routeApp,
+    path,
+    service,
+    authConfig,
+    routeRequireAuth,
+    options = {}
+  ) =>
+    registerAuthenticatedRouteBase(routeApp, path, service, authConfig, routeRequireAuth, {
+      ...options,
+      around: [tenantIdentityAround, ...(options.around ?? [])],
+    });
 
   // Helper: safely get a service (returns undefined if not registered due to tier=off)
   const safeService = (path: string) => {
@@ -273,6 +353,8 @@ export async function registerRoutes(ctx: RegisterRoutesContext): Promise<void> 
   // ============================================================================
 
   const authStrategiesArray = ['api-key', 'jwt', 'local'];
+  const multiTenancy = resolveMultiTenancyConfig(config);
+  const tenantTokenClaim = multiTenancy.auth_claim ?? 'tenant_id';
   if (sessionTokenService) {
     authStrategiesArray.push('session-token');
   }
@@ -312,7 +394,7 @@ export async function registerRoutes(ctx: RegisterRoutesContext): Promise<void> 
   const { ServiceJWTStrategy } = await import('./auth/service-jwt-strategy.js');
 
   // Register authentication strategies
-  authentication.register('jwt', new ServiceJWTStrategy(sessionTokenService));
+  authentication.register('jwt', new ServiceJWTStrategy(sessionTokenService, tenantTokenClaim));
   authentication.register('local', new AgorLocalStrategy());
 
   // Register API key authentication strategy
@@ -379,31 +461,22 @@ export async function registerRoutes(ctx: RegisterRoutesContext): Promise<void> 
     security: [],
   };
 
-  // Hook: Add refresh token to authentication response.
+  // Hook: Issue browser access + refresh tokens with millisecond issue time.
+  // Machine-token logins (executor-session / service) keep their original
+  // token — see createIssueBrowserTokensHook for why.
   // Rate limiting is enforced by express-rate-limit middleware mounted on
   // `/authentication` above — by the time we reach this hook the limiter
   // has already 429'd any over-quota request.
   authService.hooks({
     after: {
       create: [
-        // biome-ignore lint/suspicious/noExplicitAny: FeathersJS context type not fully typed
-        async (context: any) => {
-          authEventDebug('✅ Authentication succeeded:', {
-            strategy: context.result?.authentication?.strategy,
-            hasUser: !!context.result?.user,
-            user_id: context.result?.user?.user_id,
-            hasAccessToken: !!context.result?.accessToken,
-          });
-
-          if (context.result?.user) {
-            context.result.refreshToken = issueRuntimeToken(
-              { sub: context.result.user.user_id, type: 'refresh' },
-              jwtSecret,
-              REFRESH_TOKEN_TTL
-            );
-          }
-          return context;
-        },
+        createIssueBrowserTokensHook({
+          jwtSecret,
+          accessTokenTtl: ACCESS_TOKEN_TTL,
+          refreshTokenTtl: REFRESH_TOKEN_TTL,
+          tenantClaim: tenantTokenClaim,
+          debug: authEventDebug,
+        }),
       ],
     },
   });
@@ -437,51 +510,16 @@ export async function registerRoutes(ctx: RegisterRoutesContext): Promise<void> 
   // Refresh token endpoint
   // ============================================================================
 
-  app.use('/authentication/refresh', {
-    async create(data: { refreshToken: string }, _params?: Params) {
-      // Rate limiting handled by express-rate-limit at the
-      // /authentication mount point (path-prefix match catches /refresh).
-      try {
-        const decoded = jwt.verify(data.refreshToken, jwtSecret, {
-          issuer: RUNTIME_JWT_ISSUER,
-          audience: RUNTIME_JWT_AUDIENCE,
-        }) as { sub: string; type: string };
-
-        if (decoded.type !== 'refresh') {
-          throw new Error('Invalid token type');
-        }
-
-        const user = await usersService.get(decoded.sub as import('@agor/core/types').UUID);
-
-        // Use the SAME ACCESS_TOKEN_TTL as the auth-service config above —
-        // otherwise this endpoint silently downgrades the access-token
-        // hardening. Refresh tokens get the standard 30-day TTL.
-        const tokens = issueRuntimeTokenPair(user, jwtSecret, ACCESS_TOKEN_TTL, REFRESH_TOKEN_TTL);
-
-        // Return the full user object — matches what POST /authentication
-        // returns via the FeathersJS auth service. Stripping fields here
-        // (previously: only user_id/email/name/emoji/role) silently dropped
-        // `must_change_password` after every token refresh, breaking the
-        // forced-password-change UI guard in App.tsx and showing the user a
-        // black page with "Failed to load data — Password change required."
-        // instead of the change-password modal. `usersService.get` already
-        // omits secrets (password hash, raw API keys, raw env var values)
-        // via rowToUser — see services/users.ts.
-        return {
-          accessToken: tokens.accessToken,
-          refreshToken: tokens.refreshToken,
-          user,
-        };
-      } catch (_error) {
-        // Must throw NotAuthenticated (not plain Error) so the UI's
-        // isDefiniteAuthFailure classifier (apps/agor-ui/src/utils/authErrors.ts)
-        // recognizes a dead refresh token as a 401-class failure and clears
-        // session state. A plain Error has no status/name and gets treated as
-        // transient, leading the single-flight refresh loop to keep retrying.
-        throw new NotAuthenticated('Invalid or expired refresh token');
-      }
-    },
-  });
+  app.use(
+    '/authentication/refresh',
+    createRefreshTokenService({
+      jwtSecret,
+      accessTokenTtl: ACCESS_TOKEN_TTL,
+      refreshTokenTtl: REFRESH_TOKEN_TTL,
+      tenantClaim: tenantTokenClaim,
+      usersService,
+    })
+  );
 
   // biome-ignore lint/suspicious/noExplicitAny: FeathersJS service type not fully typed
   const refreshService = app.service('authentication/refresh') as any;
@@ -559,6 +597,7 @@ export async function registerRoutes(ctx: RegisterRoutesContext): Promise<void> 
           impersonated_by: caller.user_id,
           is_impersonated: true,
           jti,
+          ...authTokenIssuedAtClaim(Date.now(), targetUser),
         },
         jwtSecret,
         Math.ceil(expiryMs / 1000)
@@ -647,6 +686,23 @@ export async function registerRoutes(ctx: RegisterRoutesContext): Promise<void> 
         params: RouteParams
       ) {
         app.service('messages').emit(data.event, data.data);
+        if (isServiceAccountRoute(params)) {
+          const gatewayStreamingEvent =
+            data.event === 'streaming:start' ||
+            data.event === 'streaming:chunk' ||
+            data.event === 'streaming:end' ||
+            data.event === 'streaming:error'
+              ? data.event
+              : null;
+
+          if (gatewayStreamingEvent) {
+            deferInFreshTenantScope(params, async () => {
+              await (
+                app.service('gateway') as unknown as GatewayService
+              ).handleMessageStreamingEvent(gatewayStreamingEvent, data.data);
+            });
+          }
+        }
         return { success: true };
       },
     },
@@ -667,8 +723,23 @@ export async function registerRoutes(ctx: RegisterRoutesContext): Promise<void> 
         },
         params: RouteParams
       ) {
-        const _ = params;
         app.service('tasks').emit(data.event, data.data);
+        if (isServiceAccountRoute(params) && data.event === 'tool:start') {
+          const sessionId =
+            typeof data.data.session_id === 'string' ? data.data.session_id : undefined;
+          const toolName =
+            typeof data.data.tool_name === 'string' ? data.data.tool_name : undefined;
+          if (sessionId) {
+            deferInFreshTenantScope(params, async () => {
+              await (app.service('gateway') as unknown as GatewayService).updateProgress({
+                session_id: sessionId,
+                state: 'working',
+                task_id: typeof data.data.task_id === 'string' ? data.data.task_id : undefined,
+                tool_name: toolName,
+              });
+            });
+          }
+        }
         return { success: true };
       },
     },
@@ -677,6 +748,13 @@ export async function registerRoutes(ctx: RegisterRoutesContext): Promise<void> 
     },
     requireAuth
   );
+
+  // These routes re-emit onto the `messages` / `tasks` services (which carry
+  // the real streaming payloads); their OWN default `created` event is just the
+  // `{ success: true }` ack and must never broadcast — one per chunk otherwise
+  // reaches every service-account socket. Publish it to no one.
+  app.service('/messages/streaming').publish(() => []);
+  app.service('/tasks/streaming').publish(() => []);
 
   // ============================================================================
   // Sessions custom routes (fork, spawn, genealogy, prompt, stop, queue)
@@ -747,6 +825,38 @@ export async function registerRoutes(ctx: RegisterRoutesContext): Promise<void> 
     } as any,
     {
       find: { role: ROLES.MEMBER, action: 'view session genealogy' },
+    },
+    requireAuth
+  );
+
+  registerAuthenticatedRoute(
+    app,
+    '/sessions/:id/archive',
+    {
+      async create(data: { includeChildren?: boolean } | undefined, params: RouteParams) {
+        const id = params.route?.id;
+        if (!id) throw new BadRequest('Session ID required');
+        return sessionsService.archive(id, data, params);
+      },
+    },
+    {
+      create: { role: ROLES.MEMBER, action: 'archive sessions' },
+    },
+    requireAuth
+  );
+
+  registerAuthenticatedRoute(
+    app,
+    '/sessions/:id/unarchive',
+    {
+      async create(data: { includeChildren?: boolean } | undefined, params: RouteParams) {
+        const id = params.route?.id;
+        if (!id) throw new BadRequest('Session ID required');
+        return sessionsService.unarchive(id, data, params);
+      },
+    },
+    {
+      create: { role: ROLES.MEMBER, action: 'unarchive sessions' },
     },
     requireAuth
   );
@@ -849,15 +959,22 @@ export async function registerRoutes(ctx: RegisterRoutesContext): Promise<void> 
         };
         const cwd = branch?.path;
         if (!cwd) throw new Error('Branch has no path; cannot restart');
-        const { buildSpawnConfigForSession, writeClaudeCliMcpConfigForSession } = await import(
-          './services/claude-cli-integration.js'
-        );
+        const {
+          buildSpawnConfigForSession,
+          resolveClaudeCliProviderSpawn,
+          writeClaudeCliMcpConfigForSession,
+        } = await import('./services/claude-cli-integration.js');
         const { buildClaudeCliSpawn } = await import('@agor/core/claude-cli');
         const mcpConfigPath = await writeClaudeCliMcpConfigForSession(app, session, {
           actor: params.user ?? null,
         });
         const spawnCfg = buildSpawnConfigForSession(session, cwd, { mcpConfigPath });
-        const built = buildClaudeCliSpawn(spawnCfg);
+        const built = await resolveClaudeCliProviderSpawn(
+          app,
+          session,
+          buildClaudeCliSpawn(spawnCfg)
+        );
+        if (!built) throw new Error('No scoped Claude credential is configured');
         if (app.io) {
           app.io.to(channel).emit('terminal:tab', {
             userId: targetUserId,
@@ -893,12 +1010,6 @@ export async function registerRoutes(ctx: RegisterRoutesContext): Promise<void> 
    */
   const sessionTurnLocks: SessionTurnLocks = new Map();
 
-  function sessionCanStartTask(status: SessionStatus, readyForPrompt?: boolean): boolean {
-    return (
-      status === SessionStatus.IDLE || (status === SessionStatus.FAILED && readyForPrompt === true)
-    );
-  }
-
   /**
    * Helper: Safely patch an entity, returning false if it was deleted mid-execution
    */
@@ -922,6 +1033,33 @@ export async function registerRoutes(ctx: RegisterRoutesContext): Promise<void> 
       }
       throw error;
     }
+  }
+
+  async function reconcileSessionPromptStateIfStuck(
+    session: Session,
+    taskRepo: TaskRepository,
+    params: RouteParams,
+    options: { ignoredTaskIds?: readonly string[] } = {}
+  ): Promise<Session> {
+    if (session.status !== SessionStatus.FAILED || session.ready_for_prompt === true) {
+      return session;
+    }
+
+    const sessionTasks = await taskRepo.findBySession(session.session_id);
+    if (!shouldReconcileSessionPromptState(session, sessionTasks, options)) return session;
+
+    console.warn(
+      `🧹 [PromptState] Repairing stuck session ${shortId(session.session_id)} ` +
+        `(status=${session.status}, ready_for_prompt=${session.ready_for_prompt})`
+    );
+    return (await app.service('sessions').patch(
+      session.session_id,
+      {
+        status: SessionStatus.IDLE,
+        ready_for_prompt: true,
+      },
+      params
+    )) as Session;
   }
 
   /**
@@ -960,10 +1098,25 @@ export async function registerRoutes(ctx: RegisterRoutesContext): Promise<void> 
     },
     params: RouteParams
   ): Promise<Task> {
-    const session = await sessionsService.get(task.session_id, params);
-
-    // Recompute message_range.start_index against the live message count.
-    const messageStartIndex = await sessionsRepository.countMessages(task.session_id);
+    const tenantId = getCurrentTenantId();
+    if (!tenantId) throw new Error('Missing active tenant context for task executor startup');
+    const {
+      agenticToolEnabled,
+      messageStartIndex,
+      session: loadedSession,
+    } = await runWithTenantDatabaseScope(db, tenantId, async (tenantDb) => {
+      const session = await sessionsService.get(task.session_id, params);
+      return {
+        session,
+        agenticToolEnabled: await isTenantAgenticToolEnabled(session.agentic_tool, tenantDb),
+        // Recompute message_range.start_index against the live message count.
+        messageStartIndex: await sessionsRepository.countMessages(task.session_id),
+      };
+    });
+    if (!agenticToolEnabled) {
+      throw new Forbidden(`${loadedSession.agentic_tool} is disabled for this workspace`);
+    }
+    const session = await sessionsService.materializeAgenticToolPreset(loadedSession, params);
     const startTimestamp = new Date().toISOString();
 
     // The daemon transitions the task to RUNNING and writes required sentinel
@@ -1066,7 +1219,7 @@ export async function registerRoutes(ctx: RegisterRoutesContext): Promise<void> 
       rawPrompt: task.full_prompt,
       sessionCreatedBy: session.created_by,
       prompterUserId: task.created_by,
-      usersRepo: new UsersRepository(db),
+      usersRepo: bindRepositoryToTenantUnitOfWork(db, new UsersRepository(db)),
     });
 
     const useStreaming = options.stream !== false;
@@ -1095,7 +1248,7 @@ export async function registerRoutes(ctx: RegisterRoutesContext): Promise<void> 
       const { setPendingCliTask } = await import('./services/claude-cli-integration.js');
       setPendingCliTask(sessionId as SessionID, taskId as TaskID, messageStartIndex);
 
-      setImmediate(async () => {
+      deferInFreshTenantScope(params, async () => {
         try {
           const targetUserId = session.created_by;
           if (!targetUserId) {
@@ -1167,7 +1320,9 @@ export async function registerRoutes(ctx: RegisterRoutesContext): Promise<void> 
     // Background spawn + failure handling. Returning the patched Task to the
     // caller before this resolves matches the previous behavior — the HTTP
     // response should not block on the executor process being live.
-    setImmediate(async () => {
+    // deferInFreshTenantScope uses a fresh DB connection and tenant RLS scope
+    // instead of inheriting a stale committed transaction.
+    deferInFreshTenantScope(params, async () => {
       try {
         console.log(
           `🚀 [Daemon] Routing ${session.agentic_tool} to Feathers/WebSocket executor (task ${shortId(taskId)})`
@@ -1296,6 +1451,20 @@ export async function registerRoutes(ctx: RegisterRoutesContext): Promise<void> 
         let session = await sessionsService.get(id, params);
         id = session.session_id;
 
+        if (!(await isTenantAgenticToolEnabled(session.agentic_tool ?? 'claude-code', db))) {
+          throw new Forbidden(
+            `${session.agentic_tool ?? 'claude-code'} is disabled for this workspace`
+          );
+        }
+        session = await sessionsService.materializeAgenticToolPreset(session, params);
+        if (
+          session.agentic_tool_preset_id &&
+          data.permissionMode !== undefined &&
+          data.permissionMode !== session.permission_config?.mode
+        ) {
+          throw new Forbidden('Preset-backed sessions cannot override permission mode per task');
+        }
+
         // Early validation: reject unsupported tools when stateless_fs_mode is enabled
         if (config.execution?.stateless_fs_mode) {
           const toolName = session.agentic_tool as import('@agor/core/types').AgenticToolName;
@@ -1344,93 +1513,109 @@ export async function registerRoutes(ctx: RegisterRoutesContext): Promise<void> 
         }
         const createdBy = params.user.user_id;
 
-        return await withSessionTurnLock(sessionTurnLocks, id as SessionID, async () => {
-          const lockedSession = await sessionsService.get(id, params);
-          if (lockedSession.status === SessionStatus.STOPPING) {
-            // The earlier STOPPING check was against pre-lock state — re-check
-            // here so a session that entered STOPPING while we waited for our
-            // turn doesn't accept a prompt.
-            throw new Error('Cannot send prompt: session is currently stopping');
-          }
-          const queuedTasks = await taskRepo.findQueued(id as SessionID);
-          const shouldQueue =
-            !sessionCanStartTask(lockedSession.status, lockedSession.ready_for_prompt) ||
-            queuedTasks.length > 0;
+        return await withSessionTurnLock(
+          sessionTurnLocks,
+          id as SessionID,
+          async () => {
+            let lockedSession = await sessionsService.get(id, params);
+            if (lockedSession.status === SessionStatus.STOPPING) {
+              // The earlier STOPPING check was against pre-lock state — re-check
+              // here so a session that entered STOPPING while we waited for our
+              // turn doesn't accept a prompt.
+              throw new Error('Cannot send prompt: session is currently stopping');
+            }
+            lockedSession = await reconcileSessionPromptStateIfStuck(
+              lockedSession,
+              taskRepo,
+              params
+            );
+            const queuedTasks = await taskRepo.findQueued(id as SessionID);
+            const shouldQueue =
+              !sessionCanStartTask(lockedSession.status, lockedSession.ready_for_prompt) ||
+              queuedTasks.length > 0;
 
-          if (shouldQueue) {
-            const queuedTask = await taskRepo.createPending({
+            if (shouldQueue) {
+              const queuedTask = await taskRepo.createPending({
+                session_id: id as SessionID,
+                full_prompt: data.prompt,
+                created_by: createdBy,
+                status: TaskStatus.QUEUED,
+                metadata: {
+                  ...(params.user?.user_id ? { queued_by_user_id: params.user.user_id } : {}),
+                  ...(messageSource ? { source: messageSource } : {}),
+                  ...(data.metadata ?? {}),
+                },
+              });
+
+              console.log(
+                `📬 [Prompt] Auto-queued task for session ${shortId(id)} at position ${queuedTask.queue_position} ` +
+                  `(session status: ${lockedSession.status}, existing queue items: ${queuedTasks.length})`
+              );
+
+              app.service('tasks').emit('queued', queuedTask);
+
+              if (sessionCanStartTask(lockedSession.status, lockedSession.ready_for_prompt)) {
+                deferInFreshTenantScope(params, async () => {
+                  try {
+                    await sessionsService.triggerQueueProcessing(id as SessionID, params);
+                  } catch (error) {
+                    console.error(
+                      `❌ [Prompt] Failed to trigger queue processing after auto-queue:`,
+                      error
+                    );
+                  }
+                });
+              }
+
+              // Uniform response: the entity is always a Task. Caller inspects
+              // `task.status` (`'queued'` here) and `task.queue_position` to know
+              // what happened.
+              return queuedTask;
+            }
+
+            console.log(`   Session agent: ${lockedSession.agentic_tool}`);
+            console.log(
+              `   Session permission_config.mode: ${lockedSession.permission_config?.mode || 'not set'}`
+            );
+
+            // Idle path: create a CREATED task, then hand off to spawnTaskExecutor
+            // which is the sole place that populates message_range / git_state,
+            // writes the user-message row, and spawns the executor. Both this
+            // path and processNextQueuedTask go through that helper so behavior
+            // stays in lockstep.
+            const idleTaskMetadata: import('@agor/core/types').TaskMetadata = {
+              ...(messageSource ? { source: messageSource } : {}),
+              ...(data.metadata ?? {}),
+            };
+            const task = await taskRepo.createPending({
               session_id: id as SessionID,
               full_prompt: data.prompt,
               created_by: createdBy,
-              status: TaskStatus.QUEUED,
-              metadata: {
-                ...(params.user?.user_id ? { queued_by_user_id: params.user.user_id } : {}),
-                ...(messageSource ? { source: messageSource } : {}),
-                ...(data.metadata ?? {}),
-              },
+              status: TaskStatus.CREATED,
+              metadata: Object.keys(idleTaskMetadata).length > 0 ? idleTaskMetadata : undefined,
+            });
+            // Bypassing the service means no native 'created' emit; do it here
+            // so reactive clients see the new task before the executor spawns.
+            emitServiceEvent(app, {
+              path: 'tasks',
+              event: 'created',
+              data: task,
+              params,
+              id: task.task_id,
             });
 
-            console.log(
-              `📬 [Prompt] Auto-queued task for session ${shortId(id)} at position ${queuedTask.queue_position} ` +
-                `(session status: ${lockedSession.status}, existing queue items: ${queuedTasks.length})`
+            return await spawnTaskExecutor(
+              task,
+              {
+                permissionMode: data.permissionMode,
+                stream: data.stream !== false,
+                messageSource,
+              },
+              params
             );
-
-            app.service('tasks').emit('queued', queuedTask);
-
-            if (sessionCanStartTask(lockedSession.status, lockedSession.ready_for_prompt)) {
-              setImmediate(async () => {
-                try {
-                  await sessionsService.triggerQueueProcessing(id as SessionID, params);
-                } catch (error) {
-                  console.error(
-                    `❌ [Prompt] Failed to trigger queue processing after auto-queue:`,
-                    error
-                  );
-                }
-              });
-            }
-
-            // Uniform response: the entity is always a Task. Caller inspects
-            // `task.status` (`'queued'` here) and `task.queue_position` to know
-            // what happened.
-            return queuedTask;
-          }
-
-          console.log(`   Session agent: ${lockedSession.agentic_tool}`);
-          console.log(
-            `   Session permission_config.mode: ${lockedSession.permission_config?.mode || 'not set'}`
-          );
-
-          // Idle path: create a CREATED task, then hand off to spawnTaskExecutor
-          // which is the sole place that populates message_range / git_state,
-          // writes the user-message row, and spawns the executor. Both this
-          // path and processNextQueuedTask go through that helper so behavior
-          // stays in lockstep.
-          const idleTaskMetadata: import('@agor/core/types').TaskMetadata = {
-            ...(messageSource ? { source: messageSource } : {}),
-            ...(data.metadata ?? {}),
-          };
-          const task = await taskRepo.createPending({
-            session_id: id as SessionID,
-            full_prompt: data.prompt,
-            created_by: createdBy,
-            status: TaskStatus.CREATED,
-            metadata: Object.keys(idleTaskMetadata).length > 0 ? idleTaskMetadata : undefined,
-          });
-          // Bypassing the service means no native 'created' emit; do it here
-          // so reactive clients see the new task before the executor spawns.
-          app.service('tasks').emit('created', task);
-
-          return await spawnTaskExecutor(
-            task,
-            {
-              permissionMode: data.permissionMode,
-              stream: data.stream !== false,
-              messageSource,
-            },
-            params
-          );
-        });
+          },
+          { waiterTimeoutMs: 30_000 }
+        );
       },
     },
     {
@@ -1549,36 +1734,46 @@ export async function registerRoutes(ctx: RegisterRoutesContext): Promise<void> 
         // /tasks/:id/run on different tasks of the same session, against
         // /sessions/:id/prompt's idle branch, and against the queue
         // drainer — they all serialize through `sessionTurnLocks`.
-        return await withSessionTurnLock(sessionTurnLocks, task.session_id, async () => {
-          // Re-read session state inside the lock — it may have flipped to
-          // RUNNING while we waited for our turn.
-          const session = await sessionsService.get(task.session_id, params);
-
-          if (session.status === SessionStatus.STOPPING) {
-            throw new BadRequest('Cannot run task: session is currently stopping');
-          }
-          if (!sessionCanStartTask(session.status, session.ready_for_prompt)) {
-            throw new Conflict(
-              `Cannot run task ${shortId(taskId)}: session is '${session.status}'. ` +
-                `To enqueue a prompt on a busy session, POST to /sessions/:id/prompt instead — ` +
-                `it creates and queues a task atomically.`
+        return await withSessionTurnLock(
+          sessionTurnLocks,
+          task.session_id,
+          async () => {
+            // Re-read session state inside the lock — it may have flipped to
+            // RUNNING while we waited for our turn.
+            const session = await reconcileSessionPromptStateIfStuck(
+              await sessionsService.get(task.session_id, params),
+              taskRepo,
+              params,
+              { ignoredTaskIds: [task.task_id] }
             );
-          }
 
-          return await runExistingTask(
-            task,
-            {
-              permissionMode: data.permissionMode,
-              stream: data.stream !== false,
-              messageSource: normalizeMessageSource(data.messageSource, params),
-            },
-            params,
-            {
-              findTaskById: (id) => taskRepo.findById(id),
-              spawnFn: spawnTaskExecutor,
+            if (session.status === SessionStatus.STOPPING) {
+              throw new BadRequest('Cannot run task: session is currently stopping');
             }
-          );
-        });
+            if (!sessionCanStartTask(session.status, session.ready_for_prompt)) {
+              throw new Conflict(
+                `Cannot run task ${shortId(taskId)}: session is '${session.status}'. ` +
+                  `To enqueue a prompt on a busy session, POST to /sessions/:id/prompt instead — ` +
+                  `it creates and queues a task atomically.`
+              );
+            }
+
+            return await runExistingTask(
+              task,
+              {
+                permissionMode: data.permissionMode,
+                stream: data.stream !== false,
+                messageSource: normalizeMessageSource(data.messageSource, params),
+              },
+              params,
+              {
+                findTaskById: (id) => taskRepo.findById(id),
+                spawnFn: spawnTaskExecutor,
+              }
+            );
+          },
+          { waiterTimeoutMs: 30_000 }
+        );
       },
     },
     {
@@ -1732,50 +1927,23 @@ export async function registerRoutes(ctx: RegisterRoutesContext): Promise<void> 
   // File upload endpoint
   // ============================================================================
 
-  const sessionRepo = new SessionRepository(db);
   const branchRepo = new BranchRepository(db);
-  const uploadMiddleware = createUploadMiddleware(sessionRepo, branchRepo);
+  const uploadMiddleware = createUploadMiddleware();
   const DEBUG_UPLOAD = process.env.NODE_ENV !== 'production';
 
-  // biome-ignore lint/suspicious/noExplicitAny: Express 5 + multer type compatibility
-  const uploadHandler: any = async (req: any, res: any, next: any) => {
+  // biome-ignore lint/suspicious/noExplicitAny: Express 5 type compatibility
+  const authorizeUpload: any = async (req: any, res: any, next: any) => {
     try {
-      if (DEBUG_UPLOAD) {
-        console.log('🚀 [Upload Handler] Request received');
-        console.log('   Headers:', {
-          contentType: req.headers['content-type'],
-          authorization: req.headers.authorization ? 'present' : 'missing',
-          cookie: req.headers.cookie ? 'present' : 'missing',
-        });
-      }
-
       const { sessionId } = req.params;
-      const { destination, notifyAgent, message } = req.body;
-      const files = req.files as Express.Multer.File[];
-
-      if (DEBUG_UPLOAD) {
-        console.log(
-          `📎 [Upload Handler] Processing for session ${sessionId ? shortId(sessionId) : 'unknown'}`
-        );
-        console.log(`   Destination: ${destination || 'branch'}`);
-        console.log(`   Notify agent: ${notifyAgent === 'true' || notifyAgent === true}`);
-        console.log(`   Files received: ${files?.length || 0}`);
-      }
-
       const params = req.feathers as AuthenticatedParams;
-      if (DEBUG_UPLOAD) {
-        console.log(`   Auth params:`, {
-          hasUser: !!params?.user,
-          userId: params?.user?.user_id ? shortId(params.user.user_id) : undefined,
-          provider: params?.provider,
-        });
-      }
 
       ensureMinimumRole(params, ROLES.MEMBER, 'upload files');
 
-      const session = await sessionsService.get(sessionId, params);
+      const session = await runWithTenantDatabaseScope(db, params.tenant?.tenant_id, () =>
+        sessionsService.get(sessionId, params)
+      );
       if (!session) {
-        console.error(`❌ [Upload Handler] Session not found: ${shortId(sessionId)}`);
+        console.error(`❌ [Upload Authz] Session not found: ${shortId(sessionId)}`);
         return res.status(404).json({ error: 'Session not found' });
       }
 
@@ -1790,12 +1958,17 @@ export async function registerRoutes(ctx: RegisterRoutesContext): Promise<void> 
         if (!session.branch_id) {
           return res.status(403).json({ error: 'Not authorized to upload to this session' });
         }
-        const wt = await branchRepo.findById(session.branch_id);
-        if (!wt) {
+        const access = await runWithTenantDatabaseScope(db, params.tenant?.tenant_id, async () => {
+          const wt = await branchRepo.findById(session.branch_id);
+          if (!wt) return null;
+          const isOwner = await branchRepo.isOwner(wt.branch_id, userId);
+          const branchPermission = await branchRepo.resolveUserPermission(wt, userId);
+          return { branchPermission, isOwner, wt };
+        });
+        if (!access) {
           return res.status(404).json({ error: 'Branch not found' });
         }
-        const isOwner = await branchRepo.isOwner(wt.branch_id, userId);
-        const branchPermission = await branchRepo.resolveUserPermission(wt, userId);
+        const { branchPermission, isOwner, wt } = access;
         const effectiveLevel = resolveBranchPermission(
           wt,
           userId,
@@ -1811,10 +1984,49 @@ export async function registerRoutes(ctx: RegisterRoutesContext): Promise<void> 
 
         if (!canUpload) {
           console.error(
-            `❌ [Upload Handler] User ${shortId(userId)} has '${effectiveLevel}' permission, cannot upload to branch ${shortId(wt.branch_id)}`
+            `❌ [Upload Authz] User ${shortId(userId)} has '${effectiveLevel}' permission, cannot upload to branch ${shortId(wt.branch_id)}`
           );
           return res.status(403).json({ error: 'Not authorized to upload to this session' });
         }
+      }
+
+      next();
+    } catch (error) {
+      next(error);
+    }
+  };
+
+  // biome-ignore lint/suspicious/noExplicitAny: Express 5 + multer type compatibility
+  const uploadHandler: any = async (req: any, res: any, next: any) => {
+    try {
+      if (DEBUG_UPLOAD) {
+        console.log('🚀 [Upload Handler] Request received');
+        console.log('   Headers:', {
+          contentType: req.headers['content-type'],
+          authorization: req.headers.authorization ? 'present' : 'missing',
+          cookie: req.headers.cookie ? 'present' : 'missing',
+        });
+      }
+
+      const { sessionId } = req.params;
+      const { notifyAgent, message } = req.body;
+      const files = req.files as Express.Multer.File[];
+
+      if (DEBUG_UPLOAD) {
+        console.log(
+          `📎 [Upload Handler] Processing for session ${sessionId ? shortId(sessionId) : 'unknown'}`
+        );
+        console.log(`   Notify agent: ${notifyAgent === 'true' || notifyAgent === true}`);
+        console.log(`   Files received: ${files?.length || 0}`);
+      }
+
+      const params = req.feathers as AuthenticatedParams;
+      if (DEBUG_UPLOAD) {
+        console.log(`   Auth params:`, {
+          hasUser: !!params?.user,
+          userId: params?.user?.user_id ? shortId(params.user.user_id) : undefined,
+          provider: params?.provider,
+        });
       }
 
       if (!files || files.length === 0) {
@@ -1822,23 +2034,12 @@ export async function registerRoutes(ctx: RegisterRoutesContext): Promise<void> 
         return res.status(400).json({ error: 'No files uploaded' });
       }
 
-      let branch: Awaited<ReturnType<typeof branchRepo.findById>> | undefined;
-      if (session.branch_id) {
-        branch = await branchRepo.findById(session.branch_id);
-      }
-
-      const uploadedFiles = files.map((f) => {
-        let relativePath = f.path;
-        if (branch && f.path.startsWith(branch.path)) {
-          relativePath = f.path.substring(branch.path.length + 1);
-        }
-        return {
-          filename: f.filename,
-          path: relativePath,
-          size: f.size,
-          mimeType: f.mimetype,
-        };
-      });
+      const uploadedFiles = files.map((f) => ({
+        filename: f.filename,
+        path: f.path,
+        size: f.size,
+        mimeType: f.mimetype,
+      }));
 
       if (DEBUG_UPLOAD) {
         console.log(`   Uploaded ${uploadedFiles.length} file(s):`);
@@ -1862,6 +2063,8 @@ export async function registerRoutes(ctx: RegisterRoutesContext): Promise<void> 
           const promptParams: any = {
             route: { id: sessionId },
             user: params.user,
+            authentication: params.authentication,
+            tenant: params.tenant,
           };
           await promptService.create({ prompt: promptText }, promptParams);
         } catch (error) {
@@ -1932,10 +2135,19 @@ export async function registerRoutes(ctx: RegisterRoutesContext): Promise<void> 
         console.log('   User:', result.user?.user_id ? shortId(result.user.user_id) : 'unknown');
       }
 
-      req.feathers = {
+      const authParams = {
         user: result.user,
         provider: 'rest',
         authentication: result.authentication,
+        headers: req.headers,
+      };
+      req.feathers = {
+        ...authParams,
+        tenant: resolveTenantContext(multiTenancy, {
+          params: authParams,
+          authPayload: result.authentication?.payload,
+          headers: req.headers,
+        }),
       };
 
       next();
@@ -1966,6 +2178,7 @@ export async function registerRoutes(ctx: RegisterRoutesContext): Promise<void> 
     // time writing oversize uploads to disk.
     // biome-ignore lint/suspicious/noExplicitAny: Express 5 type compatibility
     enforceTotalUploadSize() as any,
+    authorizeUpload,
     // biome-ignore lint/suspicious/noExplicitAny: Express 5 + multer type compatibility
     uploadMiddleware.array('files', 10) as any,
     // Defence-in-depth aggregate-size check using the actual file sizes that
@@ -2010,86 +2223,37 @@ export async function registerRoutes(ctx: RegisterRoutesContext): Promise<void> 
             ? data.reason
             : undefined;
 
-        const session = await sessionsService.get(id, params);
+        const sessionsServiceWithHooks = app.service('sessions') as unknown as SessionsServiceImpl;
 
-        const activeStates: SessionStatus[] = [
-          SessionStatus.RUNNING,
-          SessionStatus.AWAITING_PERMISSION,
-          SessionStatus.STOPPING,
-        ];
-        if (!activeStates.includes(session.status as SessionStatus)) {
-          return {
-            success: false,
-            reason: `Session cannot be stopped (status: ${session.status})`,
-          };
-        }
-
-        // `TasksService.find()` short-circuits on session_id and silently
-        // ignores the status filter; use the shared helper that filters in
-        // process. Already recency-DESC sorted.
-        const targetTasksArray = await findActiveTasksForSession(app as never, id as SessionID);
-
-        if (targetTasksArray.length === 0) {
-          console.warn(
-            `⚠️  [Stop] No active tasks for session ${shortId(id)}, resetting to IDLE${stopReason ? ` (reason: ${stopReason})` : ''}`
-          );
-          // ready_for_prompt: true so the post-patch hook drains any QUEUED tasks.
-          // Stop is "skip current", not "wipe everything" — queued prompts represent
-          // user intent and should still execute.
-          await app.service('sessions').patch(
-            id,
+        const result = await withSessionTurnLock(sessionTurnLocks, id as SessionID, async () =>
+          stopSessionPreserveQueue(
             {
-              status: SessionStatus.IDLE,
-              ready_for_prompt: true,
+              app,
+              taskRepo: new TaskRepository(db),
+              sessionsService: sessionsServiceWithHooks,
+              tasksService,
+              killExecutorProcess,
             },
-            params
-          );
-          return {
-            success: true,
-            status: SessionStatus.IDLE,
-            reason: 'No active tasks found, session reset to idle',
-          };
-        }
-
-        const latestTask = targetTasksArray[0];
-
-        console.log(
-          `🛑 [Stop] Stopping task ${shortId(latestTask.task_id)} for session ${shortId(id)}${stopReason ? ` (reason: ${stopReason})` : ''}`
+            id as SessionID,
+            params,
+            { reason: stopReason }
+          )
         );
 
-        const processKilled = killExecutorProcess(id);
-        if (!processKilled) {
-          console.warn(
-            `⚠️  [Stop] No tracked process for session ${shortId(id)} — executor may have already exited`
-          );
-        }
-
-        try {
-          await tasksService.patch(latestTask.task_id, {
-            status: TaskStatus.STOPPED,
-            completed_at: new Date().toISOString(),
+        if (result.success) {
+          deferInFreshTenantScope(params, async () => {
+            try {
+              await sessionsServiceWithHooks.triggerQueueProcessing(id as SessionID, params);
+            } catch (error) {
+              console.error(
+                `❌ [Stop] Failed to process queue after stopping session ${shortId(id)}:`,
+                error
+              );
+            }
           });
-        } catch (error) {
-          console.error(`❌ [Stop] Failed to patch task to STOPPED:`, error);
         }
 
-        try {
-          // ready_for_prompt: true so the post-patch hook drains any QUEUED tasks.
-          // Stop is "skip current", not "wipe everything" — queued prompts represent
-          // user intent and should still execute.
-          await app.service('sessions').patch(
-            id,
-            {
-              status: SessionStatus.IDLE,
-              ready_for_prompt: true,
-            },
-            params
-          );
-        } catch (error) {
-          console.error(`❌ [Stop] Failed to patch session to IDLE:`, error);
-        }
-
-        return { success: true, status: SessionStatus.IDLE };
+        return result;
       },
     },
     {
@@ -2143,20 +2307,74 @@ export async function registerRoutes(ctx: RegisterRoutesContext): Promise<void> 
   const queueRetryScheduled = new Set<SessionID>();
 
   async function processNextQueuedTask(sessionId: SessionID, params: RouteParams): Promise<void> {
+    await runWithSessionQueueTenantScope(
+      {
+        db,
+        config,
+        sessionId,
+        params,
+        label: 'processNextQueuedTask',
+      },
+      async (scopedParams) => processNextQueuedTaskInTenantScope(sessionId, scopedParams)
+    );
+  }
+
+  async function processNextQueuedTaskInTenantScope(
+    sessionId: SessionID,
+    params: RouteParams
+  ): Promise<void> {
     const existingLock = sessionTurnLocks.get(sessionId);
     if (existingLock) {
       console.log(`⏳ [Queue] Session turn in progress for ${shortId(sessionId)}, waiting...`);
-      await existingLock.catch(() => undefined);
+
+      // Race the lock against a timeout. A half-open TCP connection can leave
+      // a DB query pending forever, which holds the lock indefinitely and
+      // deadlocks all subsequent prompts for this session. statement_timeout
+      // (60s) handles normal cases; this is the client-side backstop.
+      const LOCK_WAIT_TIMEOUT_MS = 65_000;
+      const outcome = await Promise.race([
+        existingLock.catch(() => undefined).then(() => 'released' as const),
+        new Promise<'timeout'>((resolve) =>
+          setTimeout(() => resolve('timeout'), LOCK_WAIT_TIMEOUT_MS)
+        ),
+      ]);
+
+      if (outcome === 'timeout') {
+        console.error(
+          `❌ [Queue] Session ${shortId(sessionId)}: turn lock held >${LOCK_WAIT_TIMEOUT_MS / 1000}s — ` +
+            `holder may be stuck on a broken DB connection. Skipping this drain trigger; ` +
+            `the next natural trigger (user prompt or task completion) will retry.`
+        );
+        return;
+      }
+
       if (!queueRetryScheduled.has(sessionId)) {
         queueRetryScheduled.add(sessionId);
-        setImmediate(async () => {
-          queueRetryScheduled.delete(sessionId);
-          try {
-            await processNextQueuedTask(sessionId, params);
-          } catch (error) {
+        deferWithSessionQueueTenantScope(
+          {
+            db,
+            config,
+            sessionId,
+            params,
+            label: 'processNextQueuedTask retry',
+          },
+          async (retryParams) => {
+            queueRetryScheduled.delete(sessionId);
+            try {
+              await processNextQueuedTask(sessionId, retryParams);
+            } catch (error) {
+              console.error(`❌ [Queue] Retry failed for session ${shortId(sessionId)}:`, error);
+            }
+          },
+          (error) => {
+            queueRetryScheduled.delete(sessionId);
             console.error(`❌ [Queue] Retry failed for session ${shortId(sessionId)}:`, error);
           }
-        });
+        );
+      } else {
+        console.log(
+          `⏭️  [Queue] Retry already scheduled for session ${shortId(sessionId)}, not queueing another`
+        );
       }
       return;
     }
@@ -2167,8 +2385,33 @@ export async function registerRoutes(ctx: RegisterRoutesContext): Promise<void> 
     });
     sessionTurnLocks.set(sessionId, lockPromise);
 
+    // Race the drain against a holder timeout. A half-open TCP connection can
+    // keep spawnTaskExecutor waiting indefinitely on a DB query that never
+    // completes on the Node.js side (statement_timeout only fires if Postgres
+    // actually received the query). Releasing the lock after 30s lets waiting
+    // prompts make progress; the background drain will eventually fail and DB
+    // state will be reconciled by reconcileSessionPromptStateIfStuck.
+    const HOLDER_TIMEOUT_MS = 30_000;
     try {
-      await processNextQueuedTaskInternal(sessionId, params);
+      await Promise.race([
+        processNextQueuedTaskInternal(sessionId, params),
+        new Promise<never>((_, reject) =>
+          setTimeout(
+            () =>
+              reject(
+                new Error(
+                  `processNextQueuedTaskInternal timed out for ${shortId(sessionId)} after ${HOLDER_TIMEOUT_MS / 1000}s`
+                )
+              ),
+            HOLDER_TIMEOUT_MS
+          )
+        ),
+      ]);
+    } catch (err) {
+      console.error(
+        `❌ [Queue] processNextQueuedTask holder error for ${shortId(sessionId)}:`,
+        err instanceof Error ? err.message : err
+      );
     } finally {
       sessionTurnLocks.delete(sessionId);
       resolveLock();
@@ -2179,7 +2422,7 @@ export async function registerRoutes(ctx: RegisterRoutesContext): Promise<void> 
     sessionId: SessionID,
     params: RouteParams
   ): Promise<void> {
-    const taskRepo = new TaskRepository(db);
+    const taskRepo = bindRepositoryToTenantUnitOfWork(db, new TaskRepository(db));
     const nextTask = await taskRepo.getNextQueued(sessionId);
 
     if (!nextTask) {
@@ -2188,7 +2431,7 @@ export async function registerRoutes(ctx: RegisterRoutesContext): Promise<void> 
     }
 
     const userId = nextTask.metadata?.queued_by_user_id;
-    const userRepo = new UsersRepository(db);
+    const userRepo = bindRepositoryToTenantUnitOfWork(db, new UsersRepository(db));
     const queuedByUser = userId ? await userRepo.findById(userId) : undefined;
 
     const taskParams: RouteParams = queuedByUser
@@ -2204,7 +2447,10 @@ export async function registerRoutes(ctx: RegisterRoutesContext): Promise<void> 
         `with user context: ${queuedByUser ? shortId(queuedByUser.user_id) : 'none'}`
     );
 
-    const session = await sessionsService.get(sessionId, taskParams);
+    const queuedSession = await runWithTenantDatabaseScope(db, getCurrentTenantId(), () =>
+      sessionsService.get(sessionId, taskParams)
+    );
+    const session = await reconcileSessionPromptStateIfStuck(queuedSession, taskRepo, taskParams);
 
     if (!sessionCanStartTask(session.status, session.ready_for_prompt)) {
       console.log(
@@ -2645,7 +2891,13 @@ export async function registerRoutes(ctx: RegisterRoutesContext): Promise<void> 
           if (!data.user_id) throw new Error('user_id required');
           if (!data.emoji) throw new Error('emoji required');
           const updated = await boardCommentsService.toggleReaction(id, data, params);
-          app.service('board-comments').emit('patched', updated);
+          emitServiceEvent(app, {
+            path: 'board-comments',
+            event: 'patched',
+            data: updated,
+            params,
+            id: updated.comment_id,
+          });
           return updated;
         },
       },
@@ -2671,7 +2923,13 @@ export async function registerRoutes(ctx: RegisterRoutesContext): Promise<void> 
           if (!callerId) throw new Error('Authentication required');
           data.created_by = callerId as import('@agor/core/types').UserID;
           const reply = await boardCommentsService.createReply(id, data, params);
-          app.service('board-comments').emit('created', reply);
+          emitServiceEvent(app, {
+            path: 'board-comments',
+            event: 'created',
+            data: reply,
+            params,
+            id: reply.comment_id,
+          });
           return reply;
         },
       },
@@ -2687,7 +2945,7 @@ export async function registerRoutes(ctx: RegisterRoutesContext): Promise<void> 
 
   const branchesService = app.service('branches') as unknown as BranchesServiceImpl;
 
-  registerAuthenticatedRoute(
+  registerLongAuthenticatedRoute(
     app,
     '/branches/:id/start',
     {
@@ -2706,7 +2964,7 @@ export async function registerRoutes(ctx: RegisterRoutesContext): Promise<void> 
     requireAuth
   );
 
-  registerAuthenticatedRoute(
+  registerLongAuthenticatedRoute(
     app,
     '/branches/:id/stop',
     {
@@ -2723,7 +2981,7 @@ export async function registerRoutes(ctx: RegisterRoutesContext): Promise<void> 
     requireAuth
   );
 
-  registerAuthenticatedRoute(
+  registerLongAuthenticatedRoute(
     app,
     '/branches/:id/restart',
     {
@@ -2743,7 +3001,7 @@ export async function registerRoutes(ctx: RegisterRoutesContext): Promise<void> 
     requireAuth
   );
 
-  registerAuthenticatedRoute(
+  registerLongAuthenticatedRoute(
     app,
     '/branches/:id/nuke',
     {
@@ -2760,7 +3018,7 @@ export async function registerRoutes(ctx: RegisterRoutesContext): Promise<void> 
     requireAuth
   );
 
-  registerAuthenticatedRoute(
+  registerLongAuthenticatedRoute(
     app,
     '/branches/:id/render-environment',
     {
@@ -2781,7 +3039,7 @@ export async function registerRoutes(ctx: RegisterRoutesContext): Promise<void> 
     requireAuth
   );
 
-  registerAuthenticatedRoute(
+  registerLongAuthenticatedRoute(
     app,
     '/branches/:id/health',
     {
@@ -2816,11 +3074,12 @@ export async function registerRoutes(ctx: RegisterRoutesContext): Promise<void> 
   });
 
   app.service('/branches/:id/archive-or-delete').hooks({
+    around: { all: [tenantIdentityAround] },
     before: {
       create: [
         requireAuth,
         requireMinimumRole(ROLES.MEMBER, 'archive or delete branches'),
-        async (context: HookContext) => {
+        inTenantDatabaseScope(async (context: HookContext) => {
           const id = context.params.route?.id;
           if (!id) throw new Error('Branch ID required');
 
@@ -2832,7 +3091,7 @@ export async function registerRoutes(ctx: RegisterRoutesContext): Promise<void> 
           await cacheBranchAccess(context.params, branchRepository, branch);
 
           return context;
-        },
+        }),
         branchRbacEnabled
           ? ensureBranchPermission('all', 'archive or delete branches', superadminOpts)
           : (context: HookContext) => {
@@ -2861,11 +3120,12 @@ export async function registerRoutes(ctx: RegisterRoutesContext): Promise<void> 
   });
 
   app.service('/branches/:id/unarchive').hooks({
+    around: { all: [tenantIdentityAround] },
     before: {
       create: [
         requireAuth,
         requireMinimumRole(ROLES.MEMBER, 'unarchive branches'),
-        async (context: HookContext) => {
+        inTenantDatabaseScope(async (context: HookContext) => {
           const id = context.params.route?.id;
           if (!id) throw new Error('Branch ID required');
 
@@ -2877,7 +3137,7 @@ export async function registerRoutes(ctx: RegisterRoutesContext): Promise<void> 
           await cacheBranchAccess(context.params, branchRepository, branch);
 
           return context;
-        },
+        }),
         branchRbacEnabled
           ? ensureBranchPermission('all', 'unarchive branches', superadminOpts)
           : (context: HookContext) => {
@@ -2944,6 +3204,7 @@ export async function registerRoutes(ctx: RegisterRoutesContext): Promise<void> 
   });
 
   app.service('/schedules/:id/run-now').hooks({
+    around: { all: [tenantIdentityAround] },
     before: {
       create: [
         requireAuth,
@@ -2951,7 +3212,7 @@ export async function registerRoutes(ctx: RegisterRoutesContext): Promise<void> 
         // Reuse the canonical hook so caching semantics (params.schedule
         // / params.branch / params.isBranchOwner) match every other
         // schedule-touching path.
-        loadScheduleAndBranch(scheduleRepository, branchRepository),
+        inTenantDatabaseScope(loadScheduleAndBranch(scheduleRepository, branchRepository)),
         ensureScheduleRunsAsCaller(superadminOpts),
         branchRbacEnabled
           ? ensureBranchPermission('all', 'run schedule', superadminOpts)
@@ -2991,10 +3252,16 @@ export async function registerRoutes(ctx: RegisterRoutesContext): Promise<void> 
         throw new NotAuthenticated('Authentication required to trigger schedule.');
       }
 
-      const branch = await branchRepository.findById(branchId);
-      if (!branch) throw new NotFound(`Branch not found: ${branchId}`);
-
-      const branchSchedules = await scheduleRepository.findByBranchId(branch.branch_id);
+      const { branch, branchSchedules } = await runWithTenantDatabaseScope(
+        db,
+        (params as AuthenticatedParams).tenant?.tenant_id,
+        async () => {
+          const branch = await branchRepository.findById(branchId);
+          if (!branch) throw new NotFound(`Branch not found: ${branchId}`);
+          const branchSchedules = await scheduleRepository.findByBranchId(branch.branch_id);
+          return { branch, branchSchedules };
+        }
+      );
       if (branchSchedules.length === 0) {
         throw new BadRequest(
           `Branch "${branch.name}" has no schedules. Create one and call POST /schedules/:id/run-now instead.`,
@@ -3035,11 +3302,12 @@ export async function registerRoutes(ctx: RegisterRoutesContext): Promise<void> 
   });
 
   app.service('/branches/:id/execute-schedule-now').hooks({
+    around: { all: [tenantIdentityAround] },
     before: {
       create: [
         requireAuth,
         requireMinimumRole(ROLES.MEMBER, 'execute scheduled runs'),
-        async (context: HookContext) => {
+        inTenantDatabaseScope(async (context: HookContext) => {
           const id = context.params.route?.id;
           if (!id) throw new BadRequest('Branch ID required');
 
@@ -3050,7 +3318,7 @@ export async function registerRoutes(ctx: RegisterRoutesContext): Promise<void> 
 
           await cacheBranchAccess(context.params, branchRepository, branch);
           return context;
-        },
+        }),
         branchRbacEnabled
           ? ensureBranchPermission('all', 'execute scheduled runs', superadminOpts)
           : (context: HookContext) => {
@@ -3068,7 +3336,7 @@ export async function registerRoutes(ctx: RegisterRoutesContext): Promise<void> 
   });
 
   // Branch logs
-  registerAuthenticatedRoute(
+  registerLongAuthenticatedRoute(
     app,
     '/branches/logs',
     {
@@ -3140,180 +3408,202 @@ export async function registerRoutes(ctx: RegisterRoutesContext): Promise<void> 
   // Session MCP servers routes
   // ============================================================================
 
-  if (svcEnabled('mcp_servers'))
-    registerAuthenticatedRoute(
-      app,
-      '/sessions/:id/mcp-servers',
-      {
-        async find(params: RouteParams) {
-          const id = params.route?.id;
-          if (!id) throw new Error('Session ID required');
-          await requireSessionScopedConfigOwnerOrAdmin(id, params);
-          const enabledOnly =
-            params.query?.enabledOnly === 'true' || params.query?.enabledOnly === true;
-          const includeGlobal =
-            params.query?.includeGlobal === 'true' || params.query?.includeGlobal === true;
-          const includeMetadata =
-            params.query?.includeMetadata === 'true' || params.query?.includeMetadata === true;
-          const mcpService = app.service('mcp-servers');
-          const userId = params.user?.user_id;
-          const rawLookupParams = {
+  registerAuthenticatedRoute(
+    app,
+    '/sessions/:id/mcp-servers',
+    {
+      async find(params: RouteParams) {
+        const id = params.route?.id;
+        if (!id) throw new Error('Session ID required');
+        await requireSessionScopedConfigOwnerOrAdmin(id, params);
+        const enabledOnly =
+          params.query?.enabledOnly === 'true' || params.query?.enabledOnly === true;
+        const includeGlobal =
+          params.query?.includeGlobal === 'true' || params.query?.includeGlobal === true;
+        const includeMetadata =
+          params.query?.includeMetadata === 'true' || params.query?.includeMetadata === true;
+        const mcpService = app.service('mcp-servers');
+        const queryForUserId =
+          typeof params.query?.forUserId === 'string' ? params.query.forUserId : undefined;
+        const authPayloadType = (
+          params as RouteParams & { authentication?: { payload?: { type?: unknown } } }
+        ).authentication?.payload?.type;
+        const routeUser = params.user as
+          | (NonNullable<RouteParams['user']> & { _isServiceAccount?: boolean })
+          | undefined;
+        const userId = resolveForUserIdWithGate({
+          queryForUserId,
+          isServiceAccount: routeUser?._isServiceAccount,
+          authPayloadType,
+          callerUserId: params.user?.user_id,
+        });
+        const rawLookupParams = {
+          ...params,
+          provider: undefined,
+          query: {
+            ...(userId ? { forUserId: userId } : {}),
+          },
+        };
+        if (includeMetadata) {
+          const linksResult = await app.service('session-mcp-servers').find({
             ...params,
             provider: undefined,
             query: {
-              ...(userId ? { forUserId: userId } : {}),
+              session_id: id,
+              ...(enabledOnly ? { enabled: true } : {}),
+              $limit: 1000,
             },
-          };
-          if (includeMetadata) {
-            const linksResult = await app.service('session-mcp-servers').find({
-              ...params,
-              provider: undefined,
-              query: {
-                session_id: id,
-                ...(enabledOnly ? { enabled: true } : {}),
-                $limit: 1000,
-              },
-            });
-            const links = (Array.isArray(linksResult) ? linksResult : linksResult.data) as Array<
-              SessionMCPServer & { added_at: Date | string | number }
-            >;
-            const withMetadata = await Promise.all(
-              links.map(async (link) => {
-                try {
-                  const server = await mcpService.get(link.mcp_server_id, rawLookupParams);
-                  return {
-                    server,
-                    added_at: new Date(link.added_at).getTime(),
-                    enabled: Boolean(link.enabled),
-                  };
-                } catch (_error) {
-                  return null;
-                }
-              })
-            );
-            const entries = withMetadata.filter(
-              (entry): entry is Exclude<(typeof withMetadata)[number], null> => entry !== null
-            );
-            return shouldExposeMCPServerSecrets(params, {
-              allowSessionToken: true,
-              sessionId: id,
-            })
-              ? entries
-              : entries.map((entry) => ({
-                  ...entry,
-                  server: redactMCPServerSecrets(entry.server),
-                }));
-          }
-          const sessionServerRefs = await sessionMCPServersService.listServers(
-            id as import('@agor/core/types').SessionID,
-            enabledOnly,
-            params
-          );
-          const sessionServers = await Promise.all(
-            sessionServerRefs.map(async (server) => {
+          });
+          const links = (Array.isArray(linksResult) ? linksResult : linksResult.data) as Array<
+            SessionMCPServer & { added_at: Date | string | number }
+          >;
+          const withMetadata = await Promise.all(
+            links.map(async (link) => {
               try {
-                return await mcpService.get(server.mcp_server_id, rawLookupParams);
+                const server = await mcpService.get(link.mcp_server_id, rawLookupParams);
+                return {
+                  server,
+                  added_at: new Date(link.added_at).getTime(),
+                  enabled: Boolean(link.enabled),
+                };
               } catch (_error) {
-                return server;
+                return null;
               }
             })
           );
-          const globalQuery = {
-            scope: 'global',
-            ...(enabledOnly ? { enabled: true } : {}),
-            ...(userId ? { forUserId: userId } : {}),
-            $limit: 1000,
-          };
-          const globalResult = includeGlobal
-            ? await mcpService.find({
-                ...params,
-                provider: undefined,
-                query: globalQuery,
-              })
-            : [];
-          const globalServers = Array.isArray(globalResult) ? globalResult : globalResult.data;
-          const servers = includeGlobal
-            ? [
-                ...new Map(
-                  [...globalServers, ...sessionServers].map((server) => [
-                    server.mcp_server_id,
-                    server,
-                  ])
-                ).values(),
-              ]
-            : sessionServers;
+          const entries = withMetadata.filter(
+            (entry): entry is Exclude<(typeof withMetadata)[number], null> => entry !== null
+          );
           return shouldExposeMCPServerSecrets(params, {
             allowSessionToken: true,
             sessionId: id,
           })
-            ? servers
-            : servers.map(redactMCPServerSecrets);
-        },
-        async create(data: { mcpServerId: string }, params: RouteParams) {
-          const id = params.route?.id;
-          if (!id) throw new Error('Session ID required');
-          if (!data.mcpServerId) throw new Error('MCP Server ID required');
-          await requireSessionScopedConfigOwnerOrAdmin(id, params);
-
-          await sessionMCPServersService.addServer(
-            id as import('@agor/core/types').SessionID,
-            data.mcpServerId as import('@agor/core/types').MCPServerID,
-            params
-          );
-
-          const relationship = {
-            session_id: id,
-            mcp_server_id: data.mcpServerId,
-            enabled: true,
-            added_at: new Date(),
-          };
-          app.service('session-mcp-servers').emit('created', relationship);
-
-          return relationship;
-        },
-        async remove(mcpId: string, params: RouteParams) {
-          const id = params.route?.id;
-          if (!id) throw new Error('Session ID required');
-          if (!mcpId) throw new Error('MCP Server ID required');
-          await requireSessionScopedConfigOwnerOrAdmin(id, params);
-
-          await sessionMCPServersService.removeServer(
-            id as import('@agor/core/types').SessionID,
-            mcpId as import('@agor/core/types').MCPServerID,
-            params
-          );
-
-          const relationship = {
-            session_id: id,
-            mcp_server_id: mcpId,
-          };
-          app.service('session-mcp-servers').emit('removed', relationship);
-
-          return relationship;
-        },
-        async patch(mcpId: string, data: { enabled: boolean }, params: RouteParams) {
-          const id = params.route?.id;
-          if (!id) throw new Error('Session ID required');
-          if (!mcpId) throw new Error('MCP Server ID required');
-          if (typeof data.enabled !== 'boolean') throw new Error('enabled field required');
-          await requireSessionScopedConfigOwnerOrAdmin(id, params);
-          return sessionMCPServersService.toggleServer(
-            id as import('@agor/core/types').SessionID,
-            mcpId as import('@agor/core/types').MCPServerID,
-            data.enabled,
-            params
-          );
-        },
-        // biome-ignore lint/suspicious/noExplicitAny: Service type not compatible with Express
-      } as any,
-      {
-        find: { role: ROLES.MEMBER, action: 'view session MCP servers' },
-        create: { role: ROLES.MEMBER, action: 'modify session MCP servers' },
-        remove: { role: ROLES.MEMBER, action: 'modify session MCP servers' },
-        patch: { role: ROLES.MEMBER, action: 'modify session MCP servers' },
+            ? entries
+            : entries.map((entry) => ({
+                ...entry,
+                server: redactMCPServerSecrets(entry.server),
+              }));
+        }
+        const sessionServerRefs = await sessionMCPServersService.listServers(
+          id as import('@agor/core/types').SessionID,
+          enabledOnly,
+          params
+        );
+        const sessionServers = await Promise.all(
+          sessionServerRefs.map(async (server) => {
+            try {
+              return await mcpService.get(server.mcp_server_id, rawLookupParams);
+            } catch (_error) {
+              return server;
+            }
+          })
+        );
+        const globalQuery = {
+          scope: 'global',
+          ...(enabledOnly ? { enabled: true } : {}),
+          ...(userId ? { forUserId: userId } : {}),
+          $limit: 1000,
+        };
+        const globalResult = includeGlobal
+          ? await mcpService.find({
+              ...params,
+              provider: undefined,
+              query: globalQuery,
+            })
+          : [];
+        const globalServers = Array.isArray(globalResult) ? globalResult : globalResult.data;
+        const servers = includeGlobal
+          ? [
+              ...new Map(
+                [...globalServers, ...sessionServers].map((server) => [
+                  server.mcp_server_id,
+                  server,
+                ])
+              ).values(),
+            ]
+          : sessionServers;
+        return shouldExposeMCPServerSecrets(params, {
+          allowSessionToken: true,
+          sessionId: id,
+        })
+          ? servers
+          : servers.map(redactMCPServerSecrets);
       },
-      requireAuth
-    );
+      async create(data: { mcpServerId: string }, params: RouteParams) {
+        const id = params.route?.id;
+        if (!id) throw new Error('Session ID required');
+        if (!data.mcpServerId) throw new Error('MCP Server ID required');
+        await requireSessionScopedConfigOwnerOrAdmin(id, params);
+
+        await sessionMCPServersService.addServer(
+          id as import('@agor/core/types').SessionID,
+          data.mcpServerId as import('@agor/core/types').MCPServerID,
+          params
+        );
+
+        const relationship = {
+          session_id: id,
+          mcp_server_id: data.mcpServerId,
+          enabled: true,
+          added_at: new Date(),
+        };
+        emitServiceEvent(app, {
+          path: 'session-mcp-servers',
+          event: 'created',
+          data: relationship,
+          params,
+        });
+
+        return relationship;
+      },
+      async remove(mcpId: string, params: RouteParams) {
+        const id = params.route?.id;
+        if (!id) throw new Error('Session ID required');
+        if (!mcpId) throw new Error('MCP Server ID required');
+        await requireSessionScopedConfigOwnerOrAdmin(id, params);
+
+        await sessionMCPServersService.removeServer(
+          id as import('@agor/core/types').SessionID,
+          mcpId as import('@agor/core/types').MCPServerID,
+          params
+        );
+
+        const relationship = {
+          session_id: id,
+          mcp_server_id: mcpId,
+        };
+        emitServiceEvent(app, {
+          path: 'session-mcp-servers',
+          event: 'removed',
+          data: relationship,
+          params,
+        });
+
+        return relationship;
+      },
+      async patch(mcpId: string, data: { enabled: boolean }, params: RouteParams) {
+        const id = params.route?.id;
+        if (!id) throw new Error('Session ID required');
+        if (!mcpId) throw new Error('MCP Server ID required');
+        if (typeof data.enabled !== 'boolean') throw new Error('enabled field required');
+        await requireSessionScopedConfigOwnerOrAdmin(id, params);
+        return sessionMCPServersService.toggleServer(
+          id as import('@agor/core/types').SessionID,
+          mcpId as import('@agor/core/types').MCPServerID,
+          data.enabled,
+          params
+        );
+      },
+      // biome-ignore lint/suspicious/noExplicitAny: Service type not compatible with Express
+    } as any,
+    {
+      find: { role: ROLES.MEMBER, action: 'view session MCP servers' },
+      create: { role: ROLES.MEMBER, action: 'modify session MCP servers' },
+      remove: { role: ROLES.MEMBER, action: 'modify session MCP servers' },
+      patch: { role: ROLES.MEMBER, action: 'modify session MCP servers' },
+    },
+    requireAuth
+  );
 
   // ============================================================================
   // Session env selections (v0.5 env-var-access)
@@ -3383,7 +3673,12 @@ export async function registerRoutes(ctx: RegisterRoutesContext): Promise<void> 
           env_var_name: name,
         };
         try {
-          app.service('session-env-selections').emit('created', relationship);
+          emitServiceEvent(app, {
+            path: 'session-env-selections',
+            event: 'created',
+            data: relationship,
+            params,
+          });
         } catch {
           // Event emission is non-fatal
         }
@@ -3400,7 +3695,12 @@ export async function registerRoutes(ctx: RegisterRoutesContext): Promise<void> 
           env_var_name: name,
         };
         try {
-          app.service('session-env-selections').emit('removed', relationship);
+          emitServiceEvent(app, {
+            path: 'session-env-selections',
+            event: 'removed',
+            data: relationship,
+            params,
+          });
         } catch {
           // Event emission is non-fatal
         }
@@ -3413,9 +3713,12 @@ export async function registerRoutes(ctx: RegisterRoutesContext): Promise<void> 
         await requireSessionScopedConfigOwnerOrAdmin(id, params);
         await sessionEnvSelectionsService.setAll(id as SessionID, envVarNames, params);
         try {
-          app
-            .service('session-env-selections')
-            .emit('patched', { session_id: id, env_var_names: envVarNames });
+          emitServiceEvent(app, {
+            path: 'session-env-selections',
+            event: 'patched',
+            data: { session_id: id, env_var_names: envVarNames },
+            params,
+          });
         } catch {
           // Event emission is non-fatal
         }
@@ -3439,8 +3742,13 @@ export async function registerRoutes(ctx: RegisterRoutesContext): Promise<void> 
   app.use('/health', {
     async find(params?: AuthenticatedParams) {
       const publicLaunchAuth = resolvePublicLaunchAuthSettings(config);
+      // `/health` stays 200 always (pre-login UI fetches must not throw), so the
+      // DB signal rides on `status`: ok | degraded. /readyz is the one that 503s.
+      // Only { ok, latencyMs } is public; the raw error is authenticated-only below.
+      const dbProbe = await probeDatabase(db);
       const publicResponse = {
-        status: 'ok',
+        status: healthStatus(dbProbe),
+        db: publicHealthDb(dbProbe),
         timestamp: Date.now(),
         version: DAEMON_VERSION,
         // Build identity for the version-sync banner (apps/agor-ui ConnectionStatus).
@@ -3457,29 +3765,8 @@ export async function registerRoutes(ctx: RegisterRoutesContext): Promise<void> 
           label: config.daemon?.instanceLabel,
           description: config.daemon?.instanceDescription,
         },
-        onboarding: {
-          assistantPending:
-            config.onboarding?.assistantPending ??
-            config.onboarding?.persistedAgentPending ??
-            false,
-          frameworkRepoUrl: config.onboarding?.frameworkRepoUrl,
-          systemCredentials: {
-            ANTHROPIC_API_KEY: !!(
-              config.credentials?.ANTHROPIC_API_KEY || process.env.ANTHROPIC_API_KEY
-            ),
-            ANTHROPIC_AUTH_TOKEN: !!(
-              config.credentials?.ANTHROPIC_AUTH_TOKEN || process.env.ANTHROPIC_AUTH_TOKEN
-            ),
-            ANTHROPIC_BASE_URL: !!(
-              config.credentials?.ANTHROPIC_BASE_URL || process.env.ANTHROPIC_BASE_URL
-            ),
-            OPENAI_API_KEY: !!(config.credentials?.OPENAI_API_KEY || process.env.OPENAI_API_KEY),
-            GEMINI_API_KEY: !!(config.credentials?.GEMINI_API_KEY || process.env.GEMINI_API_KEY),
-            CURSOR_API_KEY: !!(config.credentials?.CURSOR_API_KEY || process.env.CURSOR_API_KEY),
-          },
-        },
-        services: servicesConfig,
         features: {
+          teammateFrameworkRepoUrl: resolveTeammateFrameworkRepoUrl(config),
           // Web terminal availability: UI should hide terminal buttons when false.
           // Server-side gate in register-hooks.ts is the source of truth; this
           // flag exists so the UI can skip rendering buttons that would fail.
@@ -3502,9 +3789,7 @@ export async function registerRoutes(ctx: RegisterRoutesContext): Promise<void> 
           // surfaces when true. Server-side gates (e.g. ArtifactsService.
           // grantTrust) are the source of truth and reject regardless.
           multiUser: (config.execution?.unix_user_mode ?? 'simple') !== 'simple',
-          // Cursor SDK provider is available as a beta surface. The legacy
-          // cursor_sdk_enabled flag is retained in config for compatibility but
-          // no longer gates provider visibility.
+          // Tenant agentic-tool settings provide the authoritative availability gate.
           cursorSdk: true,
           // Resolved branch storage policy. The daemon still enforces this at
           // create time; the UI uses it to pick the right default and disable
@@ -3526,8 +3811,18 @@ export async function registerRoutes(ctx: RegisterRoutesContext): Promise<void> 
           databaseInfo = { dialect, path: DB_PATH };
         }
 
+        // Diagnostic only; not in the public payload, doesn't gate readiness.
+        // Gated behind auth like the rest of this block (any authenticated
+        // user, matching the existing `database`/`execution` fields below —
+        // not admin-only).
+        const migrations = await probePendingMigrations(db);
+
         return {
           ...publicResponse,
+          // Full DB probe detail, including the raw error, is authenticated-only
+          // (never in the public payload).
+          db: authenticatedHealthDb(dbProbe),
+          migrations: healthMigrations(migrations),
           database: databaseInfo,
           auth: {
             ...publicResponse.auth,
@@ -3584,161 +3879,8 @@ export async function registerRoutes(ctx: RegisterRoutesContext): Promise<void> 
     security: [],
   };
 
-  // ============================================================================
-  // OpenCode models + health endpoints
-  // ============================================================================
-
-  app.use('/opencode/models', {
-    async find() {
-      try {
-        const freshConfig = await loadConfig();
-        const opencodeConfig = freshConfig.opencode;
-        if (!opencodeConfig?.enabled) {
-          throw new Error('OpenCode is not enabled in configuration');
-        }
-
-        const serverUrl = opencodeConfig.serverUrl || 'http://localhost:4096';
-        console.log('[OpenCode] Fetching models from server:', serverUrl);
-
-        const response = await fetch(`${serverUrl}/config/providers`);
-
-        if (!response.ok) {
-          throw new Error(`OpenCode server returned ${response.status}: ${response.statusText}`);
-        }
-
-        const data = (await response.json()) as {
-          providers: Array<{
-            id: string;
-            name: string;
-            models: Record<string, { name?: string }>;
-          }>;
-          default: Record<string, string>;
-        };
-
-        const connectedProviders = data.providers;
-
-        const transformedProviders = connectedProviders.map((provider) => ({
-          id: provider.id,
-          name: provider.name,
-          models: Object.entries(provider.models)
-            .map(([modelId, modelMeta]) => ({
-              id: modelId,
-              name: modelMeta.name || modelId,
-            }))
-            .sort((a, b) => a.name.localeCompare(b.name)),
-        }));
-
-        return {
-          providers: transformedProviders,
-          default: data.default,
-          serverUrl: serverUrl,
-        };
-      } catch (error) {
-        console.error('[OpenCode] Failed to fetch models:', error);
-        throw new Error(
-          `Failed to fetch OpenCode models: ${error instanceof Error ? error.message : String(error)}`
-        );
-      }
-    },
-  });
-
-  // biome-ignore lint/suspicious/noExplicitAny: FeathersJS service type not fully typed
-  const opencodeModelsService = app.service('opencode/models') as any;
-  opencodeModelsService.docs = {
-    description: 'Get available OpenCode providers and models (requires OpenCode server running)',
-    security: [],
-  };
-
-  app.use('/opencode/health', {
-    // biome-ignore lint/suspicious/noExplicitAny: FeathersJS params type varies, runtime query param check
-    async find(params?: any) {
-      try {
-        let serverUrl: string;
-
-        if (params?.query?.serverUrl) {
-          serverUrl = params.query.serverUrl;
-        } else {
-          const freshConfig = await loadConfig();
-          const opencodeConfig = freshConfig.opencode;
-          if (!opencodeConfig?.enabled) {
-            throw new Error('OpenCode is not enabled in configuration');
-          }
-          serverUrl = opencodeConfig.serverUrl || 'http://localhost:4096';
-        }
-
-        const response = await fetch(`${serverUrl}/config`);
-
-        return {
-          connected: response.ok,
-          status: response.status,
-          serverUrl: serverUrl,
-        };
-      } catch (error) {
-        console.error('[OpenCode] Health check failed:', error);
-        return {
-          connected: false,
-          error: error instanceof Error ? error.message : String(error),
-        };
-      }
-    },
-  });
-
-  // biome-ignore lint/suspicious/noExplicitAny: FeathersJS service type not fully typed
-  const opencodeHealthService = app.service('opencode/health') as any;
-  opencodeHealthService.docs = {
-    description: 'Test connection to OpenCode server',
-    security: [],
-  };
-
-  // ============================================================================
-  // Apply service tier hooks
-  // ============================================================================
-
-  const SERVICE_GROUP_PATHS: Partial<Record<ServiceGroupName, string[]>> = {
-    core: ['sessions', 'tasks', 'messages'],
-    branches: ['branches'],
-    repos: ['repos'],
-    users: ['users'],
-    boards: ['boards', 'board-objects', 'board-comments'],
-    cards: ['cards', 'card-types'],
-    artifacts: ['artifacts'],
-    gateway: ['gateway', 'gateway-channels', 'thread-session-map'],
-    terminals: ['terminals'],
-    file_browser: ['file', 'files', 'context'],
-    mcp_servers: ['mcp-servers', 'session-mcp-servers'],
-    leaderboard: ['leaderboard'],
-    knowledge: [
-      'kb/namespaces',
-      'kb/documents',
-      'kb/versions',
-      'kb/search',
-      'kb/settings',
-      'kb/indexing/status',
-      'kb/indexing/reindex',
-      'kb/graph',
-    ],
-  };
-
-  const mappedGroups = new Set(Object.keys(SERVICE_GROUP_PATHS));
-  for (const name of SERVICE_GROUP_NAMES) {
-    if (!mappedGroups.has(name)) {
-      console.warn(
-        `[services] Service group '${name}' has no path mapping — tier hooks will not apply`
-      );
-    }
-  }
-
-  for (const [group, paths] of Object.entries(SERVICE_GROUP_PATHS)) {
-    const tier = svcTier(group as string);
-    if (tier === 'on' || tier === 'off') continue;
-    for (const path of paths) {
-      try {
-        applyTierHooks(app, path, tier);
-      } catch {
-        // Service may not be registered
-      }
-    }
-  }
+  // Liveness (/livez) and readiness (/readyz) probes — see health/routes.ts.
+  registerHealthProbeRoutes(app, db);
 
   // ============================================================================
   // MCP routes
@@ -3747,7 +3889,7 @@ export async function registerRoutes(ctx: RegisterRoutesContext): Promise<void> 
   if (config.daemon?.mcpEnabled !== false) {
     const { setupMCPRoutes } = await import('./mcp/server.js');
     const toolSearchEnabled = config.daemon?.mcpToolSearch !== false;
-    setupMCPRoutes(app, db, toolSearchEnabled, servicesConfig);
+    setupMCPRoutes(app, db, toolSearchEnabled);
     console.log(
       `✅ MCP server enabled at POST /mcp${toolSearchEnabled ? ' (tool search mode)' : ''}`
     );

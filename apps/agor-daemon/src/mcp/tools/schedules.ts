@@ -34,7 +34,7 @@ const agenticToolConfigSchema = z
       .object({
         mode: z.enum(['alias', 'exact']).optional(),
         model: mcpOptionalString('model_config.model', 'Model name override.'),
-        effort: z.enum(['low', 'medium', 'high', 'max']).optional(),
+        effort: z.enum(['low', 'medium', 'high', 'xhigh', 'max']).optional(),
         advisorModel: mcpOptionalString(
           'model_config.advisorModel',
           "Claude Code advisor model override (e.g. 'opus', 'sonnet', 'fable')."
@@ -44,17 +44,13 @@ const agenticToolConfigSchema = z
       .describe(
         'Optional model override (canonical DefaultModelConfig shape). Omit to inherit the agent default; set { model } to override; set { mode, model, effort, advisorModel } for full control.'
       ),
-    mcp_server_ids: z
-      .array(mcpRequiredId('mcp_server_ids[]', 'MCP server'))
-      .optional()
-      .describe("MCP servers to attach to spawned sessions. Defaults to ['agor']."),
     context_files: z
       .array(mcpRequiredString('context_files[]', 'Context file path'))
       .optional()
       .describe('Additional context files to load.'),
   })
   .describe(
-    'Agentic-tool configuration. Bundles the fields that change together (agent + permission + model + MCPs + context).'
+    'Agentic-tool configuration. MCP capability selection is configured separately on the schedule.'
   );
 
 export function registerScheduleTools(server: McpServer, ctx: McpContext): void {
@@ -145,11 +141,17 @@ export function registerScheduleTools(server: McpServer, ctx: McpContext): void 
         ),
         prompt: mcpRequiredString('prompt', 'Handlebars prompt template'),
         agentic_tool_config: agenticToolConfigSchema,
+        mcp_server_ids: z
+          .array(mcpRequiredId('mcp_server_ids[]', 'MCP server'))
+          .optional()
+          .describe('MCP servers to attach to spawned sessions.'),
         enabled: z.boolean().optional().describe('Whether to fire (default: true)'),
         allow_concurrent_runs: z
           .boolean()
           .optional()
-          .describe('Allow runs to overlap (default: false)'),
+          .describe(
+            'Allow overlapping runs from this schedule (default: false). Sibling schedules on the same branch are independent.'
+          ),
         retention: mcpOptionalNonNegativeInt(
           'retention',
           'Number of sessions to keep; 0 = keep all (default: 5)'
@@ -170,6 +172,7 @@ export function registerScheduleTools(server: McpServer, ctx: McpContext): void 
         // strings; the validator + service hooks coerce them to the
         // canonical enums on save.
         agentic_tool_config: args.agentic_tool_config as Schedule['agentic_tool_config'],
+        mcp_server_ids: args.mcp_server_ids,
         enabled: args.enabled,
         allow_concurrent_runs: args.allow_concurrent_runs,
         retention: args.retention,
@@ -194,6 +197,7 @@ export function registerScheduleTools(server: McpServer, ctx: McpContext): void 
         timezone: mcpOptionalString('timezone', 'IANA timezone'),
         prompt: mcpOptionalString('prompt', 'Handlebars prompt template'),
         agentic_tool_config: agenticToolConfigSchema.optional(),
+        mcp_server_ids: z.array(mcpRequiredId('mcp_server_ids[]', 'MCP server')).optional(),
         enabled: z.boolean().optional(),
         allow_concurrent_runs: z.boolean().optional(),
         retention: mcpOptionalNonNegativeInt(

@@ -5,7 +5,6 @@ import type {
   CodexApprovalPolicy,
   CodexSandboxMode,
   EffortLevel,
-  MCPServer,
   PermissionMode,
   User,
 } from '@agor-live/client';
@@ -13,19 +12,34 @@ import { getDefaultPermissionMode, mapToCodexPermissionConfig } from '@agor-live
 import { DownOutlined } from '@ant-design/icons';
 import { Alert, Collapse, Form, Input, Modal, Typography } from 'antd';
 import { useEffect, useState } from 'react';
-import { AgenticToolConfigForm, getFormValuesFromConfig } from '../AgenticToolConfigForm';
+import { useAgorStore } from '../../store/agorStore';
+import { selectMcpServerById, selectUserById } from '../../store/selectors';
+import { useThemedMessage } from '../../utils/message';
+import { getFormValuesFromConfig } from '../AgenticToolConfigForm';
+import {
+  AgenticToolConfigurationPicker,
+  INLINE_AGENTIC_CONFIGURATION,
+} from '../AgenticToolConfigurationPicker';
 import {
   type AgenticToolOption,
   AgentSelectionGrid,
 } from '../AgentSelectionGrid/AgentSelectionGrid';
 import { AutocompleteTextarea } from '../AutocompleteTextarea';
-import { SessionMcpServersField } from '../MCPServerSelect';
 import type { ModelConfig } from '../ModelSelector';
 import { SessionEnvVarsSelector } from '../SessionEnvVarsSelector';
+import { SessionAttachmentTray } from '../SessionPanel/SessionAttachmentTray';
+import { useComposerAttachments } from '../SessionPanel/useComposerAttachments';
+
+const PASTE_SHORTCUT =
+  typeof navigator !== 'undefined' &&
+  /Mac|iPhone|iPad|iPod/.test(navigator.platform || navigator.userAgent || '')
+    ? '⌘V'
+    : 'Ctrl+V';
 
 export interface NewSessionConfig {
   branch_id: string; // Required - sessions are always created from a branch
   agent: string;
+  agenticToolPresetId?: string;
   title?: string;
   initialPrompt?: string;
 
@@ -42,6 +56,12 @@ export interface NewSessionConfig {
    * session's executor process once it is created.
    */
   envVarNames?: string[];
+  /**
+   * Raw files pasted/dropped into the initial prompt before the session
+   * exists. Uploaded to the new session after creation, then folded into the
+   * initial prompt. Never included in the session-create REST payload.
+   */
+  attachmentFiles?: File[];
 }
 
 export interface NewSessionModalProps {
@@ -51,10 +71,8 @@ export interface NewSessionModalProps {
   availableAgents: AgenticToolOption[];
   branchId: string; // Required - the branch to create the session in
   branch?: Branch; // Optional - branch details for display
-  mcpServerById?: Map<string, MCPServer>;
   currentUser?: User | null; // Optional - current user for default settings
   client: AgorClient | null;
-  userById: Map<string, User>;
 }
 
 export const NewSessionModal: React.FC<NewSessionModalProps> = ({
@@ -64,15 +82,20 @@ export const NewSessionModal: React.FC<NewSessionModalProps> = ({
   availableAgents,
   branchId,
   branch,
-  mcpServerById = new Map(),
   currentUser,
   client,
-  userById,
 }) => {
+  // Entity maps are read from the store rather than drilled through props so
+  // the App shell doesn't have to forward them into every modal.
+  const mcpServerById = useAgorStore(selectMcpServerById);
+  const userById = useAgorStore(selectUserById);
   const [form] = Form.useForm();
+  const { showError } = useThemedMessage();
   const [selectedAgent, setSelectedAgent] = useState<string>('claude-code');
   const [isCreating, setIsCreating] = useState(false);
   const [envVarNames, setEnvVarNames] = useState<string[]>([]);
+  const { attachments, addAttachments, removeAttachment, clearAttachments } =
+    useComposerAttachments({ sessionId: null, showError });
   const isFormValid = !!selectedAgent;
 
   // Reset form when modal opens, using user defaults if available
@@ -85,6 +108,7 @@ export const NewSessionModal: React.FC<NewSessionModalProps> = ({
     setSelectedAgent('claude-code');
     setIsCreating(false); // Reset creating state when modal opens
     setEnvVarNames([]);
+    clearAttachments();
 
     // Get default config for the selected agent
     const agentDefaults = currentUser?.default_agentic_config?.['claude-code'];
@@ -98,7 +122,9 @@ export const NewSessionModal: React.FC<NewSessionModalProps> = ({
       initialPrompt: '',
       ...baseValues,
       mcpServerIds:
-        branchMcpIds && branchMcpIds.length > 0 ? branchMcpIds : baseValues.mcpServerIds,
+        branchMcpIds && branchMcpIds.length > 0
+          ? branchMcpIds
+          : currentUser?.default_mcp_server_ids,
     });
   }, [open, form]);
 
@@ -112,10 +138,6 @@ export const NewSessionModal: React.FC<NewSessionModalProps> = ({
       // MCP inheritance: branch config > user defaults
       form.setFieldsValue({
         ...baseValues,
-        mcpServerIds:
-          branch?.mcp_server_ids && branch.mcp_server_ids.length > 0
-            ? branch.mcp_server_ids
-            : baseValues.mcpServerIds,
         // Clear codex fields when switching away from codex
         ...(tool !== 'codex' && {
           codexSandboxMode: undefined,
@@ -124,7 +146,7 @@ export const NewSessionModal: React.FC<NewSessionModalProps> = ({
         }),
       });
     }
-  }, [selectedAgent, form, currentUser, branch?.mcp_server_ids]);
+  }, [selectedAgent, form, currentUser]);
 
   const handleCreate = () => {
     form.validateFields().then(() => {
@@ -139,7 +161,9 @@ export const NewSessionModal: React.FC<NewSessionModalProps> = ({
       // MCP fallback must respect branch > user defaults (same as open-reset effect)
       const branchMcpIds = branch?.mcp_server_ids;
       const fallbackMcpServerIds =
-        branchMcpIds && branchMcpIds.length > 0 ? branchMcpIds : agentDefaults?.mcpServerIds;
+        branchMcpIds && branchMcpIds.length > 0
+          ? branchMcpIds
+          : currentUser?.default_mcp_server_ids;
 
       const permissionMode: PermissionMode =
         (values.permissionMode as PermissionMode | undefined) ??
@@ -149,6 +173,10 @@ export const NewSessionModal: React.FC<NewSessionModalProps> = ({
       const config: NewSessionConfig = {
         branch_id: branchId,
         agent: selectedAgent,
+        agenticToolPresetId:
+          values.agenticToolPresetId === INLINE_AGENTIC_CONFIGURATION
+            ? undefined
+            : values.agenticToolPresetId,
         title: values.title,
         initialPrompt: values.initialPrompt,
         // Daemon's applySessionConfigDefaults hook fills the tool default.
@@ -157,6 +185,8 @@ export const NewSessionModal: React.FC<NewSessionModalProps> = ({
         mcpServerIds: values.mcpServerIds ?? fallbackMcpServerIds,
         permissionMode,
         envVarNames: envVarNames.length > 0 ? envVarNames : undefined,
+        attachmentFiles:
+          attachments.length > 0 ? attachments.map((attachment) => attachment.file) : undefined,
       };
 
       if (selectedAgent === 'codex') {
@@ -182,6 +212,7 @@ export const NewSessionModal: React.FC<NewSessionModalProps> = ({
 
   const handleCancel = () => {
     form.resetFields();
+    clearAttachments();
     onClose();
   };
 
@@ -194,6 +225,7 @@ export const NewSessionModal: React.FC<NewSessionModalProps> = ({
       okText="Create Session"
       cancelText="Cancel"
       width={700}
+      maskClosable={false}
       okButtonProps={{
         disabled: !isFormValid || isCreating,
         loading: isCreating,
@@ -226,6 +258,13 @@ export const NewSessionModal: React.FC<NewSessionModalProps> = ({
           />
         </Form.Item>
 
+        <AgenticToolConfigurationPicker
+          tool={(selectedAgent as AgenticToolName) || 'claude-code'}
+          mcpServerById={mcpServerById}
+          showHelpText={true}
+          client={client}
+        />
+
         {/* Session Title */}
         <Form.Item name="title" label="Title (optional)">
           <Input placeholder="e.g., Add authentication system" />
@@ -240,16 +279,26 @@ export const NewSessionModal: React.FC<NewSessionModalProps> = ({
           <AutocompleteTextarea
             value={form.getFieldValue('initialPrompt') || ''}
             onChange={(value) => form.setFieldValue('initialPrompt', value)}
-            placeholder="e.g., Build a JWT authentication system with secure password storage... (type @ for autocomplete)"
+            placeholder={`e.g., Build a JWT authentication system with secure password storage... (type @ for autocomplete, or ${PASTE_SHORTCUT} to paste a screenshot)`}
             autoSize={{ minRows: 4, maxRows: 8 }}
             client={client}
             sessionId={null}
             userById={userById}
+            enableKnowledgeMentions
+            kbLinkTarget="absolute-route"
+            onFilesDrop={addAttachments}
+            filesDropDisabled={isCreating}
           />
         </Form.Item>
-
-        {/* MCP Servers — first-class field, mirrors SessionSettingsModal */}
-        <SessionMcpServersField mcpServerById={mcpServerById} />
+        {attachments.length > 0 && (
+          <div style={{ padding: '8px 0' }}>
+            <SessionAttachmentTray
+              attachments={attachments}
+              onRemove={removeAttachment}
+              disabled={isCreating}
+            />
+          </div>
+        )}
 
         {/* Advanced Configuration (Collapsible) */}
         <Collapse
@@ -257,19 +306,6 @@ export const NewSessionModal: React.FC<NewSessionModalProps> = ({
           destroyOnHidden={false}
           expandIcon={({ isActive }) => <DownOutlined rotate={isActive ? 180 : 0} />}
           items={[
-            {
-              key: 'agentic-tool-config',
-              label: <Typography.Text strong>Agentic Tool Configuration</Typography.Text>,
-              children: (
-                <AgenticToolConfigForm
-                  agenticTool={(selectedAgent as AgenticToolName) || 'claude-code'}
-                  mcpServerById={mcpServerById}
-                  showHelpText={true}
-                  hideMcpServers
-                  client={client}
-                />
-              ),
-            },
             ...(currentUser && client
               ? [
                   {

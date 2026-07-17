@@ -2,10 +2,13 @@
 <html lang="en">
   <head>
     <meta charset="UTF-8" />
-    <link rel="icon" type="image/png" href="favicon.png" />
+    <!-- Root-absolute so Vite rebases it to the configured base (/ui/ in prod);
+         a relative href would 404 on deep-linked nested routes. -->
+    <link rel="icon" type="image/png" href="/favicon.png" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Agor</title>
     <style>
+      /* biome-ignore-all lint/plugin/noFirstPartyCss: pre-React viewport sizing must apply before the themed application mounts */
       body {
         margin: 0;
         padding: 0;

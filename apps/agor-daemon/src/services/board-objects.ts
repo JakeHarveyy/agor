@@ -5,7 +5,13 @@
  * Supports both session cards and branch cards (Phase 1: Hybrid support).
  */
 
-import { BoardObjectRepository, type Database } from '@agor/core/db';
+import {
+  type BoardObjectFindFilters,
+  type BoardObjectFindOptions,
+  BoardObjectRepository,
+  type TenantScopeAwareDatabase,
+} from '@agor/core/db';
+import type { Application } from '@agor/core/feathers';
 import type {
   BoardEntityObject,
   BoardEntityType,
@@ -13,7 +19,9 @@ import type {
   BranchID,
   CardID,
   QueryParams,
+  UUID,
 } from '@agor/core/types';
+import { emitServiceEvent } from '../utils/emit-service-event.js';
 
 export type BoardObjectPatchedEventPayload = Omit<BoardEntityObject, 'zone_id'> & {
   zone_id?: string | null;
@@ -37,7 +45,40 @@ export type BoardObjectParams = QueryParams<{
   card_id?: CardID;
   zone_id?: string;
   entity_type?: BoardEntityType;
-}>;
+}> & {
+  /** Internal RBAC SQL pushdown marker set by register-hooks for external regular users. */
+  _agorSqlBoardAccessUserId?: UUID;
+};
+
+export interface NormalizedBoardObjectFindQuery {
+  filters: BoardObjectFindFilters;
+  pagination: BoardObjectFindOptions;
+  limit: number;
+  skip: number;
+}
+
+export function normalizeBoardObjectFindQuery(
+  query: BoardObjectParams['query'] = {}
+): NormalizedBoardObjectFindQuery {
+  const { board_id, branch_id, card_id, zone_id, entity_type } = query;
+  const requestedSkip = Number(query.$skip ?? 0);
+  const requestedLimit = typeof query.$limit === 'number' ? query.$limit : undefined;
+  const filters = Object.fromEntries(
+    Object.entries({ board_id, branch_id, card_id, zone_id, entity_type }).filter(
+      ([, value]) => value !== undefined
+    )
+  ) as BoardObjectFindFilters;
+
+  return {
+    filters,
+    pagination:
+      requestedLimit !== undefined || requestedSkip > 0
+        ? { limit: requestedLimit, offset: requestedSkip }
+        : {},
+    limit: requestedLimit ?? 100,
+    skip: requestedSkip,
+  };
+}
 
 /**
  * Board objects service implementation
@@ -46,7 +87,10 @@ export class BoardObjectsService {
   private boardObjectRepo: BoardObjectRepository;
   public emit?: (event: string, data: BoardEntityObject, params?: BoardObjectParams) => void;
 
-  constructor(db: Database) {
+  constructor(
+    db: TenantScopeAwareDatabase,
+    private app?: Application
+  ) {
     this.boardObjectRepo = new BoardObjectRepository(db);
   }
 
@@ -80,9 +124,6 @@ export class BoardObjectsService {
       zone_id: data.zone_id,
     });
 
-    // Emit WebSocket event
-    this.emit?.('created', boardObject, params);
-
     return boardObject;
   }
 
@@ -90,46 +131,28 @@ export class BoardObjectsService {
    * Find board objects
    */
   async find(params?: BoardObjectParams) {
-    const { board_id, branch_id, card_id, zone_id, entity_type } = params?.query || {};
-
-    let objects: BoardEntityObject[];
-
-    // If board_id filter is provided, use repository method
-    if (board_id) {
-      objects = await this.boardObjectRepo.findByBoardId(board_id);
-    } else {
-      // No board_id - return ALL board objects
-      objects = await this.boardObjectRepo.findAll();
-    }
-
-    if (branch_id) {
-      objects = objects.filter((object) => object.branch_id === branch_id);
-    }
-    if (card_id) {
-      objects = objects.filter((object) => object.card_id === card_id);
-    }
-    if (zone_id) {
-      objects = objects.filter((object) => object.zone_id === zone_id);
-    }
-    if (entity_type) {
-      objects = objects.filter((object) => object.entity_type === entity_type);
-    }
-
-    const total = objects.length;
-    const requestedSkip = params?.query?.$skip ?? 0;
-    const requestedLimit = params?.query?.$limit;
-    const data =
-      requestedLimit !== undefined || requestedSkip > 0
-        ? objects.slice(
-            requestedSkip,
-            requestedLimit === undefined ? undefined : requestedSkip + requestedLimit
-          )
-        : objects;
+    const normalized = normalizeBoardObjectFindQuery(params?.query);
+    const visibleToUserId = params?._agorSqlBoardAccessUserId;
+    const [total, data] = await Promise.all(
+      visibleToUserId
+        ? [
+            this.boardObjectRepo.countVisibleToUser(visibleToUserId, normalized.filters),
+            this.boardObjectRepo.findVisibleToUser(
+              visibleToUserId,
+              normalized.filters,
+              normalized.pagination
+            ),
+          ]
+        : [
+            this.boardObjectRepo.count(normalized.filters),
+            this.boardObjectRepo.findAll(normalized.filters, normalized.pagination),
+          ]
+    );
 
     return {
       total,
-      limit: requestedLimit ?? 100,
-      skip: requestedSkip,
+      limit: normalized.limit,
+      skip: normalized.skip,
       data,
     };
   }
@@ -151,7 +174,7 @@ export class BoardObjectsService {
   async patch(
     id: string,
     data: Partial<BoardEntityObject>,
-    params?: BoardObjectParams
+    _params?: BoardObjectParams
   ): Promise<BoardEntityObject> {
     // Handle simultaneous position + zone_id update
     if (data.position && 'zone_id' in data) {
@@ -159,23 +182,16 @@ export class BoardObjectsService {
       await this.boardObjectRepo.updatePosition(id, data.position);
       const boardObject = await this.boardObjectRepo.updateZone(id, data.zone_id);
 
-      // Emit single WebSocket event with both updates
-      // Explicitly include zone_id field (even if undefined) to signal zone changes to clients
-      this.emit?.(
-        'patched',
-        toBoardObjectPatchedEventPayload(boardObject) as BoardEntityObject,
-        params
-      );
-
-      return boardObject;
+      return toBoardObjectPatchedEventPayload(boardObject) as BoardEntityObject;
     }
 
     if (data.position) {
-      return this.updatePosition(id, data.position, params);
+      return this.boardObjectRepo.updatePosition(id, data.position);
     }
 
     if ('zone_id' in data) {
-      return this.updateZone(id, data.zone_id, params);
+      const boardObject = await this.boardObjectRepo.updateZone(id, data.zone_id);
+      return toBoardObjectPatchedEventPayload(boardObject) as BoardEntityObject;
     }
 
     throw new Error('Only position and zone_id updates are supported via patch');
@@ -187,9 +203,6 @@ export class BoardObjectsService {
   async remove(id: string, params?: BoardObjectParams): Promise<BoardEntityObject> {
     const object = await this.get(id, params);
     await this.boardObjectRepo.remove(id);
-
-    // Emit WebSocket event
-    this.emit?.('removed', object, params);
 
     return object;
   }
@@ -204,8 +217,7 @@ export class BoardObjectsService {
   ): Promise<BoardEntityObject> {
     const boardObject = await this.boardObjectRepo.updatePosition(objectId, position);
 
-    // Emit WebSocket event
-    this.emit?.('patched', boardObject, params);
+    this.emitPatched(boardObject, params);
 
     return boardObject;
   }
@@ -220,12 +232,7 @@ export class BoardObjectsService {
   ): Promise<BoardEntityObject> {
     const boardObject = await this.boardObjectRepo.updateZone(objectId, zoneId);
 
-    // Emit WebSocket event with explicit null for undefined zone_id.
-    this.emit?.(
-      'patched',
-      toBoardObjectPatchedEventPayload(boardObject) as BoardEntityObject,
-      params
-    );
+    this.emitPatched(toBoardObjectPatchedEventPayload(boardObject) as BoardEntityObject, params);
 
     return boardObject;
   }
@@ -242,14 +249,21 @@ export class BoardObjectsService {
     const cleared = await this.boardObjectRepo.clearZoneReferences(boardId, zoneId, zonePosition);
 
     for (const boardObject of cleared) {
-      this.emit?.(
-        'patched',
-        toBoardObjectPatchedEventPayload(boardObject) as BoardEntityObject,
-        params
-      );
+      this.emitPatched(toBoardObjectPatchedEventPayload(boardObject) as BoardEntityObject, params);
     }
 
     return cleared;
+  }
+
+  private emitPatched(boardObject: BoardEntityObject, params?: BoardObjectParams): void {
+    if (!this.app) return;
+    emitServiceEvent(this.app, {
+      path: 'board-objects',
+      event: 'patched',
+      data: boardObject,
+      params,
+      id: boardObject.object_id,
+    });
   }
 
   /**
@@ -266,6 +280,9 @@ export class BoardObjectsService {
 /**
  * Service factory function
  */
-export function createBoardObjectsService(db: Database): BoardObjectsService {
-  return new BoardObjectsService(db);
+export function createBoardObjectsService(
+  db: TenantScopeAwareDatabase,
+  app?: Application
+): BoardObjectsService {
+  return new BoardObjectsService(db, app);
 }

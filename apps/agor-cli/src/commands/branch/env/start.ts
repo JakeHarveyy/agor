@@ -8,6 +8,7 @@ import { shortId } from '@agor-live/client';
 import { Args } from '@oclif/core';
 import chalk from 'chalk';
 import { BaseCommand } from '../../../base-command';
+import { requestBranchEnvironmentAction } from '../../../lib/branch-environment-action.js';
 
 export default class BranchEnvStart extends BaseCommand {
   static description = 'Start branch environment';
@@ -42,10 +43,9 @@ export default class BranchEnvStart extends BaseCommand {
       this.log(`  Path: ${chalk.dim(branch.path)}`);
       this.log('');
 
-      // Call custom startEnvironment method
-      const updated = await branchesService.startEnvironment(branch.branch_id);
+      const updated = await requestBranchEnvironmentAction(client, branch.branch_id, 'start');
 
-      this.log(`${chalk.green('✓')} Environment started`);
+      this.log(`${chalk.green('✓')} Environment start requested`);
 
       if (updated.environment_instance?.access_urls) {
         this.log('');

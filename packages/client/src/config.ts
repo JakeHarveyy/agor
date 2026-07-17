@@ -2,21 +2,13 @@ import { readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import path from 'node:path';
 import type { AgorConfig } from '@agor/core/client';
-import yaml from 'js-yaml';
+import * as yaml from 'js-yaml';
 
 const DEFAULT_DAEMON_PORT = 3030;
 const DEFAULT_DAEMON_HOST = 'localhost';
 
 export function getDefaultConfig(): AgorConfig {
   return {
-    defaults: {
-      board: 'main',
-      agent: 'claude-code',
-    },
-    display: {
-      tableStyle: 'unicode',
-      colorOutput: true,
-    },
     daemon: {
       port: DEFAULT_DAEMON_PORT,
       host: DEFAULT_DAEMON_HOST,

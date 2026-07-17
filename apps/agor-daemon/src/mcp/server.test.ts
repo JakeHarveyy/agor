@@ -61,15 +61,6 @@ describe('coerceJsonRecord', () => {
 });
 
 describe('MCP tool registry', () => {
-  it('mirrors runtime read-only service tier filtering', () => {
-    const registry = buildRegistry({ boards: 'readonly' });
-
-    expect(registry.get('agor_boards_get')).toBeDefined();
-    expect(registry.get('agor_boards_list')).toBeDefined();
-    expect(registry.get('agor_boards_update')).toBeUndefined();
-    expect(registry.get('agor_boards_create')).toBeUndefined();
-  });
-
   it('keeps representative tool detail schemas from degrading to bare object schemas', () => {
     const registry = buildRegistry();
     const expectedPropertiesByTool: Record<string, string[]> = {
@@ -511,6 +502,57 @@ describe('POST /mcp with personal API keys', () => {
             authenticated: true,
             provider: 'mcp',
             user: expect.objectContaining({ user_id: 'user-1', role: 'member' }),
+          })
+        );
+      }
+    );
+  });
+
+  it('carries authenticated user tenant into service params for MCP tool calls and session validation', async () => {
+    await mockPersonalApiKeyUser();
+    const getUser = vi.fn(async () => ({
+      user_id: 'user-1',
+      email: 'alice@example.com',
+      role: 'member',
+      tenant_id: 'tenant-a',
+    }));
+    const getSession = vi.fn(async () => ({ session_id: 'session-full-id' }));
+
+    await withMcpServer(
+      { users: { get: getUser }, sessions: { get: getSession } },
+      async (baseUrl) => {
+        const resp = await fetch(`${baseUrl}/mcp`, {
+          method: 'POST',
+          headers: {
+            Accept: 'application/json, text/event-stream',
+            'Content-Type': 'application/json',
+            'X-API-Key': 'agor_sk_valid',
+            'X-Agor-Session-Id': 'session-short',
+          },
+          body: JSON.stringify({
+            jsonrpc: '2.0',
+            id: 22,
+            method: 'tools/call',
+            params: { name: 'agor_users_get_current', arguments: {} },
+          }),
+        });
+
+        expect(resp.status).toBe(200);
+        expect(parseMcpResponse(await resp.text()).error).toBeUndefined();
+        expect(getSession).toHaveBeenCalledWith(
+          'session-short',
+          expect.objectContaining({
+            authenticated: true,
+            provider: 'mcp',
+            tenant: { tenant_id: 'tenant-a', source: 'auth_claim' },
+          })
+        );
+        expect(getUser).toHaveBeenCalledWith(
+          'user-1',
+          expect.objectContaining({
+            authenticated: true,
+            provider: 'mcp',
+            tenant: { tenant_id: 'tenant-a', source: 'auth_claim' },
           })
         );
       }

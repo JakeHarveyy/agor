@@ -89,6 +89,23 @@ describe('applySessionConfigDefaults', () => {
     );
   });
 
+  it('rejects an explicit unsupported Codex model before create', async () => {
+    const hook = applySessionConfigDefaults({ warnOnExternalDefaultFill: false });
+    const ctx = makeContext({
+      provider: 'rest',
+      user: { user_id: ALICE },
+      data: {
+        agentic_tool: 'codex',
+        created_by: ALICE,
+        permission_config: { mode: 'acceptEdits' },
+        model_config: { mode: 'alias', model: 'gpt-5-codex', updated_at: 'now' },
+      },
+      users: { [ALICE]: { user_id: ALICE } },
+    });
+
+    await expect(hook(ctx)).rejects.toThrow('gpt-5-codex');
+  });
+
   it("fills missing model_config from the user's default", async () => {
     const hook = applySessionConfigDefaults({ warnOnExternalDefaultFill: false });
     const ctx = makeContext({
@@ -110,6 +127,25 @@ describe('applySessionConfigDefaults', () => {
     );
   });
 
+  it("rejects an unsupported Codex model from the user's default", async () => {
+    const hook = applySessionConfigDefaults({ warnOnExternalDefaultFill: false });
+    const ctx = makeContext({
+      provider: 'rest',
+      user: { user_id: ALICE },
+      data: { agentic_tool: 'codex', created_by: ALICE },
+      users: {
+        [ALICE]: {
+          user_id: ALICE,
+          default_agentic_config: {
+            codex: { modelConfig: { model: 'gpt-5-codex' } },
+          },
+        },
+      },
+    });
+
+    await expect(hook(ctx)).rejects.toThrow('gpt-5-codex');
+  });
+
   it("fills missing advisorModel from the user's model default", async () => {
     const hook = applySessionConfigDefaults({ warnOnExternalDefaultFill: false });
     const ctx = makeContext({
@@ -121,7 +157,7 @@ describe('applySessionConfigDefaults', () => {
           user_id: ALICE,
           default_agentic_config: {
             'claude-code': {
-              modelConfig: { model: 'claude-sonnet-4-6', advisorModel: 'opus' },
+              modelConfig: { model: 'claude-sonnet-5', advisorModel: 'opus' },
             },
           },
         },
@@ -131,7 +167,7 @@ describe('applySessionConfigDefaults', () => {
     expect(
       (ctx.data as { model_config: { model: string; advisorModel: string } }).model_config
     ).toMatchObject({
-      model: 'claude-sonnet-4-6',
+      model: 'claude-sonnet-5',
       advisorModel: 'opus',
     });
   });
@@ -153,7 +189,7 @@ describe('applySessionConfigDefaults', () => {
       (ctx.data as { model_config: { mode: string; model: string; effort: string } }).model_config
     ).toMatchObject({
       mode: 'alias',
-      model: 'claude-sonnet-4-6',
+      model: 'claude-sonnet-5',
       effort: 'max',
     });
   });
@@ -176,7 +212,7 @@ describe('applySessionConfigDefaults', () => {
         .model_config
     ).toMatchObject({
       mode: 'alias',
-      model: 'claude-sonnet-4-6',
+      model: 'claude-sonnet-5',
       advisorModel: 'opus',
     });
   });
@@ -190,9 +226,9 @@ describe('applySessionConfigDefaults', () => {
       users: { [ALICE]: { user_id: ALICE } },
     });
     await hook(ctx);
-    // System default for claude-code is 'acceptEdits'
+    // System default for claude-code is 'auto'
     expect((ctx.data as { permission_config: { mode: string } }).permission_config.mode).toBe(
-      'acceptEdits'
+      'auto'
     );
   });
 
@@ -245,7 +281,7 @@ describe('applySessionConfigDefaults', () => {
     await hook(ctx);
     // System default for claude-code
     expect((ctx.data as { permission_config: { mode: string } }).permission_config.mode).toBe(
-      'acceptEdits'
+      'auto'
     );
   });
 

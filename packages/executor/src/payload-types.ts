@@ -539,6 +539,94 @@ export const BranchAgorYmlExportPayloadSchema = BasePayloadSchema.extend({
 export type BranchAgorYmlExportPayload = z.infer<typeof BranchAgorYmlExportPayloadSchema>;
 
 // ═══════════════════════════════════════════════════════════
+// Environment Lifecycle Payload
+// ═══════════════════════════════════════════════════════════
+
+/**
+ * Environment lifecycle payload - run shell-based start/stop/restart/nuke
+ * commands from the executor. Webhook lifecycle commands stay daemon-owned.
+ */
+export const EnvironmentLifecyclePayloadSchema = BasePayloadSchema.extend({
+  command: z.literal('environment.lifecycle'),
+
+  /** JWT for Feathers authentication */
+  sessionToken: z.string(),
+
+  params: z
+    .object({
+      /** Branch ID whose environment is being controlled */
+      branchId: z.string().uuid(),
+
+      /** Branch checkout path. Executor refetches the branch but this avoids ambiguity. */
+      branchPath: z.string().optional(),
+
+      /** Lifecycle action */
+      action: z.enum(['start', 'stop', 'restart', 'nuke']),
+
+      /** Shell start command. Required for start/restart. */
+      startCommand: z.string().optional(),
+
+      /** Shell stop command. Required for stop and used before restart when present. */
+      stopCommand: z.string().optional(),
+
+      /** Shell nuke command. Required for nuke. */
+      nukeCommand: z.string().optional(),
+
+      /** Static app URL rendered by the daemon/branch snapshot. */
+      appUrl: z.string().optional(),
+    })
+    .superRefine((params, ctx) => {
+      if ((params.action === 'start' || params.action === 'restart') && !params.startCommand) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ['startCommand'],
+          message: 'startCommand is required for start/restart',
+        });
+      }
+      if (params.action === 'stop' && !params.stopCommand) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ['stopCommand'],
+          message: 'stopCommand is required for stop',
+        });
+      }
+      if (params.action === 'nuke' && !params.nukeCommand) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ['nukeCommand'],
+          message: 'nukeCommand is required for nuke',
+        });
+      }
+    }),
+});
+
+export type EnvironmentLifecyclePayload = z.infer<typeof EnvironmentLifecyclePayloadSchema>;
+
+/**
+ * Environment logs payload - run shell-based logs command from executor.
+ * Webhook logs stay daemon-owned.
+ */
+export const EnvironmentLogsPayloadSchema = BasePayloadSchema.extend({
+  command: z.literal('environment.logs'),
+
+  /** JWT for Feathers authentication */
+  sessionToken: z.string(),
+
+  params: z.object({
+    /** Branch ID whose environment logs are being fetched */
+    branchId: z.string().uuid(),
+
+    /** Branch checkout path. Executor refetches the branch but this avoids ambiguity. */
+    branchPath: z.string().optional(),
+
+    /** Shell logs command */
+    logsCommand: z.string(),
+  }),
+});
+
+export type EnvironmentLogsPayload = z.infer<typeof EnvironmentLogsPayloadSchema>;
+
+// ═══════════════════════════════════════════════════════════
 // Git Repo Realign Origin Payload
 // ═══════════════════════════════════════════════════════════
 
@@ -618,6 +706,29 @@ export const UnixSyncBranchPayloadSchema = BasePayloadSchema.extend({
 });
 
 export type UnixSyncBranchPayload = z.infer<typeof UnixSyncBranchPayloadSchema>;
+
+/**
+ * Unix sync-board payload - Sync Unix state for every branch aligned with a board.
+ *
+ * The executor resolves board-aligned branches through the daemon, then reuses
+ * unix.sync-branch semantics for each branch in the same executor process.
+ */
+export const UnixSyncBoardPayloadSchema = BasePayloadSchema.extend({
+  command: z.literal('unix.sync-board'),
+
+  /** JWT for Feathers authentication */
+  sessionToken: z.string(),
+
+  params: z.object({
+    /** Board ID whose aligned branches should be synced */
+    boardId: z.string().uuid(),
+
+    /** Daemon Unix user (added to all groups for daemon access) */
+    daemonUser: z.string().optional(),
+  }),
+});
+
+export type UnixSyncBoardPayload = z.infer<typeof UnixSyncBoardPayloadSchema>;
 
 /**
  * Unix sync-repo payload - Sync all Unix state for a repo
@@ -802,9 +913,12 @@ export const ExecutorPayloadSchema = z.discriminatedUnion('command', [
   BranchInspectPayloadSchema,
   BranchAgorYmlImportPayloadSchema,
   BranchAgorYmlExportPayloadSchema,
+  EnvironmentLifecyclePayloadSchema,
+  EnvironmentLogsPayloadSchema,
   GitRepoRealignOriginPayloadSchema,
   GitRepoDeletePayloadSchema,
   UnixSyncBranchPayloadSchema,
+  UnixSyncBoardPayloadSchema,
   UnixSyncRepoPayloadSchema,
   UnixSyncUserPayloadSchema,
   ZellijAttachPayloadSchema,
@@ -864,9 +978,12 @@ export function getSupportedCommands(): string[] {
     'branch.inspect',
     'branch.agor-yml.import',
     'branch.agor-yml.export',
+    'environment.lifecycle',
+    'environment.logs',
     'git.repo.realign-origin',
     'git.repo.delete',
     'unix.sync-branch',
+    'unix.sync-board',
     'unix.sync-repo',
     'unix.sync-user',
     'zellij.attach',
@@ -920,6 +1037,13 @@ export function isUnixSyncBranchPayload(
   payload: ExecutorPayload
 ): payload is UnixSyncBranchPayload {
   return payload.command === 'unix.sync-branch';
+}
+
+/**
+ * Type guard for UnixSyncBoardPayload
+ */
+export function isUnixSyncBoardPayload(payload: ExecutorPayload): payload is UnixSyncBoardPayload {
+  return payload.command === 'unix.sync-board';
 }
 
 /**

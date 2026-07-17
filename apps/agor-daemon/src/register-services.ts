@@ -9,21 +9,27 @@ import {
   type AgorConfig,
   PublicBaseUrlNotConfiguredError,
   requirePublicBaseUrl,
+  resolveExecutionSecurityMode,
 } from '@agor/core/config';
 import {
   and,
   BoardRepository,
   BranchRepository,
-  type Database,
   eq,
+  GatewayChannelRepository,
+  getCurrentTenantId,
   inArray,
+  isPostgresDatabase,
   MCPServerRepository,
+  runWithTenantDatabaseScope,
   SessionMCPServerRepository,
   type SessionMCPServerRow,
   select,
   sessionMcpServers,
   shortId,
+  type TenantScopeAwareDatabase,
   UserMCPOAuthTokenRepository,
+  visibleSessionReferenceAccessExists,
 } from '@agor/core/db';
 import type { Application } from '@agor/core/feathers';
 import { Forbidden, NotAuthenticated } from '@agor/core/feathers';
@@ -36,8 +42,16 @@ import type {
   Params,
   SessionID,
   UserID,
+  UUID,
 } from '@agor/core/types';
-import { AGENTIC_TOOL_CAPABILITIES, SessionStatus, TaskStatus } from '@agor/core/types';
+import {
+  AGENTIC_TOOL_CAPABILITIES,
+  isSessionExecuting,
+  isTaskExecuting,
+  ROLES,
+  SessionStatus,
+  TaskStatus,
+} from '@agor/core/types';
 import type { UnixUserMode } from '@agor/core/unix';
 import type express from 'express';
 import type {
@@ -46,6 +60,7 @@ import type {
   SessionsServiceImpl,
 } from './declarations.js';
 import { trackExecutorProcess, untrackExecutorProcess } from './executor-tracking.js';
+import { runInOAuthTenantScope } from './oauth-auth-helpers.js';
 import {
   cacheOAuth21Token,
   clearOAuth21Token,
@@ -53,6 +68,7 @@ import {
   oauth21TokenCache,
   persistOAuthToken,
 } from './oauth-cache.js';
+import { createAgenticToolPresetsService } from './services/agentic-tool-presets.js';
 import { createArtifactsService } from './services/artifacts.js';
 import { createBoardCommentsService } from './services/board-comments.js';
 import { createBoardObjectsService } from './services/board-objects.js';
@@ -63,10 +79,12 @@ import { createBranchesService } from './services/branches.js';
 import { createCardTypesService } from './services/card-types.js';
 import { createCardsService } from './services/cards.js';
 import { createCheckAuthService } from './services/check-auth.js';
+import { createClaudeModelsService } from './services/claude-models.js';
 import { createConfigService } from './services/config.js';
 import { createContextService } from './services/context.js';
 import { createCopilotModelsService } from './services/copilot-models.js';
 import { createCursorModelsService } from './services/cursor-models.js';
+import { prepareSessionForExecutorStart } from './services/executor-startup.js';
 import {
   createExternalRunEventsService,
   createExternalRunLinksService,
@@ -76,12 +94,16 @@ import { createFileService } from './services/file.js';
 import { createFilesService } from './services/files.js';
 import { createGatewayService } from './services/gateway.js';
 import { createGatewayChannelsService } from './services/gateway-channels.js';
+import { createGatewayChannelsAppInfoService } from './services/gateway-channels-app-info.js';
+import { createGatewayChannelsTestService } from './services/gateway-channels-test.js';
 import { registerGitHubAppSetupRoutes } from './services/github-app-setup.js';
 import {
   createGroupMembershipsService,
   createGroupsService,
+  setupBoardAlignedBranchesService,
   setupBoardGroupGrantsService,
   setupBranchEffectiveAccessService,
+  setupBranchFsAccessUsersService,
   setupBranchGroupGrantsService,
 } from './services/groups.js';
 import { createKnowledgeDocumentEditsService } from './services/knowledge-document-edits.js';
@@ -94,6 +116,7 @@ import { createKnowledgeSearchService } from './services/knowledge-search.js';
 import { createKnowledgeSettingsService } from './services/knowledge-settings.js';
 import { createKnowledgeVersionsService } from './services/knowledge-versions.js';
 import { createLeaderboardService } from './services/leaderboard.js';
+import { createLocalActionsService } from './services/local-actions.js';
 import { createMCPServersService } from './services/mcp-servers.js';
 import { createMessagesService } from './services/messages.js';
 import { performOAuthDisconnect } from './services/oauth-disconnect.js';
@@ -101,14 +124,18 @@ import { createReposService } from './services/repos.js';
 import { createSchedulesService } from './services/schedules.js';
 import { createSessionEnvSelectionsService } from './services/session-env-selections.js';
 import { createSessionMCPServersService } from './services/session-mcp-servers.js';
+import { createSessionStreamsService } from './services/session-streams.js';
 import { createSessionsService } from './services/sessions.js';
 import { createTasksService } from './services/tasks.js';
 import { createTemplatesService } from './services/templates.js';
+import { createTenantAgenticToolSettingsService } from './services/tenant-agentic-tools.js';
 import { TerminalsService } from './services/terminals.js';
 import { createThreadSessionMapService } from './services/thread-session-map.js';
 import { createUsersService } from './services/users.js';
 import { userRoomName } from './setup/socketio.js';
 import { appendSystemMessage } from './utils/append-system-message.js';
+import { requireMinimumRole } from './utils/authorization.js';
+import { emitServiceEvent } from './utils/emit-service-event.js';
 import { escapeHtml } from './utils/html.js';
 import {
   shouldExposeMCPServerSecrets,
@@ -127,10 +154,9 @@ import { spawnExecutor } from './utils/spawn-executor.js';
  * Interface for dependencies needed by service registration.
  */
 export interface RegisterServicesContext {
-  db: Database;
+  db: TenantScopeAwareDatabase;
   app: Application & { io?: import('socket.io').Server };
   config: AgorConfig;
-  svcEnabled: (group: string) => boolean;
   jwtSecret: string;
   daemonUrl: string;
   /** True when the daemon is serving the bundled UI itself at /ui (installed agor-live). */
@@ -163,12 +189,11 @@ export interface RegisteredServices {
  * Register all FeathersJS services on the app.
  */
 export async function registerServices(ctx: RegisterServicesContext): Promise<RegisteredServices> {
-  const { db, app, config, svcEnabled, jwtSecret, daemonUrl, branchRbacEnabled, allowSuperadmin } =
-    ctx;
+  const { db, app, config, jwtSecret, daemonUrl, branchRbacEnabled, allowSuperadmin } = ctx;
 
   const _superadminOpts = { allowSuperadmin };
 
-  // Helper: safely get a service (returns undefined if not registered due to tier=off)
+  // Helper for optional or conditionally registered integration services.
   const safeService = (path: string) => {
     try {
       return app.service(path);
@@ -208,6 +233,19 @@ export async function registerServices(ctx: RegisterServicesContext): Promise<Re
     createExecuteHandler(ctx, sessionsService, sessionTokenService)
   );
 
+  // Realtime control-plane: browsers subscribe (create) / unsubscribe (remove)
+  // to a session's per-connection streaming channel so per-chunk streaming
+  // events reach only the tabs actively viewing that session. Access is gated
+  // by the session read inside the service. The create/remove events are
+  // control-plane only and must never broadcast, so publish to no connections.
+  app.use('/session-streams', createSessionStreamsService(app), {
+    methods: ['create', 'remove'],
+  });
+  app.service('/session-streams').hooks({
+    before: { all: [ctx.requireAuth] },
+  });
+  app.service('/session-streams').publish(() => []);
+
   app.use('/tasks', createTasksService(db, app), {
     // Custom events not in this list are dropped at the FeathersJS transport
     // boundary — they fire on the local EventEmitter but never reach socket
@@ -222,9 +260,7 @@ export async function registerServices(ctx: RegisterServicesContext): Promise<Re
     //      the executor for live tool/thinking visualization.
     events: ['queued', 'tool:start', 'tool:complete', 'thinking:chunk', 'failed'],
   });
-  if (svcEnabled('leaderboard')) {
-    app.use('/leaderboard', createLeaderboardService(db));
-  }
+  app.use('/leaderboard', createLeaderboardService(db));
   const messagesService = createMessagesService(db) as unknown as MessagesServiceImpl;
 
   app.use('/messages', messagesService, {
@@ -273,58 +309,52 @@ export async function registerServices(ctx: RegisterServicesContext): Promise<Re
     },
     // biome-ignore lint/suspicious/noExplicitAny: feathers-swagger docs option not typed in FeathersJS
   } as any);
-
-  // ============================================================================
-  // Boards, board-objects, cards, artifacts, board-comments
-  // ============================================================================
-
-  if (svcEnabled('boards')) {
-    app.use(
-      '/boards',
-      createBoardsService(db, (boardObject) => {
-        app.service('board-objects').emit('patched', boardObject);
-      }),
-      {
-        methods: [
-          'find',
-          'get',
-          'create',
-          'update',
-          'patch',
-          'remove',
-          'toBlob',
-          'fromBlob',
-          'toYaml',
-          'fromYaml',
-          'clone',
-          'setPrimaryAssistant',
-          'clearPrimaryAssistant',
-          'ensureAssistantWelcomeNote',
-        ],
-      }
-    );
-    app.use('/board-objects', createBoardObjectsService(db));
-  }
+  app.use(
+    '/boards',
+    createBoardsService(
+      db,
+      (boardObject, params) => {
+        emitServiceEvent(app, {
+          path: 'board-objects',
+          event: 'patched',
+          data: boardObject,
+          params,
+          id: boardObject.object_id,
+        });
+      },
+      (event) => emitServiceEvent(app, { path: 'boards', ...event })
+    ),
+    {
+      methods: [
+        'find',
+        'get',
+        'create',
+        'update',
+        'patch',
+        'remove',
+        'toBlob',
+        'fromBlob',
+        'toYaml',
+        'fromYaml',
+        'clone',
+        'setPrimaryTeammate',
+        'clearPrimaryTeammate',
+        'ensureTeammateWelcomeNote',
+      ],
+    }
+  );
+  app.use('/board-objects', createBoardObjectsService(db, app));
 
   const boardsService = safeService('boards') as unknown as BoardsServiceImpl | undefined;
-
-  if (svcEnabled('cards')) {
-    app.use('/card-types', createCardTypesService(db));
-    app.use('/cards', createCardsService(db));
-  }
-
-  if (svcEnabled('artifacts')) {
-    // `agor-query` is the runtime-introspection fan-out event (daemon →
-    // viewer's browser tab). Feathers' default `serviceEvents` is just
-    // ['created','updated','patched','removed'], so without this it
-    // fires locally on the server's EventEmitter and never reaches any
-    // socket. See queryArtifactRuntime in services/artifacts.ts.
-    app.use('/artifacts', createArtifactsService(db, app), { events: ['agor-query'] });
-  }
-
-  if (svcEnabled('boards')) {
-    app.use('/board-comments', createBoardCommentsService(db));
-  }
+  app.use('/card-types', createCardTypesService(db));
+  app.use('/cards', createCardsService(db));
+  // `agor-query` is the runtime-introspection fan-out event (daemon →
+  // viewer's browser tab). Feathers' default `serviceEvents` is just
+  // ['created','updated','patched','removed'], so without this it
+  // fires locally on the server's EventEmitter and never reaches any
+  // socket. See queryArtifactRuntime in services/artifacts.ts.
+  app.use('/artifacts', createArtifactsService(db, app), { events: ['agor-query'] });
+  app.use('/board-comments', createBoardCommentsService(db));
 
   // ============================================================================
   // Branches, repos
@@ -338,8 +368,9 @@ export async function registerServices(ctx: RegisterServicesContext): Promise<Re
       'update',
       'patch',
       'remove',
+      'updateEnvironment',
       'initializeUnixGroup',
-      'ensureAssistantKnowledgeNamespace',
+      'ensureTeammateKnowledgeNamespace',
     ],
   });
 
@@ -352,14 +383,16 @@ export async function registerServices(ctx: RegisterServicesContext): Promise<Re
     !app.services['branches/:id/owners/:userId']
   ) {
     const branchRepo = new BranchRepository(db);
+    const executionMode = resolveExecutionSecurityMode(config);
     setupBranchOwnersService(app, branchRepo, {
       jwtSecret,
       daemonUser: config.daemon?.unix_user,
+      unixFsIsolationEnabled: executionMode.unixFsIsolationEnabled,
       allowSuperadmin,
     });
   }
 
-  if (branchRbacEnabled) {
+  if (resolveExecutionSecurityMode(config).unixFsIsolationEnabled) {
     const daemonUser = config.daemon?.unix_user || 'agor';
     console.log(`[Unix Integration] Executor-based sync enabled (daemon user: ${daemonUser})`);
   }
@@ -371,6 +404,8 @@ export async function registerServices(ctx: RegisterServicesContext): Promise<Re
     methods: ['find', 'create', 'remove'],
   });
   setupBranchEffectiveAccessService(app, new BranchRepository(db));
+  setupBoardAlignedBranchesService(app, new BranchRepository(db));
+  setupBranchFsAccessUsersService(app, new BranchRepository(db));
   if (branchRbacEnabled) {
     setupBoardOwnersService(app, new BoardRepository(db));
     setupBoardGroupGrantsService(app, db);
@@ -389,7 +424,7 @@ export async function registerServices(ctx: RegisterServicesContext): Promise<Re
   // Knowledge (backend/data foundations)
   // ============================================================================
 
-  app.use('/kb/namespaces', createKnowledgeNamespacesService(db), {
+  app.use('/kb/namespaces', createKnowledgeNamespacesService(db, app), {
     methods: [
       'find',
       'get',
@@ -455,7 +490,7 @@ export async function registerServices(ctx: RegisterServicesContext): Promise<Re
   let oauthCallbackHandler: ((req: express.Request, res: express.Response) => void) | null = null;
 
   // The OAuth callback middleware is registered in boot.ts; here we set the handler
-  if (svcEnabled('mcp_servers')) {
+  {
     const mcpResult = await registerMCPServices(ctx, sessionsService);
     oauthCallbackHandler = mcpResult.oauthCallbackHandler;
   }
@@ -464,10 +499,42 @@ export async function registerServices(ctx: RegisterServicesContext): Promise<Re
   // Gateway services
   // ============================================================================
 
-  if (svcEnabled('gateway')) {
+  {
     app.use('/gateway-channels', createGatewayChannelsService(db));
+
+    // Sub-path service for the connection probe. A sub-path does NOT inherit
+    // the parent gateway-channels admin gating / redaction hooks, so it carries
+    // its own requireAuth + admin gate. It reads decrypted tokens via the
+    // repository and returns no token values.
+    app.use('/gateway-channels/test', createGatewayChannelsTestService(db));
+    app.service('gateway-channels/test').hooks({
+      before: {
+        create: [ctx.requireAuth, requireMinimumRole(ROLES.ADMIN, 'test gateway channels')],
+      },
+    });
+    // Request/response probe — its default `created` event would otherwise fall
+    // through the global publisher's `global` scope and broadcast the probe
+    // result to every authenticated socket. Publish to no one.
+    app.service('gateway-channels/test').publish(() => []);
+
+    // Sub-path service resolving the Slack app id behind a channel's stored
+    // bot token (auth.test → bots.info). Same gating rationale as /test above:
+    // reads decrypted tokens via the repository, returns no token values.
+    app.use('/gateway-channels/app-info', createGatewayChannelsAppInfoService(db));
+    app.service('gateway-channels/app-info').hooks({
+      before: {
+        create: [ctx.requireAuth, requireMinimumRole(ROLES.ADMIN, 'read gateway app info')],
+      },
+    });
+    // Request/response read — same broadcast fall-through as /test above.
+    app.service('gateway-channels/app-info').publish(() => []);
+
     app.use('/thread-session-map', createThreadSessionMapService(db));
     app.use('/gateway', createGatewayService(db, app), {
+      // Only expose the inbound gateway entrypoint and existing route hook
+      // externally. Proactive outbound emits are intentionally invoked through
+      // the authenticated Agor MCP tool surface; exposing emitMessage here would
+      // bypass the gateway service's normal channel_key auth model.
       methods: ['create', 'routeMessage'],
     });
 
@@ -481,7 +548,12 @@ export async function registerServices(ctx: RegisterServicesContext): Promise<Re
 
   const configService = createConfigService(db);
   configService.app = app;
-  app.use('/config', configService);
+  app.use('/admin/local-actions', createLocalActionsService());
+
+  app.use('/agentic-tool-settings', createTenantAgenticToolSettingsService(db));
+  app.service('/agentic-tool-settings').hooks({ before: { all: [ctx.requireAuth] } });
+  app.use('/agentic-tool-presets', createAgenticToolPresetsService(db));
+  app.service('/agentic-tool-presets').hooks({ before: { all: [ctx.requireAuth] } });
 
   app.use('/config/resolve-api-key', {
     // biome-ignore lint/suspicious/noExplicitAny: taskId is branded UUID at runtime
@@ -497,6 +569,12 @@ export async function registerServices(ctx: RegisterServicesContext): Promise<Re
 
   app.use('/check-auth', createCheckAuthService(db));
   app.service('/check-auth').hooks({ before: { create: [ctx.requireAuth] } });
+
+  // Claude dynamic model discovery via @anthropic-ai/sdk's models.list().
+  // Resolves ANTHROPIC_API_KEY per-user (with config.yaml + env fallback)
+  // and falls back to AVAILABLE_CLAUDE_MODEL_ALIASES if no key or API failure.
+  app.use('/claude-models', createClaudeModelsService(db));
+  app.service('/claude-models').hooks({ before: { find: [ctx.requireAuth] } });
 
   // Copilot dynamic model discovery via @github/copilot-sdk's listModels().
   // Resolves the GitHub token per-user (with config.yaml + env fallback)
@@ -515,12 +593,9 @@ export async function registerServices(ctx: RegisterServicesContext): Promise<Re
   const { UsersRepository, SessionRepository } = await import('@agor/core/db');
   const usersRepository = new UsersRepository(db);
   const sessionsRepository = new SessionRepository(db);
-
-  if (svcEnabled('file_browser')) {
-    app.use('/context', createContextService(branchRepository));
-    app.use('/file', createFileService(branchRepository));
-    app.use('/files', createFilesService(db, app));
-  }
+  app.use('/context', createContextService(branchRepository));
+  app.use('/file', createFileService(branchRepository));
+  app.use('/files', createFilesService(db, app));
 
   // Server-side Handlebars renderer. UI calls POST /templates so the browser
   // bundle can stay free of Handlebars (which uses `new Function` and would
@@ -528,12 +603,10 @@ export async function registerServices(ctx: RegisterServicesContext): Promise<Re
   app.use('/templates', createTemplatesService());
   app.service('/templates').hooks({ before: { create: [ctx.requireAuth] } });
 
-  const terminalsService = svcEnabled('terminals') ? new TerminalsService(app, db) : null;
-  if (terminalsService) {
-    app.use('/terminals', terminalsService, {
-      events: ['data', 'exit'],
-    });
-  }
+  const terminalsService = new TerminalsService(app, db);
+  app.use('/terminals', terminalsService, {
+    events: ['data', 'exit'],
+  });
 
   // ============================================================================
   // Session MCP Servers (top-level for WebSocket events)
@@ -560,63 +633,80 @@ export async function registerServices(ctx: RegisterServicesContext): Promise<Re
       return [];
     },
   });
-
-  if (svcEnabled('mcp_servers')) {
-    app.use('/session-mcp-servers', {
-      async find(params?: {
-        query?: {
-          session_id?: string | { $in?: string[] };
-          mcp_server_id?: string;
-          enabled?: boolean;
-        };
-      }) {
-        const conditions: ReturnType<typeof eq>[] = [];
-        // session_id may be a scalar string or `{ $in: [...] }` — the latter is
-        // injected by the RBAC scoping hook to restrict rows to accessible sessions.
-        const sessionIdFilter = params?.query?.session_id;
-        if (typeof sessionIdFilter === 'string') {
-          conditions.push(eq(sessionMcpServers.session_id, sessionIdFilter));
-        } else if (
-          sessionIdFilter &&
-          typeof sessionIdFilter === 'object' &&
-          Array.isArray(sessionIdFilter.$in)
-        ) {
-          if (sessionIdFilter.$in.length === 0) {
-            return [];
-          }
-          conditions.push(inArray(sessionMcpServers.session_id, sessionIdFilter.$in));
+  app.use('/session-mcp-servers', {
+    async find(params?: {
+      query?: {
+        session_id?: string | { $in?: string[] };
+        mcp_server_id?: string;
+        enabled?: boolean;
+      };
+      _agorSqlSessionAccessUserId?: UUID;
+    }) {
+      const conditions: ReturnType<typeof eq>[] = [];
+      // session_id may be a scalar string or `{ $in: [...] }` from callers.
+      // RBAC scoping is composed below via `_agorSqlSessionAccessUserId`.
+      const sessionIdFilter = params?.query?.session_id;
+      if (typeof sessionIdFilter === 'string') {
+        conditions.push(eq(sessionMcpServers.session_id, sessionIdFilter));
+      } else if (
+        sessionIdFilter &&
+        typeof sessionIdFilter === 'object' &&
+        Array.isArray(sessionIdFilter.$in)
+      ) {
+        if (sessionIdFilter.$in.length === 0) {
+          return [];
         }
-        if (params?.query?.mcp_server_id) {
-          conditions.push(eq(sessionMcpServers.mcp_server_id, params.query.mcp_server_id));
-        }
-        if (params?.query?.enabled !== undefined) {
-          conditions.push(eq(sessionMcpServers.enabled, params.query.enabled));
-        }
-        let query = select(db).from(sessionMcpServers);
-        if (conditions.length > 0) {
-          query = query.where(and(...conditions)) as typeof query;
-        }
-        const rows = await query.all();
-        return rows.map((row: SessionMCPServerRow) => ({
-          session_id: row.session_id,
-          mcp_server_id: row.mcp_server_id,
-          enabled: Boolean(row.enabled),
-          added_at: new Date(row.added_at),
-        }));
-      },
-    });
-  }
+        conditions.push(inArray(sessionMcpServers.session_id, sessionIdFilter.$in));
+      }
+      if (params?.query?.mcp_server_id) {
+        conditions.push(eq(sessionMcpServers.mcp_server_id, params.query.mcp_server_id));
+      }
+      if (params?.query?.enabled !== undefined) {
+        conditions.push(eq(sessionMcpServers.enabled, params.query.enabled));
+      }
+      if (params?._agorSqlSessionAccessUserId) {
+        conditions.push(
+          visibleSessionReferenceAccessExists(
+            db,
+            params._agorSqlSessionAccessUserId,
+            sessionMcpServers.session_id
+          )
+        );
+      }
+      let query = select(db).from(sessionMcpServers);
+      if (conditions.length > 0) {
+        query = query.where(and(...conditions)) as typeof query;
+      }
+      const rows = await query.all();
+      return rows.map((row: SessionMCPServerRow) => ({
+        session_id: row.session_id,
+        mcp_server_id: row.mcp_server_id,
+        enabled: Boolean(row.enabled),
+        added_at: new Date(row.added_at),
+      }));
+    },
+  });
 
   // ============================================================================
   // Users service
   // ============================================================================
 
-  const usersService = createUsersService(db);
+  const usersService = createUsersService(db, app);
   // UsersService implements find/get/create/patch/remove (no `update`), plus
-  // the custom `getGitEnvironment`. Listing `update` here makes Feathers' hook
+  // custom RPCs like `getGitEnvironment` and avatar sync helpers. Listing `update` here makes Feathers' hook
   // wiring throw "Can not apply hooks. 'update' is not a function" at startup.
   app.use('/users', usersService, {
-    methods: ['find', 'get', 'create', 'patch', 'remove', 'getGitEnvironment'],
+    methods: [
+      'find',
+      'get',
+      'create',
+      'patch',
+      'remove',
+      'getGitEnvironment',
+      'getAvatarSettings',
+      'updateAvatarSettings',
+      'syncAvatars',
+    ],
   });
 
   // Bootstrap superadmin users
@@ -666,9 +756,14 @@ function createExecuteHandler(
     // biome-ignore lint/suspicious/noExplicitAny: FeathersJS params type varies by context
     params: any
   ) => {
-    const session = await sessionsService.get(sessionId, params);
-    if (!session) {
-      throw new Error(`Session ${sessionId} not found`);
+    const tenantId = getCurrentTenantId();
+    const session = await prepareSessionForExecutorStart(db, sessionsService, sessionId, params);
+    if (
+      session.agentic_tool_preset_id &&
+      data.permissionMode !== undefined &&
+      data.permissionMode !== session.permission_config?.mode
+    ) {
+      throw new Error('Preset-backed sessions cannot override permission mode per task');
     }
 
     // Validate stateless_fs_mode compatibility with agentic tool
@@ -715,12 +810,13 @@ function createExecuteHandler(
     // Get branch path
     let cwd = process.cwd();
     if (session.branch_id) {
-      try {
-        const branch = await app.service('branches').get(session.branch_id, params);
-        cwd = branch.path;
-      } catch (error) {
-        console.warn(`Could not get branch path for ${session.branch_id}:`, error);
-      }
+      const branchPath = await runWithTenantDatabaseScope(db, tenantId, async (tenantDb) => {
+        const branch = await new BranchRepository(tenantDb).findById(session.branch_id);
+        return branch?.path;
+      });
+      if (!branchPath)
+        throw new Error(`Branch ${session.branch_id} not found for executor startup`);
+      cwd = branchPath;
     }
 
     // Determine Unix user for executor
@@ -735,13 +831,6 @@ function createExecuteHandler(
     const configExecutorUser = config.execution?.executor_unix_user;
     const sessionUnixUser = session.unix_username;
 
-    console.log('[Daemon] Determining executor Unix user:', {
-      sessionId: shortId(session.session_id),
-      unixUserMode,
-      sessionUnixUser,
-      configExecutorUser,
-    });
-
     const impersonationResult = resolveUnixUserForImpersonation({
       mode: unixUserMode,
       userUnixUsername: sessionUnixUser,
@@ -749,8 +838,6 @@ function createExecuteHandler(
     });
 
     const executorUnixUser = impersonationResult.unixUser;
-    console.log(`[Daemon] Executor impersonation: ${impersonationResult.reason}`);
-
     const effectivePermissionMode =
       data.permissionMode || session.permission_config?.mode || undefined;
     const permissionModeForPayload =
@@ -773,16 +860,15 @@ function createExecuteHandler(
     const userId = (params as AuthenticatedParams).user?.user_id as UserID | undefined;
 
     // Resolve gateway-level env vars
-    let gatewayEnv: import('@agor/core/types').GatewayEnvVar[] | undefined;
     const gatewaySource = (session.custom_context as Record<string, unknown> | undefined)
       ?.gateway_source as { channel_id?: string } | undefined;
-    if (gatewaySource?.channel_id) {
-      try {
-        const { GatewayChannelRepository, decryptApiKey, isEncrypted } = await import(
-          '@agor/core/db'
+    const executorEnv = await runWithTenantDatabaseScope(db, tenantId, async (tenantDb) => {
+      let gatewayEnv: import('@agor/core/types').GatewayEnvVar[] | undefined;
+      if (gatewaySource?.channel_id) {
+        const { decryptApiKey, isEncrypted } = await import('@agor/core/db');
+        const channel = await new GatewayChannelRepository(tenantDb).findById(
+          gatewaySource.channel_id
         );
-        const channelRepo = new GatewayChannelRepository(db);
-        const channel = await channelRepo.findById(gatewaySource.channel_id);
         if (channel?.agentic_config?.envVars) {
           gatewayEnv = channel.agentic_config.envVars.map((v) => ({
             ...v,
@@ -796,22 +882,33 @@ function createExecuteHandler(
             })(),
           }));
         }
-      } catch {
-        // Non-fatal
+        // Merge connector-provided session credentials (e.g. Shortcut's API
+        // token, which the media-intake skill uses to fetch ticket
+        // attachments) as defaults. Operator `agentic_config.envVars` above
+        // take precedence — a key already present is not overwritten.
+        if (channel) {
+          const { getConnector } = await import('@agor/core/gateway');
+          const connectorEnv =
+            getConnector(channel.channel_type, channel.config).sessionEnv?.() ?? [];
+          if (connectorEnv.length > 0) {
+            const present = new Set((gatewayEnv ?? []).map((e) => e.key));
+            const defaults = connectorEnv.filter((e) => !present.has(e.key));
+            if (defaults.length > 0) gatewayEnv = [...(gatewayEnv ?? []), ...defaults];
+          }
+        }
       }
-    }
 
-    // SDK spawn: scope per-tool credentials to the session's agentic_tool, so
-    // an Anthropic key on the user never leaks into a Codex/Gemini executor.
-    const executorEnv = await createUserProcessEnvironment(
-      userId,
-      db,
-      undefined,
-      !!executorUnixUser,
-      gatewayEnv,
-      sessionId as SessionID,
-      session.agentic_tool
-    );
+      // Provider connections are resolved once by the executor through the
+      // task-scoped daemon API. Generic process environment never carries them.
+      return createUserProcessEnvironment(
+        userId,
+        tenantDb,
+        undefined,
+        !!executorUnixUser,
+        gatewayEnv,
+        sessionId as SessionID
+      );
+    });
 
     // Validate required user environment variables
     const requiredUserEnvVars = config.execution?.required_user_env_vars;
@@ -828,14 +925,16 @@ function createExecuteHandler(
           '',
           'This is a one-time setup — once configured, this message will not appear again.',
         ].join('\n');
-        await appendSystemMessage({
-          app,
-          db,
-          sessionId,
-          taskId: data.taskId,
-          content: errorContent,
-          contentPreview: `Missing required env vars: ${missingVars.join(', ')}`,
-        });
+        await runWithTenantDatabaseScope(db, tenantId, (tenantDb) =>
+          appendSystemMessage({
+            app,
+            db,
+            sessionId,
+            taskId: data.taskId,
+            content: errorContent,
+            contentPreview: `Missing required env vars: ${missingVars.join(', ')}`,
+          })
+        );
         throw new Error(`Missing required environment variables: ${missingVars.join(', ')}`);
       }
     }
@@ -920,22 +1019,12 @@ function createExecuteHandler(
               `⏭️ [Executor] Task ${shortId(taskId)} is not the latest (latest: ${shortId(latestTaskId)}), skipping safety net`
             );
           } else if (
-            currentSession.status === SessionStatus.RUNNING ||
-            currentSession.status === SessionStatus.AWAITING_PERMISSION ||
-            currentSession.status === SessionStatus.AWAITING_INPUT ||
-            currentSession.status === SessionStatus.STOPPING ||
+            isSessionExecuting(currentSession) ||
             currentSession.status === SessionStatus.TIMED_OUT
           ) {
             try {
               const currentTask = await app.service('tasks').get(taskId, params);
-              const isTaskStillActive =
-                currentTask.status === TaskStatus.RUNNING ||
-                currentTask.status === 'awaiting_permission' ||
-                currentTask.status === 'awaiting_input' ||
-                currentTask.status === 'stopping' ||
-                currentTask.status === 'timed_out';
-
-              if (isTaskStillActive) {
+              if (isTaskExecuting(currentTask) || currentTask.status === TaskStatus.TIMED_OUT) {
                 await app.service('tasks').patch(
                   taskId,
                   {
@@ -1095,6 +1184,8 @@ async function registerMCPServices(
     mcpServerId?: string;
     userId?: string;
     oauthMode?: 'per_user' | 'shared';
+    /** Tenant captured when the flow starts; browser callbacks have no auth headers. */
+    tenantId?: string;
     socketId?: string;
     createdAt: number;
     /**
@@ -1187,6 +1278,7 @@ async function registerMCPServices(
     mcpServerId?: string;
     userId?: string;
     oauthMode?: 'per_user' | 'shared';
+    tenantId?: string;
     clientId?: string;
     clientSecret?: string;
     authorizationUrlOverride?: string;
@@ -1292,6 +1384,7 @@ async function registerMCPServices(
       mcpServerId: opts.mcpServerId,
       userId: opts.userId,
       oauthMode: opts.oauthMode,
+      tenantId: opts.tenantId ?? getCurrentTenantId(),
       socketId: opts.socketId,
       createdAt: Date.now(),
       tokenResolve,
@@ -1317,6 +1410,48 @@ async function registerMCPServices(
     }
     return base;
   }
+
+  const tenantIdFromParams = (params?: AuthenticatedParams): string | undefined =>
+    (params as (AuthenticatedParams & { tenant?: { tenant_id?: string } }) | undefined)?.tenant
+      ?.tenant_id ?? getCurrentTenantId();
+
+  const persistOAuthTokenForPendingFlow = async (
+    tokenResponse: OAuthTokenResponse,
+    pendingFlow: PendingOAuthFlow,
+    logPrefix: string
+  ): Promise<void> => {
+    const work = () =>
+      persistOAuthToken(
+        db,
+        tokenResponse,
+        pendingFlow.mcpUrl,
+        {
+          ...pendingFlow,
+          clientId: pendingFlow.context.clientId,
+          clientSecret: pendingFlow.context.clientSecret,
+          tokenEndpoint: pendingFlow.context.tokenEndpoint,
+        },
+        logPrefix
+      );
+
+    if (pendingFlow.tenantId) {
+      await runInOAuthTenantScope(db, pendingFlow.tenantId, work);
+      return;
+    }
+
+    // OAuth callbacks arrive as unauthenticated browser redirects, so they
+    // cannot re-resolve tenant scope from request auth. In Postgres/multitenant
+    // deployments, a flow without captured tenant metadata is unsafe to persist:
+    // fail closed and ask the user to restart the OAuth flow. SQLite/single-user
+    // installs do not have tenant DB scope, so they keep the legacy direct path.
+    if (isPostgresDatabase(db) && pendingFlow.mcpServerId) {
+      throw new Error(
+        'Missing tenant context for MCP OAuth callback. Please restart the OAuth flow.'
+      );
+    }
+
+    await work();
+  };
 
   // Set the OAuth callback handler
   const oauthCallbackHandler = async (req: express.Request, res: express.Response) => {
@@ -1371,18 +1506,7 @@ async function registerMCPServices(
         const tokenResponse = await completeMCPOAuthFlow(pendingFlow.context, code, state);
         pendingOAuthFlows.delete(state);
 
-        await persistOAuthToken(
-          db,
-          tokenResponse,
-          pendingFlow.mcpUrl,
-          {
-            ...pendingFlow,
-            clientId: pendingFlow.context.clientId,
-            clientSecret: pendingFlow.context.clientSecret,
-            tokenEndpoint: pendingFlow.context.tokenEndpoint,
-          },
-          'OAuth Callback'
-        );
+        await persistOAuthTokenForPendingFlow(tokenResponse, pendingFlow, 'OAuth Callback');
 
         if (app.io) {
           const oauthEvent = {
@@ -1577,6 +1701,7 @@ async function registerMCPServices(
                   // call (writes to the shared MCP server row, not per-user).
                   oauthMode: 'shared',
                   clientId: data.client_id,
+                  tenantId: tenantIdFromParams(params as AuthenticatedParams | undefined),
                   socketId: connection?.id,
                 });
               } catch (err) {
@@ -1831,6 +1956,7 @@ async function registerMCPServices(
       try {
         console.log('[OAuth Start] Starting two-phase OAuth flow for:', data.mcp_url);
         const userId = params?.user?.user_id;
+        const tenantId = tenantIdFromParams(params);
 
         let oauthMode: 'per_user' | 'shared' | undefined;
         let authorizationUrlOverride: string | undefined;
@@ -1839,8 +1965,10 @@ async function registerMCPServices(
         let clientIdFromConfig: string | undefined;
         let scopeOverride: string | undefined;
         if (data.mcp_server_id) {
-          const mcpServerRepo = new MCPServerRepository(db);
-          const server = await mcpServerRepo.findById(data.mcp_server_id);
+          const server = await runInOAuthTenantScope(db, tenantId, () => {
+            const mcpServerRepo = new MCPServerRepository(db);
+            return mcpServerRepo.findById(data.mcp_server_id as string);
+          });
           if (server?.auth?.type === 'oauth') {
             oauthMode = server.auth.oauth_mode || 'per_user';
             authorizationUrlOverride = server.auth.oauth_authorization_url;
@@ -1897,6 +2025,7 @@ async function registerMCPServices(
             authorizationUrlOverride,
             tokenUrlOverride,
             scope: scopeOverride,
+            tenantId,
             socketId,
           });
         } catch (err) {
@@ -1951,18 +2080,14 @@ async function registerMCPServices(
         const tokenResponse = await completeMCPOAuthFlow(pendingFlow.context, code, state);
         pendingOAuthFlows.delete(state);
 
-        await persistOAuthToken(
-          db,
-          tokenResponse,
-          pendingFlow.mcpUrl,
-          {
-            ...pendingFlow,
-            clientId: pendingFlow.context.clientId,
-            clientSecret: pendingFlow.context.clientSecret,
-            tokenEndpoint: pendingFlow.context.tokenEndpoint,
-          },
-          'OAuth Complete'
-        );
+        const activeTenantId = getCurrentTenantId();
+        if (pendingFlow.tenantId && activeTenantId && pendingFlow.tenantId !== activeTenantId) {
+          throw new Error(
+            'OAuth flow belongs to a different tenant. Please restart the OAuth flow.'
+          );
+        }
+
+        await persistOAuthTokenForPendingFlow(tokenResponse, pendingFlow, 'OAuth Complete');
         return { success: true, message: 'OAuth authentication successful!', tokenObtained: true };
       } catch (error) {
         console.error('[OAuth Complete] Error:', error);
@@ -2038,7 +2163,7 @@ async function registerMCPServices(
   // --------------------------------------------------------------------------
   app.use('/mcp-servers/oauth-auth-headers', {
     async create(
-      data: { mcp_server_ids: string[] },
+      data: { mcp_server_ids: string[]; executorSessionToken?: string },
       params?: AuthenticatedParams
     ): Promise<{
       headers: Record<string, { authorization?: string; error?: string }>;
@@ -2058,9 +2183,30 @@ async function registerMCPServices(
       const sessionId = (params as (AuthenticatedParams & { session_id?: string }) | undefined)
         ?.session_id;
       const trustedInternalOrService = shouldExposeMCPServerSecrets(params);
-      const trustedSessionExecutor = shouldExposeMCPServerSecretsForSessionToken(params, {
+      let trustedSessionExecutor = shouldExposeMCPServerSecretsForSessionToken(params, {
         sessionId,
       });
+      let executorSessionId = sessionId;
+      if (!trustedSessionExecutor && params?.provider && data.executorSessionToken) {
+        const executorTokenService = (
+          app as unknown as {
+            sessionTokenService?: {
+              validateToken: (
+                token: string,
+                expected?: { sessionId?: string; taskId?: string; branchId?: string }
+              ) => Promise<{ session_id: string } | null>;
+            };
+          }
+        ).sessionTokenService;
+        const sessionInfo = await executorTokenService?.validateToken(
+          data.executorSessionToken,
+          {}
+        );
+        if (sessionInfo?.session_id) {
+          executorSessionId = sessionInfo.session_id;
+          trustedSessionExecutor = true;
+        }
+      }
       if (!trustedInternalOrService && !trustedSessionExecutor) {
         throw new Forbidden('oauth-auth-headers is only available to trusted executor paths');
       }
@@ -2068,8 +2214,14 @@ async function registerMCPServices(
       const userTokenRepo = new UserMCPOAuthTokenRepository(db);
       const mcpServerRepo = new MCPServerRepository(db);
       if (trustedSessionExecutor) {
+        if (!executorSessionId) {
+          throw new Forbidden('oauth-auth-headers requires executor session scope');
+        }
         const sessionMcpRepo = new SessionMCPServerRepository(db);
-        const attachedServers = await sessionMcpRepo.listServers(sessionId as SessionID, true);
+        const attachedServers = await sessionMcpRepo.listServers(
+          executorSessionId as SessionID,
+          true
+        );
         const globalServers = await mcpServerRepo.findAll({ scope: 'global', enabled: true });
         const allowedServerIds = new Set([
           ...globalServers.map((server) => server.mcp_server_id),
@@ -2492,6 +2644,7 @@ async function registerMCPServices(
               // call). Without a serverId nothing is persisted to the DB; the
               // daemon-level cache below carries the token for this request.
               oauthMode: 'shared',
+              tenantId: tenantIdFromParams(params),
               socketId: connection?.id,
             });
 

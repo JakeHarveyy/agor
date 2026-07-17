@@ -5,19 +5,21 @@
  */
 
 import type {
+  AgenticToolPreset,
   Artifact,
-  AssistantWelcomeNoteRequest,
   AuthenticationResult,
   Board,
   BoardExportBlob,
   BoardGroupGrantWithGroup,
   Branch,
+  BranchEnvironmentUpdate,
   BranchGroupGrantWithGroup,
   CardType,
   CardWithType,
   CloneRepositoryResult,
   ContextFileDetail,
   ContextFileListItem,
+  CreateAgenticToolPreset,
   Group,
   GroupMembership,
   KnowledgeDocument,
@@ -30,14 +32,21 @@ import type {
   KnowledgeSemanticSettingsPublic,
   MCPServer,
   Message,
+  PatchAgenticToolPreset,
   PermissionMode,
   Repo,
   Schedule,
   Session,
   Task,
+  TeammateWelcomeNoteRequest,
   TemplateRenderRequest,
   TemplateRenderResponse,
+  TenantAgenticToolSettings,
+  TenantAgenticToolSettingsPatch,
   User,
+  UserAvatarSettings,
+  UserAvatarSyncRequest,
+  UserAvatarSyncResult,
   UUID,
 } from '@agor/core/types';
 import authentication from '@feathersjs/authentication-client';
@@ -197,6 +206,8 @@ export interface ServiceTypes {
   'kb/indexing/status': KnowledgeIndexingStatus;
   'kb/indexing/reindex': { queued: number; status: KnowledgeEmbeddingStatus };
   templates: TemplateRenderResponse;
+  'agentic-tool-settings': TenantAgenticToolSettings;
+  'agentic-tool-presets': AgenticToolPreset;
 }
 
 /**
@@ -236,6 +247,20 @@ export interface AgorService<
   // Emit custom events to WebSocket clients (available at runtime via FeathersJS socket.io integration)
   emit(event: string, data: unknown): void;
 }
+
+export type AgenticToolSettingsService = AgorService<
+  TenantAgenticToolSettings,
+  never,
+  never,
+  TenantAgenticToolSettingsPatch
+>;
+
+export type AgenticToolPresetsService = AgorService<
+  AgenticToolPreset,
+  CreateAgenticToolPreset,
+  never,
+  PatchAgenticToolPreset
+>;
 
 /**
  * Sessions service with custom methods for forking, spawning, and genealogy
@@ -411,19 +436,19 @@ export interface BoardsService extends AgorService<Board> {
   ): Promise<Board>;
 
   /**
-   * Set or clear the board's primary assistant branch.
+   * Set or clear the board's primary teammate branch.
    */
-  setPrimaryAssistant(
+  setPrimaryTeammate(
     data: { id?: string; boardId?: string; branchId: string },
     params?: Params
   ): Promise<Board>;
-  clearPrimaryAssistant(boardId: string, params?: Params): Promise<Board>;
+  clearPrimaryTeammate(boardId: string, params?: Params): Promise<Board>;
 
   /**
-   * Create the bundled assistant welcome markdown note when missing. Rendering
+   * Create the bundled teammate welcome markdown note when missing. Rendering
    * happens server-side from a static template; callers only provide values.
    */
-  ensureAssistantWelcomeNote(data: AssistantWelcomeNoteRequest, params?: Params): Promise<Board>;
+  ensureTeammateWelcomeNote(data: TeammateWelcomeNoteRequest, params?: Params): Promise<Board>;
 }
 
 /**
@@ -436,6 +461,12 @@ export interface UsersService extends AgorService<User> {
    * regular users may only fetch their own.
    */
   getGitEnvironment(data: { userId: string }, params?: Params): Promise<Record<string, string>>;
+  getAvatarSettings(data?: unknown, params?: Params): Promise<UserAvatarSettings>;
+  updateAvatarSettings(
+    data: Partial<UserAvatarSettings>,
+    params?: Params
+  ): Promise<UserAvatarSettings>;
+  syncAvatars(data?: UserAvatarSyncRequest, params?: Params): Promise<UserAvatarSyncResult>;
 }
 
 /**
@@ -452,14 +483,13 @@ export interface BranchesService extends AgorService<Branch> {
   ): Promise<{ unixGroup: string }>;
 
   /**
-   * Create or repair the primary Knowledge namespace for an assistant branch.
-   * API/UI-only; not exposed through assistant MCP config mutation tools.
+   * Create or repair the primary Knowledge namespace for a teammate branch.
+   * API/UI-only; not exposed through teammate MCP config mutation tools.
    */
-  ensureAssistantKnowledgeNamespace(
+  ensureTeammateKnowledgeNamespace(
     data: { branchId?: string; branch_id?: string } | string,
     params?: Params
   ): Promise<{ namespace: KnowledgeNamespace; branch: Branch }>;
-
   /**
    * Find branch by repo_id and name
    */
@@ -489,8 +519,15 @@ export interface BranchesService extends AgorService<Branch> {
    * Update environment status
    */
   updateEnvironment(
-    id: string,
-    environmentUpdate: Partial<Branch['environment_instance']>,
+    data:
+      | {
+          branch_id?: string;
+          branchId?: string;
+          environment_update?: BranchEnvironmentUpdate;
+          environmentUpdate?: BranchEnvironmentUpdate;
+        }
+      | string,
+    environmentUpdate?: BranchEnvironmentUpdate,
     params?: Params
   ): Promise<Branch>;
 
@@ -549,6 +586,8 @@ export interface AgorClient extends Omit<Application<ServiceTypes>, 'service'> {
   service(path: 'repos/local'): ReposLocalService;
   service(path: 'branches'): BranchesService;
   service(path: 'boards'): BoardsService;
+  service(path: 'agentic-tool-settings'): AgenticToolSettingsService;
+  service(path: 'agentic-tool-presets'): AgenticToolPresetsService;
 
   // Bulk operation endpoints
   service(path: 'messages/bulk'): MessagesService;
@@ -606,9 +645,9 @@ function extendBoardsService(client: AgorClient): void {
         'toYaml',
         'fromYaml',
         'clone',
-        'setPrimaryAssistant',
-        'clearPrimaryAssistant',
-        'ensureAssistantWelcomeNote'
+        'setPrimaryTeammate',
+        'clearPrimaryTeammate',
+        'ensureTeammateWelcomeNote'
       );
     }
   };
@@ -792,7 +831,12 @@ function extendUsersService(client: AgorClient): void {
   };
   if (usersService[USERS_SERVICE_EXTENDED]) return;
   if (typeof usersService.methods === 'function') {
-    usersService.methods('getGitEnvironment');
+    usersService.methods(
+      'getGitEnvironment',
+      'getAvatarSettings',
+      'updateAvatarSettings',
+      'syncAvatars'
+    );
   }
   usersService[USERS_SERVICE_EXTENDED] = true;
 }
@@ -816,7 +860,11 @@ function extendBranchesService(client: AgorClient): void {
   };
   if (branchesService[BRANCHES_SERVICE_EXTENDED]) return;
   if (typeof branchesService.methods === 'function') {
-    branchesService.methods('initializeUnixGroup', 'ensureAssistantKnowledgeNamespace');
+    branchesService.methods(
+      'updateEnvironment',
+      'initializeUnixGroup',
+      'ensureTeammateKnowledgeNamespace'
+    );
   }
   branchesService[BRANCHES_SERVICE_EXTENDED] = true;
 }
@@ -965,6 +1013,12 @@ export function createClient(
     verbose?: boolean;
     /** Limit reconnection attempts (useful for CLI to avoid hanging) */
     reconnectionAttempts?: number;
+    /** Explicit authentication storage for non-browser clients. */
+    authStorage?: {
+      getItem(key: string): string | null | Promise<string | null>;
+      setItem(key: string, value: string): void | Promise<void>;
+      removeItem(key: string): void | Promise<void>;
+    };
   }
 ): AgorClient {
   // Detect if running in browser vs Node.js (CLI)
@@ -1024,7 +1078,9 @@ export function createClient(
   const _ls = (globalThis as { localStorage?: unknown }).localStorage as
     | (Storage & { setItem?: unknown })
     | undefined;
-  const storage = _ls && typeof _ls.setItem === 'function' ? (_ls as Storage) : undefined;
+  const storage =
+    options?.authStorage ??
+    (_ls && typeof _ls.setItem === 'function' ? (_ls as Storage) : undefined);
 
   client.configure(authentication({ storage }));
   client.io = socket;

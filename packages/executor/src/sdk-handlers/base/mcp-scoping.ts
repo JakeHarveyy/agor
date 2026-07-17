@@ -17,9 +17,14 @@
  * truly global and available to all sessions regardless of who created them.
  */
 
-import { buildMCPTemplateContextFromEnv, resolveMcpServerTemplates } from '@agor/core/mcp';
+import {
+  buildMCPTemplateContextFromEnv,
+  resolveMcpServerTemplates,
+  TEMPLATE_RESOLVABLE_MCP_AUTH_SECRET_FIELDS,
+} from '@agor/core/mcp';
 import type { MCPServer, SessionID } from '@agor/core/types';
 import type {
+  MCPOAuthAuthHeadersRepository,
   MCPServerRepository,
   SessionMCPServerRepository,
 } from '../../db/feathers-repositories.js';
@@ -31,6 +36,10 @@ function mcpDebug(...args: unknown[]): void {
   if (DEBUG_MCP_SCOPING) {
     console.debug(...args);
   }
+}
+
+function compareStrings(a: string, b: string): number {
+  return a < b ? -1 : a > b ? 1 : 0;
 }
 
 /**
@@ -47,6 +56,13 @@ export interface MCPServerWithSource {
 export interface MCPResolutionDeps {
   sessionMCPRepo?: SessionMCPServerRepository;
   mcpServerRepo?: MCPServerRepository;
+  /**
+   * Trusted executor-only route for hydrating OAuth Authorization headers.
+   *
+   * Normal session MCP server payloads redact OAuth access tokens, so executor
+   * paths must not rely on `server.auth.oauth_access_token` being present.
+   */
+  mcpOAuthAuthHeadersRepo?: MCPOAuthAuthHeadersRepository;
   /**
    * User ID to use for fetching per-user OAuth tokens.
    * When provided, MCP servers with per-user OAuth will have tokens injected.
@@ -107,7 +123,11 @@ export async function getMcpServersForSession(
     };
 
     if (typeof deps.sessionMCPRepo.listEffectiveServers === 'function') {
-      const effectiveServers = await deps.sessionMCPRepo.listEffectiveServers(sessionId, true);
+      const effectiveServers = await deps.sessionMCPRepo.listEffectiveServers(
+        sessionId,
+        true,
+        deps.forUserId
+      );
       mcpDebug(`   📍 Effective session scope: ${effectiveServers.length} server(s)`);
 
       for (const server of effectiveServers) {
@@ -160,6 +180,17 @@ export async function getMcpServersForSession(
 
     const containsTemplate = (v: string | undefined) => v?.includes('{{') && v?.includes('}}');
 
+    // Every auth field `resolveMcpServerTemplates` substitutes. Driven from the
+    // canonical secret set plus the non-secret auth templates the resolver also
+    // handles, so this trigger cannot drift from what resolution resolves.
+    const AUTH_TEMPLATE_FIELDS = [
+      ...TEMPLATE_RESOLVABLE_MCP_AUTH_SECRET_FIELDS,
+      'api_url',
+      'oauth_token_url',
+      'oauth_client_id',
+      'oauth_scope',
+    ] as const;
+
     // Process servers in reverse to safely remove invalid ones
     for (let i = servers.length - 1; i >= 0; i--) {
       const original = servers[i].server;
@@ -170,11 +201,9 @@ export async function getMcpServersForSession(
       const hasEnvTemplates = envValues.some(containsTemplate);
       const hasHeaderTemplates = headerValues.some(containsTemplate);
       const hasUrlTemplate = containsTemplate(original.url);
-      const hasAuthTemplates =
-        containsTemplate(original.auth?.token) ||
-        containsTemplate(original.auth?.api_url) ||
-        containsTemplate(original.auth?.api_token) ||
-        containsTemplate(original.auth?.api_secret);
+      const hasAuthTemplates = AUTH_TEMPLATE_FIELDS.some((field) =>
+        containsTemplate(original.auth?.[field] as string | undefined)
+      );
 
       if (hasEnvTemplates || hasHeaderTemplates || hasUrlTemplate || hasAuthTemplates) {
         const result = resolveMcpServerTemplates(original, templateContext);
@@ -209,6 +238,76 @@ export async function getMcpServersForSession(
         `   ⚠️  Skipped ${serversSkipped} MCP server(s) due to unresolved required templates`
       );
     }
+
+    const oauthServers = servers
+      .map(({ server }) => server)
+      .filter((server) => server.auth?.type === 'oauth');
+    if (oauthServers.length > 0) {
+      if (!deps.mcpOAuthAuthHeadersRepo) {
+        mcpDebug(
+          `   ℹ️  ${oauthServers.length} OAuth MCP server(s) resolved without executor auth-header hydrator`
+        );
+      } else {
+        try {
+          const authHeaders = await deps.mcpOAuthAuthHeadersRepo.getAuthHeaders(
+            oauthServers.map((server) => server.mcp_server_id)
+          );
+          let hydrated = 0;
+          for (let i = 0; i < servers.length; i++) {
+            const server = servers[i].server;
+            if (server.auth?.type !== 'oauth') continue;
+
+            const header = authHeaders[server.mcp_server_id];
+            const bearer = /^Bearer\s+(.+)$/i.exec(header?.authorization ?? '')?.[1];
+            if (!bearer) {
+              if (header?.error && header.error !== 'needs_reauth') {
+                console.warn(
+                  `   ⚠️  OAuth MCP server "${server.name}" auth unavailable: ${header.error}`
+                );
+              } else if (header?.error) {
+                mcpDebug(
+                  `   ℹ️  OAuth MCP server "${server.name}" auth unavailable: ${header.error}`
+                );
+              }
+              continue;
+            }
+
+            servers[i] = {
+              ...servers[i],
+              server: {
+                ...server,
+                auth: {
+                  ...server.auth,
+                  oauth_access_token: bearer,
+                },
+              },
+            };
+            hydrated++;
+          }
+          mcpDebug(`   🔐 Hydrated OAuth auth headers for ${hydrated} MCP server(s)`);
+        } catch (error) {
+          console.warn(
+            `   ⚠️  Failed to hydrate OAuth MCP auth headers: ${
+              error instanceof Error ? error.message : String(error)
+            }`
+          );
+        }
+      }
+    }
+
+    // Keep MCP config order stable across turns. Provider SDKs serialize MCP
+    // tools into the prompt prefix, so DB/default ordering drift can reduce
+    // server-side prompt-cache hits even when the effective server set is the
+    // same. Global servers stay before session-assigned servers to preserve the
+    // historical scoping precedence; names and IDs make the ordering total.
+    servers.sort((a, b) => {
+      const sourceRank = (source: MCPServerWithSource['source']) => (source === 'global' ? 0 : 1);
+      return (
+        sourceRank(a.source) - sourceRank(b.source) ||
+        compareStrings(a.server.name, b.server.name) ||
+        compareStrings(String(a.server.mcp_server_id), String(b.server.mcp_server_id))
+      );
+    });
   } catch (error) {
     console.warn(
       `⚠️  Failed to resolve MCP servers: ${error instanceof Error ? error.message : String(error)}`

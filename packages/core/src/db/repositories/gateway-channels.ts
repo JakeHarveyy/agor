@@ -13,7 +13,12 @@ import type {
   GatewayEnvVar,
   UUID,
 } from '@agor/core/types';
-import { prefixToLikePattern } from '@agor/core/types';
+import {
+  GATEWAY_REDACTED_SENTINEL,
+  GATEWAY_SENSITIVE_CONFIG_FIELDS,
+  getRequiredSecretFields,
+  prefixToLikePattern,
+} from '@agor/core/types';
 import { eq, like } from 'drizzle-orm';
 import { generateId } from '../../lib/ids';
 import type { Database } from '../client';
@@ -22,30 +27,18 @@ import { decryptApiKey, encryptApiKey } from '../encryption';
 import { type GatewayChannelInsert, type GatewayChannelRow, gatewayChannels } from '../schema';
 import {
   AmbiguousIdError,
+  attachHiddenTenant,
   type BaseRepository,
   EntityNotFoundError,
   RepositoryError,
 } from './base';
-
-/** Sensitive config fields that should be encrypted at rest */
-const SENSITIVE_CONFIG_FIELDS = [
-  'bot_token',
-  'app_token',
-  'signing_secret', // Slack
-  'private_key',
-  'webhook_secret', // GitHub
-  'app_password', // Teams (Azure Bot App Secret)
-];
-
-/** Sentinel value used by the API to redact sensitive fields in responses */
-const REDACTED_SENTINEL = '••••••••';
 
 /**
  * Encrypt sensitive fields within a config object
  */
 function encryptConfig(config: Record<string, unknown>): Record<string, unknown> {
   const encrypted = { ...config };
-  for (const field of SENSITIVE_CONFIG_FIELDS) {
+  for (const field of GATEWAY_SENSITIVE_CONFIG_FIELDS) {
     if (typeof encrypted[field] === 'string' && encrypted[field]) {
       encrypted[field] = encryptApiKey(encrypted[field] as string);
     }
@@ -58,7 +51,7 @@ function encryptConfig(config: Record<string, unknown>): Record<string, unknown>
  */
 function decryptConfig(config: Record<string, unknown>): Record<string, unknown> {
   const decrypted = { ...config };
-  for (const field of SENSITIVE_CONFIG_FIELDS) {
+  for (const field of GATEWAY_SENSITIVE_CONFIG_FIELDS) {
     if (typeof decrypted[field] === 'string' && decrypted[field]) {
       try {
         decrypted[field] = decryptApiKey(decrypted[field] as string);
@@ -156,21 +149,31 @@ export class GatewayChannelRepository
       (row.agentic_config as Record<string, unknown> | null) ?? null
     );
 
-    return {
-      id: row.id as GatewayChannelID,
-      created_by: row.created_by,
-      name: row.name,
-      channel_type: row.channel_type as ChannelType,
-      target_branch_id: row.target_branch_id as UUID,
-      agor_user_id: row.agor_user_id as UUID,
-      channel_key: row.channel_key,
-      config: decryptConfig(config),
-      agentic_config: (agenticConfig as unknown as GatewayAgenticConfig) ?? null,
-      enabled: Boolean(row.enabled),
-      created_at: new Date(row.created_at).toISOString(),
-      updated_at: new Date(row.updated_at).toISOString(),
-      last_message_at: row.last_message_at ? new Date(row.last_message_at).toISOString() : null,
-    };
+    return attachHiddenTenant(
+      {
+        id: row.id as GatewayChannelID,
+        created_by: row.created_by,
+        name: row.name,
+        channel_type: row.channel_type as ChannelType,
+        target_branch_id: row.target_branch_id as UUID,
+        agor_user_id: row.agor_user_id as UUID,
+        channel_key: row.channel_key,
+        config: decryptConfig(config),
+        agentic_config: agenticConfig
+          ? ({
+              ...(agenticConfig as unknown as GatewayAgenticConfig),
+              presetId:
+                (row.agentic_tool_preset_id as GatewayAgenticConfig['presetId']) ?? undefined,
+            } as GatewayAgenticConfig)
+          : null,
+        mcp_server_ids: row.mcp_server_ids ?? undefined,
+        enabled: Boolean(row.enabled),
+        created_at: new Date(row.created_at).toISOString(),
+        updated_at: new Date(row.updated_at).toISOString(),
+        last_message_at: row.last_message_at ? new Date(row.last_message_at).toISOString() : null,
+      },
+      row
+    );
   }
 
   /**
@@ -183,8 +186,11 @@ export class GatewayChannelRepository
       throw new RepositoryError('GatewayChannel must have a created_by');
     }
 
+    const { presetId: _presetId, ...storedAgenticConfig } = data.agentic_config ?? {};
     const encryptedAgenticConfig = encryptAgenticConfig(
-      (data.agentic_config as unknown as Record<string, unknown> | null) ?? null
+      Object.keys(storedAgenticConfig).length > 0
+        ? (storedAgenticConfig as unknown as Record<string, unknown>)
+        : null
     );
 
     return {
@@ -201,7 +207,37 @@ export class GatewayChannelRepository
       last_message_at: data.last_message_at ? new Date(data.last_message_at) : null,
       config: data.config ? encryptConfig(data.config) : {},
       agentic_config: encryptedAgenticConfig,
+      agentic_tool_preset_id: data.agentic_config?.presetId ?? null,
+      mcp_server_ids: data.mcp_server_ids ?? null,
     };
+  }
+
+  /**
+   * Enforce the "enabled requires secrets" invariant on every write path.
+   *
+   * An enabled channel can never exist without the secrets its type needs to
+   * function. Runs on the post-merge, decrypted config so a patch that only
+   * flips `enabled: true` on a channel with already-stored tokens passes.
+   * Disabled ("draft") channels are exempt.
+   */
+  private assertRequiredSecretsWhenEnabled(channel: Partial<GatewayChannel>): void {
+    // Insert defaults `enabled` to true, so treat undefined as enabled here.
+    if (channel.enabled === false) return;
+
+    const channelType = channel.channel_type ?? 'slack';
+    const config = channel.config ?? {};
+    const missing = getRequiredSecretFields(channelType, config).filter((field) => {
+      const value = config[field];
+      return (
+        typeof value !== 'string' || value.trim() === '' || value === GATEWAY_REDACTED_SENTINEL
+      );
+    });
+
+    if (missing.length > 0) {
+      throw new RepositoryError(
+        `Cannot enable ${channelType} gateway channel: missing required secret(s) ${missing.join(', ')}`
+      );
+    }
   }
 
   /**
@@ -244,6 +280,8 @@ export class GatewayChannelRepository
         id: data.id ?? generateId(),
         channel_key: data.channel_key ?? generateId(),
       });
+
+      this.assertRequiredSecretsWhenEnabled(data);
 
       await insert(this.db, gatewayChannels).values(insertData).run();
 
@@ -323,14 +361,19 @@ export class GatewayChannelRepository
       // sends that sentinel back it means "no change" — not "set token to bullets".
       if (updates.config) {
         const mergedConfig = { ...current.config, ...updates.config };
-        for (const field of SENSITIVE_CONFIG_FIELDS) {
+        for (const field of GATEWAY_SENSITIVE_CONFIG_FIELDS) {
           const updateValue = updates.config[field];
-          if ((!updateValue || updateValue === REDACTED_SENTINEL) && current.config[field]) {
+          if (
+            (!updateValue || updateValue === GATEWAY_REDACTED_SENTINEL) &&
+            current.config[field]
+          ) {
             mergedConfig[field] = current.config[field];
           }
         }
         merged.config = mergedConfig;
       }
+
+      this.assertRequiredSecretsWhenEnabled(merged);
 
       const insertData = this.channelToInsert(merged);
 
@@ -343,6 +386,8 @@ export class GatewayChannelRepository
           enabled: insertData.enabled,
           config: insertData.config,
           agentic_config: insertData.agentic_config,
+          agentic_tool_preset_id: insertData.agentic_tool_preset_id,
+          mcp_server_ids: insertData.mcp_server_ids,
           updated_at: new Date(),
         })
         .where(eq(gatewayChannels.id, fullId))

@@ -41,7 +41,7 @@ on:
   workflow_call:
 
 env:
-  PNPM_VERSION: '9.15.1'
+  PNPM_VERSION: '11.13.0'
   NODE_VERSION: '22'
 
 jobs:
@@ -50,7 +50,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - uses: pnpm/action-setup@v6
         with:
@@ -136,8 +136,10 @@ jobs:
             "${{ steps.pack.outputs.live }}"
           echo "=== Installed dist/ ==="
           ls node_modules/agor-live/dist
-          echo "=== Postinstall artifact (@agor/core symlink) ==="
+          echo "=== Postinstall artifacts (@agor symlinks) ==="
           ls -la node_modules/agor-live/node_modules/@agor/core
+          ls -la node_modules/agor-live/node_modules/@agor/git
+          (cd node_modules/agor-live && node --input-type=module -e "await import('@agor/core/git/exec'); console.log('✓ @agor/core/git/exec imports from agor-live package context')")
           # Confirm the UI bundle index.html is present and references a JS asset.
           if [ ! -f node_modules/agor-live/dist/ui/index.html ]; then
             echo "::error::dist/ui/index.html missing from installed package"
@@ -195,11 +197,12 @@ jobs:
           # Actually fetch the JS asset to confirm static-file serving works end-to-end.
           ASSET_PATH=$(grep -oE '/ui/assets/index-[A-Za-z0-9_-]+\.js' /tmp/ui.html | head -1)
           echo "=== GET $ASSET_PATH ==="
-          SIZE=$(curl -fsS -o /dev/null -w "%{size_download}" "http://localhost:3030$ASSET_PATH")
-          echo "JS asset size: $SIZE bytes"
-          # The UI bundle is multi-MB. <100KB means we're getting an error page or empty body.
-          if [ "$SIZE" -lt 100000 ]; then
-            echo "::error::/ui/ JS asset is suspiciously small (${SIZE} bytes) — static serving broken"
+          read -r SIZE CTYPE < <(curl -fsS -o /dev/null -w "%{size_download} %{content_type}\n" "http://localhost:3030$ASSET_PATH")
+          echo "JS asset size: $SIZE bytes; content-type: $CTYPE"
+          # Vite may split most application code out of the entry chunk. Verify that the
+          # referenced asset is non-empty JavaScript rather than relying on bundle size.
+          if [ "$SIZE" -lt 1000 ] || [[ "$CTYPE" != *javascript* ]]; then
+            echo "::error::/ui/ JS asset response is invalid (${SIZE} bytes, ${CTYPE}) — static serving broken"
             exit 1
           fi
           echo "✓ Smoke test passed"

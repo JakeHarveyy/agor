@@ -1,7 +1,7 @@
 import type { ArtifactPayload } from '@agor-live/client';
-import { LockOutlined, SafetyOutlined } from '@ant-design/icons';
+import { SafetyOutlined, WarningOutlined } from '@ant-design/icons';
 import { useSandpack, useSandpackConsole } from '@codesandbox/sandpack-react';
-import { Tag, Tooltip } from 'antd';
+import { Tooltip, theme } from 'antd';
 import type { CSSProperties } from 'react';
 import { useEffect, useRef } from 'react';
 import { getDaemonUrl } from '@/config/daemon';
@@ -17,7 +17,13 @@ const RUNTIME_QUERY_DEFAULT_TIMEOUT_MS = 6000;
  * Captures Sandpack console events and forwards them to the daemon.
  * Must be rendered inside a SandpackProvider.
  */
-export function ArtifactConsoleReporter({ artifactId }: { artifactId: string }) {
+export function ArtifactConsoleReporter({
+  artifactId,
+  contentHash,
+}: {
+  artifactId: string;
+  contentHash?: string;
+}) {
   const { logs } = useSandpackConsole({ resetOnPreviewRestart: false });
   const lastSentRef = useRef(0);
   const lastSendTimeRef = useRef(0);
@@ -50,7 +56,7 @@ export function ArtifactConsoleReporter({ artifactId }: { artifactId: string }) 
       fetch(`${getDaemonUrl()}/artifacts/${artifactId}/console`, {
         method: 'POST',
         headers: getAuthHeaders(),
-        body: JSON.stringify({ entries }),
+        body: JSON.stringify({ entries, content_hash: contentHash }),
       }).catch(() => {});
     };
 
@@ -70,7 +76,7 @@ export function ArtifactConsoleReporter({ artifactId }: { artifactId: string }) 
         timerRef.current = null;
       }
     };
-  }, [logs, artifactId]);
+  }, [logs, artifactId, contentHash]);
 
   return null;
 }
@@ -79,7 +85,13 @@ export function ArtifactConsoleReporter({ artifactId }: { artifactId: string }) 
  * Captures Sandpack bundler/runtime errors and forwards them to the daemon.
  * Must be rendered inside a SandpackProvider.
  */
-export function ArtifactSandpackErrorReporter({ artifactId }: { artifactId: string }) {
+export function ArtifactSandpackErrorReporter({
+  artifactId,
+  contentHash,
+}: {
+  artifactId: string;
+  contentHash?: string;
+}) {
   const { sandpack } = useSandpack();
   const lastSentRef = useRef<string | null>(null);
   const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -118,7 +130,7 @@ export function ArtifactSandpackErrorReporter({ artifactId }: { artifactId: stri
       fetch(`${getDaemonUrl()}/artifacts/${artifactId}/sandpack-error`, {
         method: 'POST',
         headers: getAuthHeaders(),
-        body: JSON.stringify(payload),
+        body: JSON.stringify({ ...payload, content_hash: contentHash }),
       }).catch(() => {});
     };
 
@@ -136,7 +148,7 @@ export function ArtifactSandpackErrorReporter({ artifactId }: { artifactId: stri
         pendingSendRef.current?.();
       }
     };
-  }, [sandpack.error, sandpack.status, artifactId]);
+  }, [sandpack.error, sandpack.status, artifactId, contentHash]);
 
   return null;
 }
@@ -227,62 +239,98 @@ export function ArtifactRuntimeBridge({ artifactId }: { artifactId: string }) {
   return null;
 }
 
-interface ArtifactTrustBadgeOptions {
+interface ArtifactTrustStatusIconProps {
+  payload: ArtifactPayload;
+  onTrustClick?: () => void;
   className?: string;
   style?: CSSProperties;
 }
 
-export function renderArtifactTrustBadge(
-  payload: ArtifactPayload,
-  onTrustClick?: () => void,
-  options: ArtifactTrustBadgeOptions = {}
-) {
-  const tagStyle = { fontSize: 10, marginLeft: 4, ...options.style };
+/**
+ * Compact artifact trust/status affordance for headers.
+ *
+ * Uses warning/safety glyphs rather than a lock so the board-card lock can
+ * unambiguously mean "this artifact card cannot be moved/resized."
+ */
+export function ArtifactTrustStatusIcon({
+  payload,
+  onTrustClick,
+  className,
+  style,
+}: ArtifactTrustStatusIconProps) {
+  const { token } = theme.useToken();
   const state = payload.trust_state;
   if (state === 'no_secrets_needed') return null;
-  if (state === 'self') {
-    return (
-      <Tag color="blue" icon={<SafetyOutlined />} style={tagStyle}>
-        Yours
-      </Tag>
-    );
-  }
-  if (state === 'trusted') {
-    const scopeLabel =
-      payload.trust_scope === 'instance'
-        ? 'instance-wide'
-        : payload.trust_scope === 'author'
-          ? 'this author'
-          : payload.trust_scope === 'session'
-            ? 'just-once'
-            : 'this artifact';
-    return (
-      <Tooltip title={`Secrets injected — trust granted for ${scopeLabel}`}>
-        <Tag color="green" icon={<SafetyOutlined />} style={tagStyle}>
-          Trusted
-        </Tag>
-      </Tooltip>
-    );
-  }
 
-  return (
-    <Tooltip title="Click to review and grant trust so secrets are injected">
-      <Tag
-        color="orange"
-        icon={<LockOutlined />}
-        className={onTrustClick ? options.className : undefined}
-        style={{ ...tagStyle, cursor: onTrustClick ? 'pointer' : undefined }}
-        onClick={
-          onTrustClick
-            ? (e) => {
-                e.stopPropagation();
-                onTrustClick();
-              }
-            : undefined
-        }
+  const isUntrusted = state === 'untrusted';
+  const isTrusted = state === 'trusted';
+  const isSelf = state === 'self';
+  const scopeLabel =
+    payload.trust_scope === 'instance'
+      ? 'instance-wide'
+      : payload.trust_scope === 'author'
+        ? 'this author'
+        : payload.trust_scope === 'session'
+          ? 'just-once'
+          : 'this artifact';
+  const title = isUntrusted
+    ? onTrustClick
+      ? 'Click to review and grant trust so secrets are injected'
+      : 'Secrets are locked until trust is granted'
+    : isTrusted
+      ? `Secrets injected — trust granted for ${scopeLabel}`
+      : isSelf
+        ? 'You created this artifact; secrets are injected'
+        : 'Artifact trust status';
+  const color = isUntrusted ? token.colorWarning : isTrusted ? token.colorSuccess : token.colorInfo;
+  const backgroundColor = isUntrusted
+    ? token.colorWarningBg
+    : isTrusted
+      ? token.colorSuccessBg
+      : token.colorInfoBg;
+  const icon = isUntrusted ? <WarningOutlined /> : <SafetyOutlined />;
+  const commonStyle: CSSProperties = {
+    width: 20,
+    height: 20,
+    borderRadius: 3,
+    backgroundColor,
+    border: `1px solid ${color}`,
+    display: 'inline-flex',
+    alignItems: 'center',
+    justifyContent: 'center',
+    flexShrink: 0,
+    padding: 0,
+    appearance: 'none',
+    color,
+    fontSize: 12,
+    lineHeight: 1,
+    ...style,
+  };
+
+  const iconElement =
+    isUntrusted && onTrustClick ? (
+      <button
+        type="button"
+        className={className}
+        aria-label="Review artifact trust"
+        style={{
+          ...commonStyle,
+          backgroundClip: 'padding-box',
+          cursor: 'pointer',
+          font: 'inherit',
+        }}
+        onClick={(e) => {
+          e.stopPropagation();
+          onTrustClick();
+        }}
       >
-        Untrusted
-      </Tag>
-    </Tooltip>
-  );
+        {icon}
+      </button>
+    ) : (
+      <span className={className} style={commonStyle}>
+        {icon}
+      </span>
+    );
+
+  return <Tooltip title={title}>{iconElement}</Tooltip>;
 }

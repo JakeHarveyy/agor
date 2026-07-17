@@ -14,9 +14,16 @@
  */
 
 import 'dotenv/config';
+import { platform } from 'node:os';
 
 // Patch console methods to respect LOG_LEVEL env var
 import { configureAnalyticsLogger } from '@agor/core/analytics';
+import {
+  configureOpenSourceTelemetryLogger,
+  loadOpenSourceTelemetryAgorVersion,
+  openSourceTelemetryLogger,
+  pruneDefaultOpenSourceTelemetryDestination,
+} from '@agor/core/telemetry';
 import { patchConsole } from '@agor/core/utils/logger';
 import { UI_MOUNT_PATH } from '@agor/core/utils/url';
 
@@ -28,9 +35,11 @@ import {
   loadConfigFromFile,
   renderGitConfigParametersForLog,
   resolveGitConfigParameters,
+  resolveMultiTenancyConfig,
   resolveSecurity,
+  saveConfig,
 } from '@agor/core/config';
-import { getDatabaseUrl } from '@agor/core/db';
+import { getDatabaseUrl, runWithTenantDatabaseScope } from '@agor/core/db';
 import {
   authenticate,
   Forbidden,
@@ -39,39 +48,40 @@ import {
   rest,
   socketio,
 } from '@agor/core/feathers';
-import { buildGitConfigParameters } from '@agor/core/git';
+import { buildGitConfigParameters } from '@agor/core/git/pure';
 import { registerHandlebarsHelpers } from '@agor/core/templates/handlebars-helpers';
-import type { HookContext, ServiceGroupName, ServiceTier, User } from '@agor/core/types';
-import { getServiceTier, isServiceEnabled } from '@agor/core/types';
+import type { HookContext, User } from '@agor/core/types';
 import cors from 'cors';
 import express from 'express';
 import expressStaticGzip from 'express-static-gzip';
 import { scopeExecutorRuntimeAuth } from './auth/executor-runtime-scope.js';
+import { createRequireAuthHook } from './auth/require-auth.js';
 import { registerHooks } from './register-hooks.js';
 import { registerRoutes } from './register-routes.js';
 import { registerServices } from './register-services.js';
 import { loadBuildInfo } from './setup/build-info.js';
 import { createDynamicCompressionMiddleware } from './setup/compression.js';
 import { buildCorsConfig, isSandpackOrigin } from './setup/cors.js';
-import {
-  initializeAnthropicApiKey,
-  initializeAnthropicAuthToken,
-  initializeAnthropicBaseUrl,
-} from './setup/credentials.js';
 import { initializeDatabase } from './setup/database.js';
-import { warnDeprecatedAnonymousConfig } from './setup/first-run-admin.js';
+import { warnDeprecatedConfig } from './setup/first-run-admin.js';
 import { securityHeaders } from './setup/security-headers.js';
-import { logServicesConfig, resolveServicesConfig } from './setup/service-tiers.js';
 import { configureChannels, createSocketIOConfig } from './setup/socketio.js';
 import { setBundledUiFallbackHeaders, setBundledUiStaticHeaders } from './setup/static-assets.js';
 import { configureSwagger } from './setup/swagger.js';
 import { loadDaemonVersion } from './setup/version.js';
 import { runPostStartJob, startup } from './startup.js';
+import { ensureOpenSourceTelemetryEnvEnabledConfig } from './utils/open-source-telemetry-config.js';
+import { shouldEmitOpenSourceTelemetryDaemonActive } from './utils/open-source-telemetry-heartbeat.js';
+import { startOpenSourceTelemetryUsageSummaryInterval } from './utils/open-source-telemetry-usage.js';
 import { configureDaemonUrl, configureExecutor } from './utils/spawn-executor.js';
 import { registerAllWidgets } from './widgets/index.js';
 
 // Load daemon version at startup
 const DAEMON_VERSION = await loadDaemonVersion(import.meta.url);
+const TELEMETRY_AGOR_VERSION = await loadOpenSourceTelemetryAgorVersion(
+  DAEMON_VERSION,
+  import.meta.url
+);
 
 // Resolve build SHA (env > .build-info file > git > 'dev'). UI tabs capture
 // this on first connect and prompt a refresh if a later handshake disagrees.
@@ -145,11 +155,16 @@ export async function startDaemon(options?: DaemonStartOptions): Promise<void> {
   process.env.GIT_ASKPASS = 'echo';
 
   // Load config: CLI-provided > configPath > default loadConfig()
-  const config: AgorConfig = options?.config
+  let config: AgorConfig = options?.config
     ? options.config
     : options?.configPath
       ? await loadConfigFromFile(options.configPath)
       : await loadConfig();
+
+  const multiTenancy = resolveMultiTenancyConfig(config);
+  console.log(
+    `🏢 Multi-tenancy: mode=${multiTenancy.mode} tenant=${multiTenancy.mode === 'static' ? multiTenancy.static_tenant_id : 'auth-resolved'}`
+  );
 
   // Set GIT_CONFIG_PARAMETERS before any child-process spawn so every git
   // invocation under Agor's control inherits it. See @agor/core/config
@@ -171,26 +186,29 @@ export async function startDaemon(options?: DaemonStartOptions): Promise<void> {
   // Configure analytics after process-wide git hardening is installed. Module
   // plugins are optional dynamic imports and must never prevent daemon startup.
   await configureAnalyticsLogger(config);
+  const envTelemetryConfig = ensureOpenSourceTelemetryEnvEnabledConfig(config);
+  if (envTelemetryConfig.changed) {
+    config = envTelemetryConfig.config;
+    await saveConfig(pruneDefaultOpenSourceTelemetryDestination(config));
+  }
+  configureOpenSourceTelemetryLogger(config);
+  if (config.telemetry?.enabled === undefined) {
+    console.warn(
+      'ℹ  Open-source telemetry is not configured; no telemetry will be sent. ' +
+        'Run `agor telemetry on` to enable or `agor telemetry off` to dismiss.'
+    );
+  }
 
-  // Surface a clear migration note if the config still carries leftover
-  // anonymous-mode keys. Operators upgrading from a release that had
-  // `daemon.allowAnonymous` / `daemon.requireAuth` see what to do; the keys
-  // are otherwise silently ignored.
-  warnDeprecatedAnonymousConfig(config);
-
-  // Resolve service tier configuration (validate deps, auto-promote)
-  const servicesConfig = resolveServicesConfig(config.services);
-  logServicesConfig(servicesConfig);
-
-  const svcTier = (group: string): ServiceTier =>
-    getServiceTier(servicesConfig, group as ServiceGroupName);
-  const svcEnabled = (group: string): boolean =>
-    isServiceEnabled(servicesConfig, group as ServiceGroupName);
+  // Surface a clear migration note for accepted-but-ignored upgrade keys.
+  warnDeprecatedConfig(config);
 
   // --------------------------------------------------------------------------
   // Auth configuration
   // --------------------------------------------------------------------------
-  const requireAuth = scopeExecutorRuntimeAuth(authenticate({ strategies: ['api-key', 'jwt'] }));
+  const authenticatedHook = scopeExecutorRuntimeAuth(
+    authenticate({ strategies: ['api-key', 'jwt'] })
+  );
+  const requireAuth = createRequireAuthHook(authenticatedHook, multiTenancy);
 
   const enforcePasswordChange = async (context: HookContext) => {
     const user = context.params?.user as User | undefined;
@@ -250,10 +268,6 @@ export async function startDaemon(options?: DaemonStartOptions): Promise<void> {
   // when execution.executor_command_template is unset (no behavior change
   // for existing deployments).
   configureExecutor(config.execution);
-
-  initializeAnthropicApiKey(config, process.env.ANTHROPIC_API_KEY);
-  initializeAnthropicAuthToken(config, process.env.ANTHROPIC_AUTH_TOKEN);
-  initializeAnthropicBaseUrl(config, process.env.ANTHROPIC_BASE_URL);
 
   // --------------------------------------------------------------------------
   // Create Feathers app + Express middleware
@@ -439,9 +453,8 @@ export async function startDaemon(options?: DaemonStartOptions): Promise<void> {
   // already answers correctly for both dev (no, vite serves on its own port)
   // and installed (yes, it sits at ../ui).
   // --------------------------------------------------------------------------
-  const serveStaticFiles = servicesConfig.static_files !== 'off';
   let bundledUiAvailable = false;
-  if (serveStaticFiles) {
+  {
     const path = await import('node:path');
     const { fileURLToPath } = await import('node:url');
     const { existsSync } = await import('node:fs');
@@ -483,7 +496,7 @@ export async function startDaemon(options?: DaemonStartOptions): Promise<void> {
   }
 
   // Serve static assets (e.g., self-hosted Sandpack bundler) if available
-  if (serveStaticFiles) {
+  {
     const pathMod = await import('node:path');
     const { fileURLToPath: toPath } = await import('node:url');
     const { existsSync: exists } = await import('node:fs');
@@ -566,12 +579,17 @@ export async function startDaemon(options?: DaemonStartOptions): Promise<void> {
     // welcome event on every connect (and reconnect), so UI tabs can detect
     // FE/BE drift after a deploy without waiting for the next /health poll.
     buildInfo: DAEMON_BUILD_INFO,
+    multiTenancy,
   });
   app.configure(socketio(socketIOConfig.serverOptions, socketIOConfig.callback));
-  configureChannels(app);
+  configureChannels(app, { multiTenancy });
   configureSwagger(app, { version: DAEMON_VERSION, port: DAEMON_PORT });
 
-  const { db } = await initializeDatabase(DB_PATH);
+  const { db } = await initializeDatabase(DB_PATH, {
+    tenantId: multiTenancy.mode === 'static' ? multiTenancy.static_tenant_id : undefined,
+    requireTenantScope: multiTenancy.mode === 'required_from_auth',
+    skipFirstRunAdminBootstrap: config.external_launch?.enabled === true,
+  });
 
   // --------------------------------------------------------------------------
   // RBAC flags
@@ -588,6 +606,63 @@ export async function startDaemon(options?: DaemonStartOptions): Promise<void> {
   app.set('database', db);
   app.set('config', config);
 
+  if (openSourceTelemetryLogger.isEnabled()) {
+    const startupTelemetryProperties = {
+      agor_version: TELEMETRY_AGOR_VERSION,
+      deployment_kind: process.env.KUBERNETES_SERVICE_HOST
+        ? 'k8s'
+        : process.env.container || process.env.AGOR_DOCKER
+          ? 'docker'
+          : 'local',
+      db_backend: process.env.AGOR_DB_DIALECT === 'postgresql' ? 'postgresql' : 'sqlite',
+      os_family: platform(),
+      node_major: Number.parseInt(process.versions.node.split('.')[0] ?? '0', 10),
+      branch_rbac: branchRbacEnabled,
+      unix_user_mode: config.execution?.unix_user_mode ?? 'simple',
+    };
+
+    openSourceTelemetryLogger.track({
+      event: 'daemon.start',
+      properties: startupTelemetryProperties,
+    });
+
+    const daemonActive = shouldEmitOpenSourceTelemetryDaemonActive(config);
+    if (daemonActive.shouldEmit) {
+      openSourceTelemetryLogger.track({
+        event: 'daemon.active',
+        properties: {
+          ...startupTelemetryProperties,
+          day: daemonActive.day,
+        },
+      });
+    }
+
+    if (
+      config.telemetry?.last_reported_version &&
+      config.telemetry.last_reported_version !== TELEMETRY_AGOR_VERSION
+    ) {
+      openSourceTelemetryLogger.track({
+        event: 'daemon.upgraded',
+        properties: {
+          from_version: config.telemetry.last_reported_version,
+          to_version: TELEMETRY_AGOR_VERSION,
+        },
+      });
+    }
+    startOpenSourceTelemetryUsageSummaryInterval(db, { tenantId: multiTenancy.static_tenant_id });
+    config.telemetry = {
+      ...config.telemetry,
+      last_reported_version: TELEMETRY_AGOR_VERSION,
+      ...(daemonActive.shouldEmit ? { last_daemon_active_day: daemonActive.day } : {}),
+    };
+    saveConfig(pruneDefaultOpenSourceTelemetryDestination(config)).catch((error) => {
+      console.warn(
+        '[telemetry] failed to persist daemon telemetry state:',
+        error instanceof Error ? error.message : String(error)
+      );
+    });
+  }
+
   // --------------------------------------------------------------------------
   // Phase 1: Register services
   // --------------------------------------------------------------------------
@@ -595,7 +670,6 @@ export async function startDaemon(options?: DaemonStartOptions): Promise<void> {
     db,
     app,
     config,
-    svcEnabled,
     jwtSecret,
     daemonUrl,
     bundledUiAvailable,
@@ -613,7 +687,6 @@ export async function startDaemon(options?: DaemonStartOptions): Promise<void> {
     db,
     app,
     config,
-    svcEnabled,
     jwtSecret,
     branchRbacEnabled,
     requireAuth,
@@ -633,8 +706,6 @@ export async function startDaemon(options?: DaemonStartOptions): Promise<void> {
     db,
     app,
     config,
-    svcEnabled,
-    svcTier,
     jwtSecret,
     branchRbacEnabled,
     requireAuth,
@@ -644,7 +715,6 @@ export async function startDaemon(options?: DaemonStartOptions): Promise<void> {
     DAEMON_PORT,
     DAEMON_VERSION,
     DAEMON_BUILD_INFO,
-    servicesConfig,
     resolvedSecurity,
     sessionsService: services.sessionsService,
     messagesService: services.messagesService,
@@ -666,7 +736,6 @@ export async function startDaemon(options?: DaemonStartOptions): Promise<void> {
     config,
     DAEMON_PORT,
     DAEMON_HOST,
-    svcEnabled,
     safeService,
     getSocketServer: socketIOConfig.getSocketServer,
     sessionsService: services.sessionsService,
@@ -685,14 +754,25 @@ export async function startDaemon(options?: DaemonStartOptions): Promise<void> {
   // the restart is detected and the task is closed.
   // --------------------------------------------------------------------------
   runPostStartJob('cli-watcher-rehydrate', async () => {
-    const { rehydrateCliWatchers } = await import('./services/claude-cli-integration.js');
-    await rehydrateCliWatchers(app, async (branchId) => {
-      try {
-        const branch = (await app.service('branches').get(branchId)) as { path?: string };
-        return branch?.path ?? null;
-      } catch {
-        return null;
-      }
-    });
+    const { rehydrateCliWatchers, scanCliWatcherRehydrateSessions } = await import(
+      './services/claude-cli-integration.js'
+    );
+    const cliSessions = await runWithTenantDatabaseScope(db, multiTenancy.static_tenant_id, () =>
+      scanCliWatcherRehydrateSessions(app)
+    );
+    await rehydrateCliWatchers(
+      app,
+      (branchId) =>
+        runWithTenantDatabaseScope(db, multiTenancy.static_tenant_id, async () => {
+          try {
+            const branch = (await app.service('branches').get(branchId)) as { path?: string };
+            return branch?.path ?? null;
+          } catch {
+            return null;
+          }
+        }),
+      cliSessions,
+      { tenantId: multiTenancy.static_tenant_id }
+    );
   });
 }

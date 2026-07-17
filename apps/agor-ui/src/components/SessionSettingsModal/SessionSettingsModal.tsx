@@ -19,7 +19,6 @@ import type {
   AgorClient,
   CodexApprovalPolicy,
   CodexSandboxMode,
-  MCPServer,
   PermissionMode,
   Session,
   User,
@@ -29,12 +28,19 @@ import { DownOutlined, KeyOutlined, SettingOutlined, ThunderboltOutlined } from 
 import type { CollapseProps } from 'antd';
 import { Collapse, Divider, Form, Modal, Typography } from 'antd';
 import React from 'react';
+import { useAgorStore } from '../../store/agorStore';
+import { selectMcpServerById, selectSessionMcpServerIds } from '../../store/selectors';
 import { AdvancedSettingsForm } from '../AdvancedSettingsForm';
 import { AgenticToolConfigForm } from '../AgenticToolConfigForm';
+import {
+  AgenticToolConfigurationPicker,
+  INLINE_AGENTIC_CONFIGURATION,
+} from '../AgenticToolConfigurationPicker';
 import { CallbackConfigForm } from '../CallbackConfigForm';
 import { CallbackTargetDisplay } from '../CallbackToggleButton';
 import { CodexSettingsForm } from '../CodexSettingsForm';
 import { ErrorBoundary } from '../ErrorBoundary';
+import { SessionMcpServersField } from '../MCPServerSelect';
 import { SessionEnvVarsSelector } from '../SessionEnvVarsSelector';
 import { SessionIdsList } from '../SessionIds';
 import { SessionMetadataForm } from '../SessionMetadataForm';
@@ -43,8 +49,6 @@ export interface SessionSettingsModalProps {
   open: boolean;
   onClose: () => void;
   session: Session;
-  mcpServerById: Map<string, MCPServer>;
-  sessionMcpServerIds: string[];
   onUpdate?: (sessionId: string, updates: Partial<Session>) => void;
   onUpdateSessionMcpServers?: (sessionId: string, mcpServerIds: string[]) => void;
   /**
@@ -60,6 +64,7 @@ export interface SessionSettingsModalProps {
 }
 
 interface FormValues {
+  agenticToolPresetId: string;
   title: string;
   mcpServerIds: string[];
   modelConfig: Session['model_config'];
@@ -75,12 +80,18 @@ interface FormValues {
   };
 }
 
+// Stable empty array for sessions with no attached MCP servers — keeps the
+// derived per-session slice reference-stable so the form-reset effect (which
+// depends on it) doesn't re-fire on unrelated store patches.
+const EMPTY_MCP_SERVER_IDS: string[] = [];
+
 function buildInitialValues(session: Session, sessionMcpServerIds: string[]): FormValues {
   const permissionMode: PermissionMode =
     session.permission_config?.mode ?? getDefaultPermissionMode(session.agentic_tool);
   const codexDefaults = mapToCodexPermissionConfig(permissionMode);
 
   return {
+    agenticToolPresetId: session.agentic_tool_preset_id ?? INLINE_AGENTIC_CONFIGURATION,
     title: session.title || '',
     mcpServerIds: sessionMcpServerIds,
     modelConfig: session.model_config,
@@ -106,21 +117,27 @@ function buildUpdates(values: FormValues, session: Session): Partial<Session> {
     updates.title = values.title;
   }
 
-  if (values.modelConfig) {
+  const presetId =
+    values.agenticToolPresetId === INLINE_AGENTIC_CONFIGURATION ? null : values.agenticToolPresetId;
+  if (presetId !== (session.agentic_tool_preset_id ?? null)) {
+    updates.agentic_tool_preset_id = presetId as Session['agentic_tool_preset_id'];
+  }
+
+  if (!presetId && values.modelConfig) {
     updates.model_config = {
       ...values.modelConfig,
       updated_at: new Date().toISOString(),
     };
   }
 
-  if (values.permissionMode) {
+  if (!presetId && values.permissionMode) {
     updates.permission_config = {
       ...session.permission_config,
       mode: values.permissionMode,
     };
   }
 
-  if (session.agentic_tool === 'codex') {
+  if (!presetId && session.agentic_tool === 'codex') {
     updates.permission_config = {
       ...session.permission_config,
       ...updates.permission_config,
@@ -164,14 +181,18 @@ export const SessionSettingsModal: React.FC<SessionSettingsModalProps> = ({
   open,
   onClose,
   session,
-  mcpServerById,
-  sessionMcpServerIds,
   onUpdate,
   onUpdateSessionMcpServers,
   onUpdateSessionEnvSelections,
   client,
   currentUser,
 }) => {
+  // Entity maps come from the store rather than being drilled through the App
+  // shell. The whole session→MCP map is sliced to this session's ids here so
+  // the rest of the component keeps working with a plain `string[]`.
+  const mcpServerById = useAgorStore(selectMcpServerById);
+  const sessionMcpServerIds =
+    useAgorStore(selectSessionMcpServerIds).get(session.session_id) ?? EMPTY_MCP_SERVER_IDS;
   const [form] = Form.useForm();
   const [initialValues, setInitialValues] = React.useState<FormValues>(() =>
     buildInitialValues(session, sessionMcpServerIds)
@@ -243,7 +264,10 @@ export const SessionSettingsModal: React.FC<SessionSettingsModalProps> = ({
         onUpdate(session.session_id, updates);
       }
 
-      if (onUpdateSessionMcpServers) {
+      if (
+        onUpdateSessionMcpServers &&
+        values.agenticToolPresetId === INLINE_AGENTIC_CONFIGURATION
+      ) {
         onUpdateSessionMcpServers(session.session_id, values.mcpServerIds || []);
       }
 
@@ -353,13 +377,25 @@ export const SessionSettingsModal: React.FC<SessionSettingsModalProps> = ({
         <Form.Item label="Session IDs">
           <SessionIdsList session={session} />
         </Form.Item>
-        <AgenticToolConfigForm
-          agenticTool={session.agentic_tool}
-          mcpServerById={mcpServerById}
-          showHelpText={false}
-          compact
-          client={client}
-        />
+        {client ? (
+          <AgenticToolConfigurationPicker
+            tool={session.agentic_tool}
+            mcpServerById={mcpServerById}
+            showHelpText={false}
+            compact
+            client={client}
+          />
+        ) : (
+          <>
+            <AgenticToolConfigForm
+              agenticTool={session.agentic_tool}
+              showHelpText={false}
+              compact
+              client={client}
+            />
+            <SessionMcpServersField mcpServerById={mcpServerById} showHelpText={false} />
+          </>
+        )}
 
         {/* SECONDARY ZONE — niche settings, collapsed by default */}
         <Divider dashed style={{ margin: '8px 0 16px' }} />

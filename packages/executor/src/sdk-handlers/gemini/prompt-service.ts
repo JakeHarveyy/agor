@@ -26,6 +26,7 @@ import { shortId } from '@agor/core/db';
 import { getDaemonUrl } from '../../config.js';
 import type {
   BranchRepository,
+  MCPOAuthAuthHeadersRepository,
   MCPServerRepository,
   MessagesRepository,
   RepoRepository,
@@ -90,7 +91,7 @@ export type GeminiStreamEvent =
 
 /** SDK invocation model — falls back to DEFAULT_GEMINI_MODEL. Never used for recording. */
 export function resolveGeminiInvocationModel(session: {
-  model_config?: { model?: string };
+  model_config?: { model?: string } | null;
 }): GeminiModel {
   return (session.model_config?.model as GeminiModel | undefined) ?? DEFAULT_GEMINI_MODEL;
 }
@@ -108,13 +109,14 @@ export class GeminiPromptService {
     private sessionsRepo: SessionRepository,
     apiKey?: string,
     private branchesRepo?: BranchRepository,
-    private reposRepo?: RepoRepository,
+    _reposRepo?: RepoRepository,
     private mcpServerRepo?: MCPServerRepository,
     private sessionMCPRepo?: SessionMCPServerRepository,
     private mcpEnabled?: boolean,
     useNativeAuth?: boolean, // Flag from base-executor indicating OAuth should be used
-    private usersRepo?: UsersRepository,
-    private tasksService?: TasksService
+    _usersRepo?: UsersRepository,
+    private tasksService?: TasksService,
+    private mcpOAuthAuthHeadersRepo?: MCPOAuthAuthHeadersRepository
   ) {
     this.apiKey = apiKey;
     this.useNativeAuth = useNativeAuth ?? false; // Default to false if not provided
@@ -659,18 +661,13 @@ export class GeminiPromptService {
       `🔧 [Gemini] Creating new client with approval mode: ${permissionMode || 'ask'} → ${approvalMode}`
     );
 
-    // Inject Agor session context via temp file (no race conditions!)
+    // Inject static Agor orientation via temp file (no race conditions!)
     // Gemini SDK supports geminiMdFilePaths parameter to load additional context files.
     // We use a per-session temp file to avoid race conditions between concurrent sessions.
     //
     // IMPORTANT: Gemini uses GEMINI.md (not CLAUDE.md) for project instructions!
     // User's project GEMINI.md files are still loaded hierarchically.
-    const agorSystemPrompt = await renderAgorSystemPrompt(sessionId, {
-      sessions: this.sessionsRepo,
-      branches: this.branchesRepo,
-      repos: this.reposRepo,
-      users: this.usersRepo,
-    });
+    const agorSystemPrompt = await renderAgorSystemPrompt();
 
     // Write to temp file (unique per session, no races!)
     // Use mode 0o600 (rw-------) to prevent other users from reading session metadata
@@ -722,6 +719,7 @@ export class GeminiPromptService {
         const serversWithSource = await getMcpServersForSession(sessionId, {
           sessionMCPRepo: this.sessionMCPRepo,
           mcpServerRepo: this.mcpServerRepo,
+          mcpOAuthAuthHeadersRepo: this.mcpOAuthAuthHeadersRepo,
           forUserId: contextUserId,
         });
 

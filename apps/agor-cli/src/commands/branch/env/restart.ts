@@ -8,6 +8,7 @@ import { shortId } from '@agor-live/client';
 import { Args } from '@oclif/core';
 import chalk from 'chalk';
 import { BaseCommand } from '../../../base-command';
+import { requestBranchEnvironmentAction } from '../../../lib/branch-environment-action.js';
 
 export default class BranchEnvRestart extends BaseCommand {
   static description = 'Restart branch environment';
@@ -41,10 +42,9 @@ export default class BranchEnvRestart extends BaseCommand {
       this.log(`  ID:   ${chalk.dim(shortId(branch.branch_id))}`);
       this.log('');
 
-      // Call custom restartEnvironment method
-      const updated = await branchesService.restartEnvironment(branch.branch_id);
+      const updated = await requestBranchEnvironmentAction(client, branch.branch_id, 'restart');
 
-      this.log(`${chalk.green('✓')} Environment restarted`);
+      this.log(`${chalk.green('✓')} Environment restart requested`);
 
       if (updated.environment_instance?.access_urls) {
         this.log('');
