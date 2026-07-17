@@ -180,6 +180,7 @@ export function ExternalRunDetail({ client, run, onBack, backLabel = '← All ru
         <Timeline
           style={{ marginTop: 8 }}
           items={events.map((e) => ({
+            // biome-ignore lint/plugin/noHardcodedColorProperty: AntD Timeline preset dot color, not a raw color
             color: EVENT_COLOR[e.event_type] ?? 'gray',
             content: (
               <Space direction="vertical" size={0}>
